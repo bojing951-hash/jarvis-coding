@@ -10,6 +10,7 @@
 import { createHash } from 'node:crypto';
 import { realpathSync, existsSync, statSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import { resolve, sep } from 'node:path';
+import { hostname } from 'node:os';
 
 /* ------------------------------- 参数摘要 ---------------------------------- */
 
@@ -152,6 +153,52 @@ export function commitGate({ execOk, verify, approval, commitPaths }) {
   return { ok: true };
 }
 
+/* ------------------------------ 执行状态机 ---------------------------------- */
+
+export const EXEC_STATES = [
+  'pending',
+  'authorized',
+  'running',
+  'verifying',
+  'committing',
+  'done',
+  'failed',
+  'cancel_requested',
+  'cancelled',
+  'cancel_failed'
+];
+
+const TERMINAL = new Set(['done', 'failed', 'cancelled', 'cancel_failed']);
+
+export function isTerminal(state) {
+  return TERMINAL.has(state);
+}
+
+/**
+ * 统一裁决（DEF-01）：任务状态由完整执行链推导，
+ * 不由执行器返回值单独决定。
+ */
+export function computeVerdict({ cancelled, execOk, verify, requiresVerify, commit, requiresCommit, approvalValid }) {
+  const reasons = [];
+  if (cancelled) return { status: 'cancelled', reasons: ['执行被取消'] };
+
+  if (!execOk) return { status: 'failed', reasons: ['执行器失败'] };
+
+  if (requiresVerify) {
+    if (!verify) reasons.push('缺少必需校验结果');
+    else if (verify.exitCode !== 0) reasons.push(`校验失败（exit ${verify.exitCode}）`);
+  }
+
+  if (requiresCommit) {
+    if (!approvalValid) reasons.push('提交阶段授权无效');
+    if (!commit) reasons.push('未执行提交');
+    else if (!commit.ok) reasons.push(`提交失败: ${commit.error ?? commit.reason ?? 'unknown'}`);
+    else if (!commit.sha) reasons.push('提交未返回真实 SHA');
+  }
+
+  return { status: reasons.length ? 'failed' : 'done', reasons };
+}
+
 /* ------------------------------ 管理员入口 ---------------------------------- */
 
 /**
@@ -162,15 +209,41 @@ export function operatorKeyPath(home) {
   return `${home}/.openclaw/jarvis/operator.key`;
 }
 
-export function assertOperator(keyPath) {
-  if (!keyPath || !existsSync(keyPath)) {
+/**
+ * 可信操作者校验（DEF-04）。
+ *
+ * 密钥文件存在与否不能作为身份证明——同一用户下的任何进程都能读到它。
+ * 改为要求真实交互式终端：Agent 没有 TTY，MCP 进程也没有。
+ * 这是当前环境可验证的最强本地来源；其局限在文档中明确记录。
+ */
+export function operatorIdentity() {
+  const tty = Boolean(process.stdin.isTTY && process.stdout.isTTY);
+  let user = 'unknown';
+  let host = 'unknown';
+  try {
+    user = String(process.getuid?.() ?? 'unknown');
+    host = hostname();
+  } catch {}
+  return {
+    method: tty ? 'interactive-tty-confirmation' : 'non-interactive',
+    tty,
+    uid: user,
+    host,
+    pid: process.pid
+  };
+}
+
+export function requireInteractiveOperator(confirmToken) {
+  const id = operatorIdentity();
+  if (!id.tty) {
     throw new Error(
-      `缺少管理员密钥（${keyPath}）。审批只能由本地管理员签发：先运行 jarvisctl operator init`
+      '审批必须由真实终端中的操作者完成（当前进程没有 TTY）。Agent / MCP 无法签发审批。'
     );
   }
-  const key = readFileSync(keyPath, 'utf8').trim();
-  if (key.length < 32) throw new Error('管理员密钥无效（长度不足）');
-  return true;
+  if (!confirmToken || confirmToken !== 'APPROVE') {
+    throw new Error('必须显式确认：在终端输入 APPROVE');
+  }
+  return id;
 }
 
 /* ------------------------------ 子进程环境 ---------------------------------- */

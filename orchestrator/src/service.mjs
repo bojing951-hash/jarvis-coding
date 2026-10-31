@@ -8,7 +8,8 @@ import { homedir } from 'node:os';
 import { openDatabase, now, newId, slugify } from './db.mjs';
 import * as oc from './oc.mjs';
 import * as ex from './executor.mjs';
-import { validateExecutorConfig, resolveProjectPath, taskDigest, commitGate, canonicalJson, sha256 } from './security.mjs';
+import { validateExecutorConfig, resolveProjectPath, taskDigest, commitGate, canonicalJson, sha256, computeVerdict, operatorIdentity } from './security.mjs';
+import * as iso from './isolation.mjs';
 
 const HOME = homedir();
 export const JARVIS_HOME = process.env.JARVIS_HOME || join(HOME, '.openclaw', 'jarvis');
@@ -468,7 +469,9 @@ export function issueApproval({ task: taskRef, ttlHours = 24, issuedBy = 'local-
   const id = newId('apv');
   const issued = now();
   const expires = new Date(Date.now() + ttlHours * 3600_000).toISOString();
+  const operator = operatorIdentity();
   const scope = {
+    _operator: { method: operator.method, uid: operator.uid, host: operator.host },
     project: project.slug,
     executor: task.executor,
     mode: resolved.mode,
@@ -495,42 +498,83 @@ export function listApprovals(taskRef) {
  * 阶段：授权 → 执行 → 校验 → 提交前检查 → Commit → 记录
  * 取消后不得再进入后续副作用阶段（AC-06）。
  */
+/** 记录一次尝试（包括执行器尚未启动就被拒绝的情况）。AC-21 */
+function recordAttempt({ task, project, phase, status, blocked, reason, plan }) {
+  const id = newId('exe');
+  db()
+    .prepare('INSERT INTO executions (id,task_id,agent_id,status,model,session_key,started_at,finished_at,error,evidence) VALUES (?,?,?,?,?,?,?,?,?,?)')
+    .run(
+      id,
+      task.id,
+      null,
+      status,
+      'claude-code',
+      plan?.cwd ?? '',
+      now(),
+      status === 'running' ? null : now(),
+      blocked ? `${blocked}: ${reason}` : '',
+      JSON.stringify({ phase, blocked: blocked ?? null, reason: reason ?? null, plan: plan ?? null })
+    );
+  event(`execution.${status}`, project.id, { task: task.id, execution: id, phase, blocked, reason });
+  return id;
+}
+
+/**
+ * 外部执行器任务：授权 → 隔离执行 → 校验 → 提交 → 裁决 → 证据。
+ *
+ * 与上一版的差别：
+ * - 任务状态由完整链路裁决（computeVerdict），不由执行器返回值决定
+ * - 写模式必须有隔离环境，否则 fail closed
+ * - 每次尝试（含拒绝）都留下 execution 记录
+ * - 提交前重新校验授权与取消状态
+ */
 async function runExecutorTask(task, project) {
   if (task.executor !== 'claude-code') {
+    recordAttempt({ task, project, phase: 'validate', status: 'rejected', blocked: 'unknown_executor', reason: task.executor });
     return { ok: false, blocked: 'unknown_executor', error: `未支持的执行器: ${task.executor}` };
   }
 
   const plan = resolveExecutorPlan(task, project);
-  if (!plan.ok) return { ok: false, blocked: plan.blocked, error: plan.error };
+  if (!plan.ok) {
+    recordAttempt({ task, project, phase: 'validate', status: 'rejected', blocked: plan.blocked, reason: plan.error });
+    return { ok: false, blocked: plan.blocked, error: plan.error };
+  }
   const { resolved } = plan;
-  const { mode, cwd, commitPaths } = resolved;
-
-  // 写模式或提交必须有有效审批（AC-02 / AC-09：不认 executor_config.approved 与历史 approved_at）
+  const { mode, cwd } = resolved;
   const needsApproval = mode === 'acceptEdits' || resolved.commit;
-  let approval = { valid: !needsApproval, reason: '' };
+
+  // 授权：必须存在摘要匹配的审批记录
+  let approval = { valid: !needsApproval };
   if (needsApproval) {
     approval = findValidApproval(task.id, resolved.digest);
     if (!approval.valid) {
+      recordAttempt({ task, project, phase: 'authorize', status: 'rejected', blocked: 'needs_approval', reason: approval.reason, plan: resolved });
       return { ok: false, blocked: 'needs_approval', error: `需要本地管理员审批：${approval.reason}` };
     }
   }
 
-  // 并发保护：只有 pending/retry_pending/approved/failed 能转为 running（AC-07）
+  // 写权限必须先有隔离环境（AC-11：无法证明隔离时 fail closed）
+  if (mode === 'acceptEdits' || resolved.commit) {
+    const st = await iso.isolationStatus();
+    if (!st.available) {
+      recordAttempt({ task, project, phase: 'isolation', status: 'rejected', blocked: 'isolation_unavailable', reason: st.reason, plan: resolved });
+      updateTask(task.id, { status: 'failed', error: `写模式被拒绝：${st.reason}` });
+      return { ok: false, blocked: 'isolation_unavailable', error: st.reason };
+    }
+  }
+
+  // 状态机：pending/authorized/retry_pending → running（原子，防并发 AC-19）
   const claim = db()
     .prepare(`UPDATE tasks SET status='running', attempts=attempts+1, updated_at=?
-              WHERE id=? AND status IN ('pending','retry_pending','approved','failed')`)
+              WHERE id=? AND status IN ('pending','authorized','retry_pending','failed')`)
     .run(now(), task.id);
   if (claim.changes !== 1) {
+    recordAttempt({ task, project, phase: 'claim', status: 'rejected', blocked: 'already_running', reason: `当前状态不允许执行`, plan: resolved });
     return { ok: false, blocked: 'already_running', error: '任务已在运行或状态不允许执行' };
   }
 
   mkdirSync(cwd, { recursive: true });
-  const execId = newId('exe');
-  const started = now();
-  db()
-    .prepare('INSERT INTO executions (id,task_id,agent_id,status,model,session_key,started_at) VALUES (?,?,?,?,?,?,?)')
-    .run(execId, task.id, null, 'running', 'claude-code', cwd, started);
-
+  const execId = recordAttempt({ task, project, phase: 'execute', status: 'running', plan: resolved });
   const runDir = join(JARVIS_HOME, 'run');
   mkdirSync(runDir, { recursive: true });
   const pidFile = join(runDir, `${execId}.pid`);
@@ -543,83 +587,90 @@ async function runExecutorTask(task, project) {
     timeoutMs: resolved.timeoutMs,
     onPid: (pid) => {
       try { writeFileSync(pidFile, String(pid), { mode: 0o600 }); } catch {}
-      db().prepare('UPDATE executions SET evidence=? WHERE id=?').run(JSON.stringify({ pid }), execId);
     }
   });
   try { rmSync(pidFile, { force: true }); } catch {}
+  const cancelledNow = () => db().prepare('SELECT status FROM tasks WHERE id=?').get(task.id)?.status === 'cancelled';
 
-  const isCancelled = () =>
-    db().prepare('SELECT status FROM tasks WHERE id = ?').get(task.id)?.status === 'cancelled';
+  if (cancelledNow()) {
+    finalizeAttempt(task, execId, { status: 'cancelled', reason: '取消于校验前' });
+    return { ok: false, blocked: 'cancelled', error: '任务已取消' };
+  }
 
-  // 校验（只认登记配置，不经 shell）
+  // 校验：只接受登记配置，且必须在取消后停止
   let verify = null;
-  if (res.ok && !isCancelled() && resolved.profile) {
+  if (res.ok && resolved.profile) {
+    db().prepare("UPDATE tasks SET status='verifying', updated_at=? WHERE id=? AND status='running'").run(now(), task.id);
     verify = await ex.runVerifyProfile({
       program: resolved.profile.program,
       argv: JSON.parse(resolved.profile.argv || '[]'),
-      cwd: resolved.profile.cwd ? resolveProjectPath(resolved.profile.cwd, project.dir).cwd ?? cwd : cwd,
+      cwd,
       timeoutMs: resolved.profile.timeout_ms
     });
   }
 
-  // 提交门禁：执行成功 ≠ 可以提交
+  // 提交前：重新确认授权与取消状态（AC-17 / FIX1-H）
   let commit = null;
-  if (resolved.commit && !isCancelled()) {
+  if (resolved.commit) {
+    if (cancelledNow()) {
+      finalizeAttempt(task, execId, { status: 'cancelled', reason: '取消于提交前', verify });
+      return { ok: false, blocked: 'cancelled', error: '任务已取消' };
+    }
+    const recheck = findValidApproval(task.id, resolved.digest);
     const gate = commitGate({
       execOk: res.ok,
       verify,
-      approval: needsApproval ? { valid: true } : approval,
-      commitPaths
+      approval: recheck,
+      commitPaths: resolved.commitPaths
     });
     if (gate.ok) {
-      commit = await ex.gitCommit({
-        cwd,
-        message: JSON.parse(task.executor_config || '{}').commit_message || `chore(executor): ${task.title}`,
-        paths: commitPaths
-      });
+      db().prepare("UPDATE tasks SET status='committing', updated_at=? WHERE id=? AND status='running'").run(now(), task.id);
+      commit = await ex.gitCommit({ cwd, message: resolved.commitMessage || `chore(executor): ${task.title}`, paths: resolved.commitPaths });
     } else {
       commit = { ok: false, skipped: true, reason: gate.reason };
     }
   }
 
-  const approvalRecord = approval.valid ? { id: approval.approval?.id, digest: resolved.digest } : null;
-  if (approvalRecord?.id) {
-    db().prepare('UPDATE approvals SET used_at=? WHERE id=?').run(now(), approvalRecord.id);
-  }
+  // 统一裁决
+  const verdict = computeVerdict({
+    cancelled: res.cancelled,
+    execOk: res.ok,
+    verify,
+    requiresVerify: Boolean(resolved.profile) || resolved.commit,
+    commit,
+    requiresCommit: resolved.commit,
+    approvalValid: approval.valid
+  });
 
   const evidence = {
     ...(res.evidence ?? {}),
     verify,
     commit,
+    verdict,
     plan: {
-      mode,
-      cwd,
+      mode, cwd,
       verify_profile: resolved.verifyProfileId,
       commit: resolved.commit,
-      commit_paths: commitPaths,
+      commit_paths: resolved.commitPaths,
       digest: resolved.digest
     },
-    authorization: { required: needsApproval, approval: approvalRecord }
+    authorization: { required: needsApproval, approval: approval.approval ? { id: approval.approval.id, digest: resolved.digest } : null }
   };
+  if (approval.approval) db().prepare('UPDATE approvals SET used_at=? WHERE id=?').run(now(), approval.approval.id);
 
-  const cancelledNow = res.cancelled || isCancelled();
-  const finalStatus = cancelledNow ? 'cancelled' : res.ok ? 'ok' : 'failed';
+  finalizeAttempt(task, execId, { status: verdict.status === 'done' ? 'ok' : verdict.status, reason: verdict.reasons.join('; '), evidence, text: res.text });
+
+  return { ...res, evidence, verify, commit, verdict, task: getTask(task.id), execution: execId };
+}
+
+function finalizeAttempt(task, execId, { status, reason, evidence, text }) {
   db()
-    .prepare("UPDATE executions SET status=?, model=?, output=?, error=?, evidence=?, finished_at=? WHERE id=? AND status='running'")
-    .run(finalStatus, 'claude-code', res.text ?? '', res.ok ? '' : res.error ?? '',
-         JSON.stringify(evidence), now(), execId);
-
-  if (cancelledNow) {
-    db().prepare("UPDATE tasks SET status='cancelled', updated_at=? WHERE id=? AND status='running'").run(now(), task.id);
-  } else if (res.ok) {
-    db().prepare("UPDATE tasks SET status='done', output=?, error='', updated_at=? WHERE id=? AND status='running'")
-      .run(res.text ?? '', now(), task.id);
-  } else {
-    db().prepare("UPDATE tasks SET status='failed', error=?, updated_at=? WHERE id=? AND status='running'")
-      .run(res.error ?? '', now(), task.id);
-  }
-
-  return { ...res, evidence, verify, commit, approval: approvalRecord, task: getTask(task.id), execution: execId };
+    .prepare("UPDATE executions SET status=?, output=?, error=?, evidence=?, finished_at=? WHERE id=? AND status='running'")
+    .run(status, text ?? '', reason ?? '', JSON.stringify(evidence ?? {}), now(), execId);
+  const taskStatus = status === 'ok' ? 'done' : status === 'cancelled' ? 'cancelled' : 'failed';
+  db()
+    .prepare('UPDATE tasks SET status=?, output=COALESCE(NULLIF(?,\'\'),output), error=?, updated_at=? WHERE id=? AND status IN (\'running\',\'verifying\',\'committing\')')
+    .run(taskStatus, text ?? '', reason ?? '', now(), task.id);
 }
 
 /* --------------------------------- Workflows --------------------------------- */
@@ -888,6 +939,7 @@ async function runAuditTask(task, project) {
   else updateTask(task.id, { status: 'failed', error: res.error ?? '' });
   return { ...res, evidence, task: getTask(task.id), execution: execId };
 }
+
 
 
 /* ----------------------------- Verify Profiles ------------------------------- */
