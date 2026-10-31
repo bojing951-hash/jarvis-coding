@@ -28,6 +28,37 @@ iPhone 飞书  ──WebSocket 长连接──▶  OpenClaw Gateway (127.0.0.1:1
 | 安全审计 | ✅ | `0 critical`，exec 实测不可用 |
 | 手机端 | ✅ | iPhone 私聊实测收到回复 |
 
+## P1：通用多模型 / 多会话 / 多 Agent 调度
+
+在 MVP 基础上新增 `orchestrator/`：一层薄调度，复用 OpenClaw 的 Agent、Session、Provider，
+只补它没有的**项目、任务、交接、工作流**。
+
+```text
+飞书 / CLI / MCP
+      ↓
+orchestrator（新增，~1000 行，零依赖）
+  Project · Task · Workflow · Execution
+      ↓  只调用 CLI
+OpenClaw（复用）
+  Agent · Session · Provider · Gateway
+      ├── GLM (zai)
+      └── Claude Code（外部执行器，独立进程）
+```
+
+核心原则：**模型、Agent 角色、独立会话、项目、任务、执行工具是六种不同对象**，
+`agent set-model` 换模型不动角色与会话，`agent set-role` 改角色不动模型。
+
+- 架构说明：[docs/07-architecture.md](docs/07-architecture.md)
+- 测试结果：[docs/08-test-results.md](docs/08-test-results.md)
+- 安全审查：[docs/09-security-review.md](docs/09-security-review.md)
+- 功能状态：[docs/10-status.md](docs/10-status.md)
+- 调度层用法：[orchestrator/README.md](orchestrator/README.md)
+
+已验证：多模型独立会话、跨 Agent 真实交接、并行研究→汇总工作流、人工审批门、
+Gateway 重启后状态恢复、Claude Code + GLM 只读执行。
+
+未验证（WAITING）：GPT / Claude / DeepSeek 真实 API 会话——本机无对应凭据。
+
 ## 快速开始
 
 ```bash

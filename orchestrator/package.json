@@ -1,0 +1,16 @@
+{
+  "name": "jarvis-orchestrator",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "JARVIS P1 通用多模型 / 多会话 / 多 Agent 调度层（复用 OpenClaw 原生会话与 Agent）",
+  "bin": {
+    "jarvisctl": "./src/cli.mjs"
+  },
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "test": "node --test test/*.test.mjs"
+  }
+}

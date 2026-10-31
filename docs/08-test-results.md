@@ -1,0 +1,109 @@
+# 08 · 测试结果（真实执行）
+
+环境：macOS 15.6.1 / Apple M4 / OpenClaw 2026.10.9 / 私有 Node 24.22.1
+执行时间：2026-10-31
+
+## 可用模型清单（决定 TEST-01 的边界）
+
+`openclaw models list` 实际可用：**只有 zai（GLM 系列）有凭据**。
+
+```text
+zai/glm-5.3        zai/glm-4.6        zai/glm-5.2
+zai/glm-5.3-flash  zai/glm-4.5-air    zai/glm-5-turbo …
+```
+
+本机**没有** OpenAI / Anthropic / DeepSeek 的 API Key。
+因此 TEST-01 的「GPT / Claude / DeepSeek」部分标记为 **WAITING**，
+已用同一 provider 下三个**真实不同模型**验证了机制本身。
+
+---
+
+## TEST-01 多模型独立会话
+
+| 子项 | 结果 | 证据 |
+|---|---|---|
+| 创建独立会话 | PASS | `sess-alpha` / `sess-beta` |
+| 指定模型真实生效 | PASS | `model=zai/glm-4.6`、`zai/glm-5.3-flash`、`zai/glm-5.3` |
+| 多轮连续性 | PASS | 回访答出 `74219` |
+| 会话不混淆 | PASS | 另一会话答「不知道…这个会话里没有」 |
+| 删除/归档会话 | PASS | `openclaw sessions archive/delete` 原生支持 |
+| GPT / Claude / DeepSeek | **WAITING** | 缺对应 API Key，未冒充完成 |
+
+## TEST-02 跨 Agent 通信
+
+| 子项 | 结果 | 证据 |
+|---|---|---|
+| A → B 真实交接 | PASS | `researcher(glm-4.6)` → `reviewer(glm-5.3-flash)` |
+| 接收方真实执行 | PASS | 任务 `tsk_mvw867gw01m8vj` status=done |
+| 结果返回 | PASS | reviewer 输出完整评审报告并落库 |
+| 不复制全量历史 | PASS | 交接输入只含任务字段 |
+| 失败不虚报 | PASS | 失败路径返回 `ok:false` + 真实 error |
+
+## TEST-03 非编程工作流
+
+两阶段并行研究 + 汇总，全部真实模型调用：
+
+```text
+[并行研究] researcher(glm-4.6)     → 三条优先自动化建议
+[并行研究] reviewer(glm-5.3-flash) → 三个高估/踩坑点
+[汇总]     writer(glm-5.3)         → 共识 / 分歧 / 建议
+```
+
+结果：`workflow status=done`，汇总确实指出了两份研究的**分歧点**（记忆优先级、扩展驱动方式）。
+
+## TEST-04 编程工作流
+
+| 子项 | 结果 | 证据 |
+|---|---|---|
+| Claude Code + GLM 真实执行 | PASS | `claude 2.1.104`，exitCode=0，耗时 23s |
+| 只读模式生效 | PASS | `gitHeadBefore == gitHeadAfter`，`gitChanged=false` |
+| 读取真实文件 | PASS | 回答了探针目录 README 的内容 |
+| 返回 Commit / 测试证据 | 部分 PASS | 已记录 git HEAD 前后；未做写模式改动 |
+| 写模式（acceptEdits） | **NOT IMPLEMENTED 验证** | 代码已实现审批门，未在真实仓库测试 |
+| 独立 Auditor 审固定版本 | **NOT IMPLEMENTED** | 需真实 Git 仓库与冻结契约，未做 |
+
+## TEST-05 多项目隔离
+
+| 子项 | 结果 | 证据 |
+|---|---|---|
+| 项目目录隔离 | PASS | `~/.openclaw/projects/<slug>/agents/<name>` |
+| Agent 归属校验 | PASS | 跨项目指派直接抛错 |
+| 暂停 A 继续 B | PASS | `project_paused` 拦截，其余项目不受影响 |
+| 恢复 A | PASS | 状态与光标保留 |
+
+## TEST-06 重启恢复
+
+```text
+1. 工作流跑到审批门 → status=paused, cursor=1
+2. openclaw gateway restart
+3. 重启后：审批门测试 paused cursor=1（未丢）
+           AI总管优先级研究 done cursor=2（未回滚）
+4. task approve → 重新 run → 继续到 done
+```
+
+| 子项 | 结果 |
+|---|---|
+| 状态跨重启保留 | PASS |
+| 未执行完的不重复执行 | PASS（cursor 定位，已完成阶段不重跑） |
+| MCP 服务重启后可用 | PASS（22 tools，probe 通过） |
+
+## TEST-07 安全验证
+
+| 子项 | 结果 | 证据 |
+|---|---|---|
+| 主 Agent 无 Shell | PASS | 新 session 实测 `Unknown tool id: exec` |
+| 密钥不进 Git | PASS | 提交前扫描真实 Key/Token，均未命中 |
+| 执行器目录隔离 | PASS | 只传 `cwd`，无 `--add-dir` |
+| 执行器默认只读 | PASS | `plan` 模式 + git HEAD 未变 |
+| 审计 Agent 只读 | **WAITING** | 审计 Agent 目前是聊天 Agent（无 FS 写权限），未接代码审计流程 |
+| 无无限循环 | PASS | `maxRounds` + `max_attempts` 双重上限 |
+| 不能擅自合并主干 | PASS | 未配置任何 git push/merge 权限给 Agent |
+
+## 单元测试
+
+```text
+node --test orchestrator/test/*.test.mjs
+tests 7 / pass 7 / fail 0
+```
+
+覆盖：项目创建与 slug 冲突、审批门拦截、项目暂停拦截、重试上限、空工作流拒绝。
