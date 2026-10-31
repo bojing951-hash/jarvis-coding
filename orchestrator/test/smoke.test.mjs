@@ -65,3 +65,40 @@ test('工作流 spec 为空应报错', () => {
   const p = svc.createProject({ name: '空流', slug: 't-empty' });
   assert.throws(() => svc.createWorkflow({ project: p.id, name: 'x', spec: { stages: [] } }), /不能为空/);
 });
+
+test('取消一个没有运行中执行的任务应如实失败', () => {
+  const p = svc.createProject({ name: '取消测试', slug: 't-cancel' });
+  const t = svc.createTask({ project: p.id, title: '未执行', input: 'x' });
+  const r = svc.cancelTask(t.id);
+  assert.equal(r.ok, false);
+  assert.match(r.error, /没有正在运行/);
+});
+
+test('审计任务缺少契约应被拒绝', async () => {
+  const p = svc.createProject({ name: '审计测试', slug: 't-audit' });
+  const t = svc.createTask({
+    project: p.id,
+    title: '审计',
+    input: 'x',
+    kind: 'audit',
+    executorConfig: { repo: '/tmp', commit: 'abc' }
+  });
+  const r = await svc.runTask(t.id);
+  assert.equal(r.ok, false);
+  assert.equal(r.blocked, 'no_contract');
+});
+
+test('执行器任务应持久化 executor 与配置', () => {
+  const p = svc.createProject({ name: '执行器持久化', slug: 't-exec' });
+  const t = svc.createTask({
+    project: p.id,
+    title: 'e',
+    input: 'x',
+    kind: 'executor',
+    executor: 'claude-code',
+    executorConfig: { cwd: '/tmp', mode: 'plan', verify: 'npm test' }
+  });
+  assert.equal(t.kind, 'executor');
+  assert.equal(t.executor, 'claude-code');
+  assert.match(t.executor_config, /npm test/);
+});

@@ -62,6 +62,48 @@ zai/glm-5.3-flash  zai/glm-4.5-air    zai/glm-5-turbo …
 | 写模式（acceptEdits） | **NOT IMPLEMENTED 验证** | 代码已实现审批门，未在真实仓库测试 |
 | 独立 Auditor 审固定版本 | **NOT IMPLEMENTED** | 需真实 Git 仓库与冻结契约，未做 |
 
+## TEST-04b 执行器写模式（沙箱实测）
+
+在一个**一次性沙箱仓库**（`~/.openclaw/projects/p1-orch/sandbox`，含真实 bug 与真实失败测试）上执行，未触碰任何真实项目。
+
+| 阶段 | 证据 |
+|---|---|
+| 初始状态 | `npm test` → `pass 1 / fail 1`（`add` 误用减法） |
+| 审批门 | 未批准时 `task run` → `blocked: needs_approval` |
+| 模型改码 | `git diff` 显示 `add` 改为 `+`，仅 1 行变更 |
+| 编排层校验 | `verify: npm test` → exit 0，`pass 2 / fail 0` |
+| 提交 | `commit.sha = 49638a2`，`git log` 可见 |
+
+第二轮（`mul` 误用加法）同样走完「改码 → 测试 → 提交」全链路，
+commit 消息 `fix(calc): mul 使用加法，修正为乘法`。
+
+**限制说明**：Claude Code 自身没有 Bash 权限，跑不了测试（它如实报告了这一点）。
+因此测试执行由**编排层**完成（`executorConfig.verify` 是运维指定的固定命令，不是模型生成的），
+这样既拿到真实测试证据，又没有放宽模型的权限。
+
+## TEST-04c 审计（固定 commit + 冻结契约）
+
+```text
+kind=audit  repo=<sandbox>  commit=49638a2b  contract=4 条验收项
+```
+
+| 子项 | 结果 |
+|---|---|
+| 只读固定版本 | PASS，证据 `audit.commit=49638a2b` |
+| 不得修改被审代码 | PASS，`worktreeClean=true` |
+| 独立上下文 | PASS，独立 worktree + 独立 session |
+| 逐条对照契约 | PASS，给出 `src/calc.mjs:1` / `:2` 行号级证据 |
+| 不臆造 | PASS，明确写出「Bash 未获授权，故未动态跑测试」 |
+
+## TEST-06b 取消与通知
+
+| 子项 | 结果 | 证据 |
+|---|---|---|
+| 取消执行器任务 | PASS | `cancelTask` 杀进程组，`task=cancelled` / `execution=cancelled` |
+| 取消后不被回写覆盖 | PASS | 曾出现 `failed` 覆盖 `cancelled` 的竞态，已用 `WHERE status='running'` 守卫修复 |
+| 工作流完成通知 | PASS | `notify: {sent: true}`，飞书收到消息 |
+| 通知失败不阻塞主流程 | PASS | `notify()` 捕获异常只记事件 |
+
 ## TEST-05 多项目隔离
 
 | 子项 | 结果 | 证据 |

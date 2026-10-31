@@ -10,8 +10,8 @@
 | P1-02 | 动态创建 Agent（模型与角色解耦） | **PASS** |
 | P1-03 | 跨 Agent 通信 | **PASS** |
 | P1-04 | 动态项目管理 | **PASS** |
-| P1-05 | 通用工作流编排 | **PASS**（顺序/并行/交接/审批/重试/暂停恢复/轮次上限） |
-| P1-06 | 外部执行器（Claude Code + GLM） | **PASS**（只读）/ **NOT IMPLEMENTED 验证**（写模式） |
+| P1-05 | 通用工作流编排 | **PASS**（顺序/并行/交接/审批/重试/暂停恢复/轮次上限/完成通知） |
+| P1-06 | 外部执行器（Claude Code + GLM） | **PASS**（只读 / 写模式 / 测试校验 / Git 提交 / 取消 / 固定版本审计） |
 | P1-07 | 飞书端到端 | **PASS**（iPhone 实测，含一次失败→修复→复测） |
 
 ## 详细
@@ -49,16 +49,17 @@
 - 失败重试 ✅（`max_attempts`，单元测试覆盖）
 - 暂停恢复 ✅
 - 有上限循环 ✅（`maxRounds`）
-- 任务完成通知 —— **NOT IMPLEMENTED**（未接飞书主动推送）
+- 任务完成通知 ✅（工作流结束推送飞书，`notify.sent=true`）
 
 ### P1-06 执行器 —— PASS / 部分
 
 - 启动真实开发任务（只读）✅
 - 指定工作目录 ✅
 - 状态查询 / 读取结果 ✅
-- 取消任务 —— **NOT IMPLEMENTED**（未实现进程 kill 接口）
-- 返回 Commit / 测试结果 ✅（只读场景记录 git HEAD；未产生 commit）
-- 结果交回其他 Agent —— 机制已具备（`handoff`），未串进执行器流水线
+- 取消任务 ✅（杀进程组，状态为 cancelled，不被回写覆盖）
+- 返回 Commit / 测试结果 ✅（`commit.sha=49638a2`，`verify` 命令 exit 0）
+- 固定版本只读审计 ✅（worktree 快照 + 冻结契约 + `worktreeClean=true`）
+- 结果交回其他 Agent —— 机制具备（`handoff`），未串进执行器流水线
 
 ### P1-07 飞书端到端 —— PASS
 
@@ -75,7 +76,6 @@
 ## 明确未做（不擅自扩范围）
 
 - 可视化工作流编辑器
-- 执行器取消/超时强杀
-- 审计 Agent 读固定 commit 的冻结契约流程
 - Codex / 其他 CLI 执行器
+- GPT / Claude / DeepSeek 真实 API 会话（缺凭据）
 - 消息队列、独立数据库服务、Web 前端

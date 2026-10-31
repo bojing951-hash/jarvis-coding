@@ -135,7 +135,9 @@ const TOOLS = [
         input: { type: 'string' },
         agent: { type: 'string' },
         needs_approval: { type: 'boolean' },
-        max_attempts: { type: 'number' }
+        max_attempts: { type: 'number' },
+        executor: { type: 'string', description: '可选：claude-code' },
+        executor_config: { type: 'object', description: '{cwd, mode, approved, verify}' }
       },
       required: ['project', 'title']
     }
@@ -182,6 +184,11 @@ const TOOLS = [
     name: 'workflow_pause',
     description: '暂停工作流。',
     inputSchema: { type: 'object', properties: { workflow: { type: 'string' } }, required: ['workflow'] }
+  },
+  {
+    name: 'task_cancel',
+    description: '取消正在执行的任务（终止执行器进程组）。若无法终止会如实返回失败。',
+    inputSchema: { type: 'object', properties: { task: { type: 'string' } }, required: ['task'] }
   },
   {
     name: 'models_list',
@@ -246,7 +253,10 @@ async function callTool(name, args) {
         input: args.input ?? '',
         assignee: args.agent,
         needsApproval: Boolean(args.needs_approval),
-        maxAttempts: args.max_attempts
+        maxAttempts: args.max_attempts,
+        kind: args.executor ? 'executor' : undefined,
+        executor: args.executor,
+        executorConfig: args.executor_config
       })));
     case 'task_list':
       return ok(JSON.stringify(svc.listTasks(args.project, args.status).map((t) => ({
@@ -254,6 +264,10 @@ async function callTool(name, args) {
       })), null, 2));
     case 'task_approve':
       return ok(JSON.stringify(svc.approveTask(args.task)));
+    case 'task_cancel': {
+      const r = svc.cancelTask(args.task);
+      return r.ok ? ok(JSON.stringify(r)) : err(JSON.stringify({ error: r.error }));
+    }
     case 'task_run': {
       const r = await svc.runTask(args.task);
       return r.ok ? ok(JSON.stringify({ status: r.task.status, output: r.text })) : err(JSON.stringify({ error: r.error, status: r.task?.status }));

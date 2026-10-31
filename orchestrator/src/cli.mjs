@@ -134,8 +134,19 @@ async function main() {
             maxAttempts: opt['max-attempts'] ? Number(opt['max-attempts']) : undefined,
             kind: opt.kind,
             executor: opt.executor,
-            executorConfig: opt.executor
-              ? { cwd: opt.cwd, mode: opt.mode ?? 'plan', allowedTools: opt['allowed-tools'], maxTurns: opt['max-turns'] ? Number(opt['max-turns']) : undefined }
+            executorConfig: opt.kind === 'audit'
+              ? { repo: opt.repo, commit: opt.commit, contract: opt.contract }
+              : opt.executor
+              ? {
+                  cwd: opt.cwd,
+                  mode: opt.mode ?? 'plan',
+                  approved: Boolean(opt.approved),
+                  verify: opt.verify,
+                  commit: Boolean(opt.commit),
+                  commitMessage: opt['commit-message'],
+                  allowedTools: opt['allowed-tools'],
+                  maxTurns: opt['max-turns'] ? Number(opt['max-turns']) : undefined
+                }
               : undefined
           })
         );
@@ -146,6 +157,12 @@ async function main() {
       case 'task:show':
         print(svc.getTask(require_('task')));
         break;
+      case 'task:cancel': {
+        const r = svc.cancelTask(require_('task'));
+        print(r);
+        if (!r.ok) process.exit(2);
+        break;
+      }
       case 'task:approve':
         print(svc.approveTask(require_('task')));
         break;
@@ -193,6 +210,14 @@ async function main() {
         print(svc.setWorkflowStatus(require_('workflow'), 'paused'));
         break;
 
+      /* settings */
+      case 'config:notify':
+        print(svc.setSetting('notify_target', require_('target')));
+        break;
+      case 'config:show':
+        print({ notify_target: svc.getSetting('notify_target') });
+        break;
+
       /* models */
       case 'models:': {
         const models = await oc.listModels(opt.provider);
@@ -215,10 +240,11 @@ async function main() {
             'conv create --agent <ref> [--title <t>] | conv list --agent <ref>',
             'talk --agent <ref> --message <文本> [--conversation <id>] [--session-key <k>]',
             'task create --project <ref> --title <t> [--input <文本>] [--agent <ref>] [--needs-approval]',
-            'task list [--project <ref>] [--status <s>] | task show --task <id> | task approve --task <id> | task run --task <id>',
+            'task list [--project <ref>] [--status <s>] | task show --task <id> | task approve --task <id> | task run --task <id> | task cancel --task <id>',
             'handoff --project <ref> --from <agent> --to <agent> --requirement <文本> [--artifact <文本>] [--context <文本>] [--constraints <文本>]',
             'workflow create --project <ref> --name <n> --spec-file <json>',
             'workflow run --workflow <id|name> | workflow list [--project <ref>] | workflow pause --workflow <id>',
+            'config notify --target <feishu chat_id> | config show',
             'models [--provider <id>]',
             'status --project <ref>'
           ]

@@ -2,7 +2,7 @@
  * 调度服务层：Project / Agent / Conversation / Task / Execution 的真实操作。
  * CLI 与 MCP 共用这一层，保证两条入口行为一致。
  */
-import { mkdirSync, writeFileSync, readFileSync, existsSync } from 'node:fs';
+import { mkdirSync, writeFileSync, readFileSync, existsSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
 import { openDatabase, now, newId, slugify } from './db.mjs';
@@ -324,6 +324,9 @@ export async function runTask(ref) {
   if (task.kind === 'executor') {
     return runExecutorTask(task, project);
   }
+  if (task.kind === 'audit') {
+    return runAuditTask(task, project);
+  }
   if (!task.assignee_agent_id) {
     return { ok: false, blocked: 'no_assignee', error: '任务未指派 Agent' };
   }
@@ -421,24 +424,54 @@ async function runExecutorTask(task, project) {
     .prepare('INSERT INTO executions (id,task_id,agent_id,status,model,session_key,started_at) VALUES (?,?,?,?,?,?,?)')
     .run(execId, task.id, null, 'running', 'claude-code', cwd, started);
 
+  const runDir = join(JARVIS_HOME, 'run');
+  mkdirSync(runDir, { recursive: true });
+  const pidFile = join(runDir, `${execId}.pid`);
+
   const res = await ex.runClaudeCode({
     cwd,
     prompt: task.input,
     mode,
     allowedTools: cfg.allowedTools,
     maxTurns: cfg.maxTurns,
-    timeoutMs: cfg.timeoutMs
+    timeoutMs: cfg.timeoutMs,
+    onPid: (pid) => {
+      try { writeFileSync(pidFile, String(pid), { mode: 0o600 }); } catch {}
+      db().prepare('UPDATE executions SET evidence=? WHERE id=?')
+        .run(JSON.stringify({ pid }), execId);
+    }
   });
+  try { rmSync(pidFile, { force: true }); } catch {}
 
+  // 执行后校验（operator 指定命令）
+  let verify = null;
+  if (cfg.verify) {
+    verify = await ex.runVerify({ cwd: res.evidence?.cwd || cwd, command: cfg.verify, timeoutMs: cfg.verifyTimeoutMs });
+  }
+  let commit = null;
+  if (cfg.commit && res.ok) {
+    commit = await ex.gitCommit({ cwd: res.evidence?.cwd || cwd, message: cfg.commitMessage || `chore(executor): ${task.title}` });
+  }
+  const evidence = { ...(res.evidence ?? {}), verify, commit };
+  const finalStatus = res.cancelled ? 'cancelled' : res.ok ? 'ok' : 'failed';
+  // 只在仍为 running 时回写，避免覆盖 cancelTask 已写入的 cancelled
   db()
-    .prepare('UPDATE executions SET status=?, model=?, output=?, error=?, evidence=?, finished_at=? WHERE id=?')
-    .run(res.ok ? 'ok' : 'failed', 'claude-code', res.text ?? '', res.ok ? '' : res.error ?? '',
-         JSON.stringify(res.evidence ?? {}), now(), execId);
+    .prepare("UPDATE executions SET status=?, model=?, output=?, error=?, evidence=?, finished_at=? WHERE id=? AND status='running'")
+    .run(finalStatus, 'claude-code', res.text ?? '', res.ok ? '' : res.error ?? '',
+         JSON.stringify(evidence), now(), execId);
 
-  if (res.ok) updateTask(task.id, { status: 'done', output: res.text, error: '' });
-  else updateTask(task.id, { status: 'failed', error: res.error ?? '' });
+  // 所有回写都加 status='running' 守卫：一旦被 cancel，任何后续结果都不得覆盖
+  if (res.cancelled) {
+    db().prepare("UPDATE tasks SET status='cancelled', updated_at=? WHERE id=? AND status='running'").run(now(), task.id);
+  } else if (res.ok) {
+    db().prepare("UPDATE tasks SET status='done', output=?, error='', updated_at=? WHERE id=? AND status='running'")
+      .run(res.text ?? '', now(), task.id);
+  } else {
+    db().prepare("UPDATE tasks SET status='failed', error=?, updated_at=? WHERE id=? AND status='running'")
+      .run(res.error ?? '', now(), task.id);
+  }
 
-  return { ...res, task: getTask(task.id), execution: execId };
+  return { ...res, evidence, verify, commit, task: getTask(task.id), execution: execId };
 }
 
 
@@ -585,14 +618,155 @@ async function runWorkflowInner(ref) {
     if (failed) {
       db().prepare('UPDATE workflows SET status=?, cursor=?, rounds=rounds+1, updated_at=? WHERE id=?')
         .run('failed', stageIdx, now(), w.id);
-      return { ok: false, blocked: 'stage_failed', stage: stage.name, failed, workflow: getWorkflow(w.id), results };
+      const failedWf = getWorkflow(w.id);
+      await notify(`JARVIS 工作流「${failedWf.name}」在阶段「${stage.name}」失败：${failed.error || '未知原因'}`);
+      return { ok: false, blocked: 'stage_failed', stage: stage.name, failed, workflow: failedWf, results };
     }
 
     db().prepare('UPDATE workflows SET cursor=?, updated_at=? WHERE id=?').run(stageIdx + 1, now(), w.id);
   }
 
   db().prepare('UPDATE workflows SET status=?, rounds=rounds+1, updated_at=? WHERE id=?').run('done', now(), w.id);
-  return { ok: true, workflow: getWorkflow(w.id), results };
+  const finished = getWorkflow(w.id);
+  const lines = results.map((r) => `- ${r.node}: ${r.ok ? '完成' : '失败'}`);
+  const note = await notify(`JARVIS 工作流「${finished.name}」已完成（项目 ${project.slug}）\n${lines.join('\n')}`);
+  return { ok: true, workflow: finished, results, notified: note };
+}
+
+/**
+ * 取消任务：杀掉执行器进程组，并把状态置为 cancelled。
+ * 不做「假装已取消」——无法终止时如实返回失败。
+ */
+export function cancelTask(ref) {
+  const task = getTask(ref);
+  const running = db()
+    .prepare("SELECT * FROM executions WHERE task_id = ? AND status = 'running' ORDER BY started_at DESC")
+    .all(task.id);
+  if (!running.length) {
+    return { ok: false, error: '该任务没有正在运行的执行', task: getTask(task.id) };
+  }
+  const results = [];
+  for (const exRow of running) {
+    const pidFile = join(JARVIS_HOME, 'run', `${exRow.id}.pid`);
+    let pid = null;
+    try { pid = Number(readFileSync(pidFile, 'utf8').trim()); } catch { pid = null; }
+    let killed = false;
+    if (Number.isFinite(pid) && pid > 0) {
+      try { process.kill(-pid, 'SIGTERM'); killed = true; } catch {
+        try { process.kill(pid, 'SIGTERM'); killed = true; } catch { killed = false; }
+      }
+    }
+    db().prepare("UPDATE executions SET status='cancelled', finished_at=? WHERE id=?").run(now(), exRow.id);
+    try { rmSync(pidFile, { force: true }); } catch {}
+    results.push({ execution: exRow.id, pid, killed });
+  }
+  db().prepare("UPDATE tasks SET status='cancelled', updated_at=? WHERE id=?").run(now(), task.id);
+  event('task.cancelled', task.project_id, { title: task.title });
+  return { ok: true, task: getTask(task.id), results };
+}
+
+/**
+ * 审计任务：在固定 commit 的只读工作树上执行。
+ * - 不接受 HEAD，必须显式 commit
+ * - 只读模式，不得修改被审计代码
+ * - 契约文本随任务冻结进证据
+ */
+async function runAuditTask(task, project) {
+  const cfg = JSON.parse(task.executor_config || '{}');
+  const { repo, commit, contract } = cfg;
+  if (!repo || !commit) {
+    return { ok: false, blocked: 'bad_audit_config', error: '审计任务必须提供 repo 与 commit' };
+  }
+  if (!contract) {
+    return { ok: false, blocked: 'no_contract', error: '审计任务必须提供冻结的验收契约（contract）' };
+  }
+
+  const dest = join(JARVIS_HOME, 'audit', `${task.id}`);
+  mkdirSync(join(JARVIS_HOME, 'audit'), { recursive: true });
+  const wt = await ex.createFrozenWorktree({ repo, commit, dest });
+  if (!wt.ok) return { ok: false, blocked: 'worktree_failed', error: wt.error };
+
+  updateTask(task.id, { status: 'running', attempts: task.attempts + 1 });
+  const execId = newId('exe');
+  const started = now();
+  db()
+    .prepare('INSERT INTO executions (id,task_id,agent_id,status,model,session_key,started_at) VALUES (?,?,?,?,?,?,?)')
+    .run(execId, task.id, null, 'running', 'claude-code-audit', wt.path, started);
+
+  const prompt = [
+    '你是独立审计员。只读审计，禁止修改任何文件。',
+    '',
+    `## 被审计版本`,
+    `仓库: ${repo}`,
+    `固定 commit: ${wt.sha}`,
+    '',
+    '## 冻结的验收契约',
+    contract,
+    '',
+    '## 要求',
+    '逐条核对契约，给出 PASS / FAIL / 无法判定，并给出证据（文件与行号）。',
+    '不要臆造未看到的代码。'
+  ].join('\n');
+
+  const res = await ex.runClaudeCode({ cwd: wt.path, prompt, mode: 'plan' });
+
+  // 证明审计没有改动被审计代码
+  const dirty = await new Promise((resolve) => {
+    import('node:child_process').then(({ execFile }) => {
+      execFile('git', ['-C', wt.path, 'status', '--porcelain'], { timeout: 30_000 }, (e, so) =>
+        resolve((so || '').trim())
+      );
+    });
+  });
+
+  const evidence = {
+    ...(res.evidence ?? {}),
+    audit: { repo, commit: wt.sha, contract, path: wt.path, worktreeClean: dirty === '' }
+  };
+  db()
+    .prepare("UPDATE executions SET status=?, model=?, output=?, error=?, evidence=?, finished_at=? WHERE id=? AND status='running'")
+    .run(res.ok ? 'ok' : 'failed', 'claude-code-audit', res.text ?? '', res.ok ? '' : res.error ?? '',
+         JSON.stringify(evidence), now(), execId);
+
+  await ex.removeFrozenWorktree({ repo, dest });
+
+  if (res.ok) updateTask(task.id, { status: 'done', output: res.text, error: '' });
+  else updateTask(task.id, { status: 'failed', error: res.error ?? '' });
+  return { ...res, evidence, task: getTask(task.id), execution: execId };
+}
+
+/* -------------------------------- Notifications ------------------------------- */
+
+export function setSetting(key, value) {
+  db().prepare('INSERT INTO settings (key,value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value').run(key, value);
+  return { key, value };
+}
+
+export function getSetting(key) {
+  return db().prepare('SELECT value FROM settings WHERE key = ?').get(key)?.value ?? null;
+}
+
+/**
+ * 通过 OpenClaw 已有的飞书通道发通知。
+ * 失败不抛异常：通知失败不应该让工作流回滚。
+ */
+async function notify(text) {
+  const target = process.env.JARVIS_NOTIFY_TARGET || getSetting('notify_target');
+  if (!target) return { sent: false, reason: 'notify_target 未配置' };
+  const { execFile } = await import('node:child_process');
+  const bin = join(HOME, '.openclaw/bin/openclaw');
+  return new Promise((resolve) => {
+    execFile(
+      bin,
+      ['message', 'send', '--channel', 'feishu', '--target', target, '-m', text],
+      { timeout: 60_000, env: { ...process.env, PATH: `${join(HOME, '.openclaw/bin')}:${process.env.PATH}` } },
+      (err, stdout, stderr) => {
+        const ok = !err;
+        event('notify.sent', null, { ok, error: ok ? '' : String(stderr || err).slice(0, 200) });
+        resolve({ sent: ok, error: ok ? '' : String(stderr || err).slice(0, 300) });
+      }
+    );
+  });
 }
 
 /* --------------------------------- Reporting --------------------------------- */
