@@ -66,7 +66,7 @@ const TOOLS = [
     description: '修改 Agent 的角色指令，不改变其模型与会话。',
     inputSchema: {
       type: 'object',
-      properties: { agent: { type: 'string' }, role: { type: 'string' } },
+      properties: { agent: { type: 'string', description: '名称，或 项目slug/名称' }, role: { type: 'string' } },
       required: ['agent', 'role']
     }
   },
@@ -75,7 +75,7 @@ const TOOLS = [
     description: '替换 Agent 使用的模型，保留其角色与会话。',
     inputSchema: {
       type: 'object',
-      properties: { agent: { type: 'string' }, model: { type: 'string' } },
+      properties: { agent: { type: 'string', description: '名称，或 项目slug/名称' }, model: { type: 'string' } },
       required: ['agent', 'model']
     }
   },
@@ -99,7 +99,7 @@ const TOOLS = [
     inputSchema: {
       type: 'object',
       properties: {
-        agent: { type: 'string' },
+        agent: { type: 'string', description: '名称，或 项目slug/名称' },
         message: { type: 'string' },
         conversation: { type: 'string', description: '会话 id，可省略' }
       },
@@ -113,8 +113,8 @@ const TOOLS = [
       type: 'object',
       properties: {
         project: { type: 'string' },
-        from: { type: 'string' },
-        to: { type: 'string' },
+        from: { type: 'string', description: '名称，或 项目slug/名称' },
+        to: { type: 'string', description: '名称，或 项目slug/名称' },
         requirement: { type: 'string', description: '原始要求' },
         artifact: { type: 'string', description: '需要传递的成果' },
         context: { type: 'string' },

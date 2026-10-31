@@ -114,12 +114,41 @@ export function listAgents(projectRef) {
   return db().prepare('SELECT * FROM agents WHERE project_id = ? ORDER BY created_at').all(p.id);
 }
 
-export function getAgent(ref) {
-  const row = db()
-    .prepare('SELECT * FROM agents WHERE id = ? OR name = ? OR openclaw_agent_id = ?')
-    .get(ref, ref, ref);
-  if (!row) throw new Error(`Agent 不存在: ${ref}`);
-  return row;
+/**
+ * 解析 Agent 引用。支持三种写法：
+ *   - agt_xxx               唯一 id
+ *   - <项目slug>/<名称>      推荐：跨项目同名时无歧义
+ *   - <名称>                 仅当全局唯一时允许
+ */
+export function getAgent(ref, projectRef) {
+  const value = String(ref);
+  if (value.includes('/')) {
+    const [projSlug, agentName] = value.split('/');
+    const p = getProject(projSlug);
+    const row = db().prepare('SELECT * FROM agents WHERE project_id = ? AND name = ?').get(p.id, agentName);
+    if (!row) throw new Error(`项目 ${projSlug} 中不存在 Agent: ${agentName}`);
+    return row;
+  }
+
+  const byId = db().prepare('SELECT * FROM agents WHERE id = ?').get(value);
+  if (byId) return byId;
+
+  let rows = db().prepare('SELECT * FROM agents WHERE name = ? OR openclaw_agent_id = ?').all(value, value);
+  if (projectRef) {
+    const p = getProject(projectRef);
+    rows = rows.filter((r) => r.project_id === p.id);
+  }
+  if (rows.length === 0) throw new Error(`Agent 不存在: ${value}`);
+  if (rows.length > 1) {
+    const hints = rows.map((r) => {
+      const p = db().prepare('SELECT slug FROM projects WHERE id = ?').get(r.project_id);
+      return `${p?.slug ?? r.project_id}/${r.name}`;
+    });
+    throw new Error(
+      `Agent 名称有歧义: ${value}（命中 ${rows.length} 个：${hints.join('、')}）。请用「项目slug/名称」指定。`
+    );
+  }
+  return rows[0];
 }
 
 export function setAgentRole(ref, role) {
@@ -326,8 +355,8 @@ export async function runTask(ref) {
  */
 export async function handoff({ project: projectRef, from, to, title, requirement, artifact, context, constraints }) {
   const project = getProject(projectRef);
-  const src = getAgent(from);
-  const dst = getAgent(to);
+  const src = getAgent(from, project.id);
+  const dst = getAgent(to, project.id);
   if (src.project_id !== project.id || dst.project_id !== project.id) {
     throw new Error('交接双方必须属于同一项目');
   }

@@ -99,6 +99,26 @@ zai/glm-5.3-flash  zai/glm-4.5-air    zai/glm-5-turbo …
 | 无无限循环 | PASS | `maxRounds` + `max_attempts` 双重上限 |
 | 不能擅自合并主干 | PASS | 未配置任何 git push/merge 权限给 Agent |
 
+## 实测中发现并修复的缺陷
+
+**同名 Agent 跨项目冲突**（由 JARVIS 在真实执行中报告）：
+
+```text
+reviewer 同时存在于 p1-orch 与 p1-verify
+→ handoff 报「交接双方必须属于同一项目」
+```
+
+根因：`getAgent` 只按名称全局匹配，命中多条时取第一条。
+
+修复：支持 `项目slug/名称` 寻址，并在歧义时抛出带候选列表的明确错误：
+
+```text
+Agent 名称有歧义: reviewer（命中 2 个：p1-orch/reviewer、p1-verify/reviewer）。
+请用「项目slug/名称」指定。
+```
+
+验证：`agent role --agent p1-verify/reviewer` 正常解析；裸 `reviewer` 报歧义。
+
 ## 单元测试
 
 ```text
