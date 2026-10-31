@@ -15,7 +15,7 @@
 | 飞书连接 | PASS | `channels status --probe` = `connected, works` |
 | JARVIS 角色 | PASS | `workspace/SOUL.md`、`IDENTITY.md`、`USER.md` |
 | 安全权限 | PASS | `security audit` = 0 critical；新 session 实测 `Unknown tool id: exec` |
-| 手机端测试 | PASS | iPhone 私聊收到回复；出站消息 ID `om_x100b616ebf9444a8df28dd7dea47925` |
+| 手机端测试 | PASS | iPhone 私聊收到回复；出站消息 ID `om_<redacted>` |
 
 ## 关键运行参数
 
@@ -35,7 +35,7 @@ Tools     profile=messaging +group:fs +group:memory  fs.workspaceOnly=true
 | 17:01:01 | 生成配对请求（后续改用 allowlist） |
 | 17:03:03 | 白名单放行：`DM from ou_0ec1...` → `dispatching to agent (session=agent:jarvis:main)` |
 | 17:03:15 | `dispatch complete (queuedFinal=true, replies=1)` |
-| 17:04:21 | CLI 出站成功：`om_x100b616ebf9444a8df28dd7dea47925` |
+| 17:04:21 | CLI 出站成功：`om_<redacted>` |
 | 17:06 | 记忆落盘：`memory/2026-10-31.md` 由 agent 自行写入 |
 
 ## 记忆验证
