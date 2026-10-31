@@ -5,7 +5,7 @@
  */
 import * as svc from './service.mjs';
 import * as oc from './oc.mjs';
-import { runMacAuth, verifyApprovalSignature as secVerify } from './security.mjs';
+import { verifyApprovalSignature, signWithOsKey } from './security.mjs';
 import { hostname } from 'node:os';
 
 const argv = process.argv.slice(2);
@@ -217,40 +217,44 @@ async function main() {
         print(svc.setWorkflowStatus(require_('workflow'), 'paused'));
         break;
 
-      /* 管理员入口（本地可信） */
+      /* 管理员入口（本地可信）：签名审批 + 校验配置登记 */
       case 'verify-profile:add': {
-        const auth = await runMacAuth({
-          reason: `登记可信校验配置：${opt.name}（${opt.program}）`,
-          timeoutSeconds: Number(process.env.JARVIS_AUTH_TIMEOUT || 60)
-        });
-        if (!auth.ok) fail(`系统认证未通过，拒绝登记校验配置（code=${auth.code}）`);
-        const argv = opt.argv ? JSON.parse(opt.argv) : [];
-        print(svc.createVerifyProfile({
+        const content = {
+          kind: 'verify_profile',
           project: require_('project'),
           name: require_('name'),
           program: require_('program'),
-          argv,
-          cwd: opt.cwd,
+          argv: opt.argv ? JSON.parse(opt.argv) : [],
+          cwd: opt.cwd ?? null
+        };
+        const challenge = svc.createContentChallenge(content);
+        const signed = await signWithOsKey({ payload: challenge.payload, reason: `登记可信校验配置 ${content.name}` });
+        if (!signed.ok) fail(`无法获得可信用户签名（${signed.error}），拒绝登记`);
+        const verified = verifyApprovalSignature({ payload: challenge.payload, signatureB64: signed.signature });
+        if (!verified.ok) fail(`签名校验失败：${verified.error}`);
+        if (!svc.consumeContentChallenge(challenge.nonce, challenge.digest)) fail('挑战无效或已被使用');
+        print(svc.createVerifyProfile({
+          project: content.project,
+          name: content.name,
+          program: content.program,
+          argv: content.argv,
+          cwd: content.cwd ?? undefined,
           timeoutMs: opt.timeout ? Number(opt.timeout) : undefined
         }));
         break;
       }
-      case 'verify-profile:list':
-        print(svc.listVerifyProfiles(opt.project));
-        break;
       case 'approve:': {
-        // FIX3-A：一次性挑战 + 操作系统密钥签名，服务端独立验签。
-        // 助手不可用时 fail closed，不回退到 TTY / 固定字符串。
+        // FIX3-A：一次性挑战 + OS 密钥签名 + 服务端独立验签
         const taskRef = require_('task');
         const challenge = svc.createAuthChallenge(taskRef);
         const signed = await signWithOsKey({
           payload: challenge.payload,
-          reason: challenge.reason.slice(0, 200)
+          reason: challenge.reason.slice(0, 180)
         });
         if (!signed.ok) {
           fail(`无法获得可信用户签名（${signed.error}）。高风险授权保持拒绝。`);
         }
-        const verified = secVerify({
+        const verified = verifyApprovalSignature({
           payload: challenge.payload,
           signatureB64: signed.signature
         });
@@ -263,54 +267,16 @@ async function main() {
         print(svc.issueApproval({
           task: taskRef,
           ttlHours: opt.ttl ? Number(opt.ttl) : 24,
-          issuedBy: `macos-signing:uid=${process.getuid?.() ?? 'unknown'}@${hostname()}`,
+          issuedBy: `os-signature:uid=${process.getuid?.() ?? 'unknown'}@${hostname()}`,
           auth: { method: 'os-signature', nonce: challenge.nonce }
-        }));
-        break;
-      }
-      case 'verify-profile:add': {
-        const auth = await runMacAuth({
-          reason: `登记可信校验配置：${opt.name}（${opt.program}）`,
-          timeoutSeconds: Number(process.env.JARVIS_AUTH_TIMEOUT || 60)
-        });
-        if (!auth.ok) fail(`系统认证未通过，拒绝登记校验配置（code=${auth.code}）`);
-        const argv = opt.argv ? JSON.parse(opt.argv) : [];
-        print(svc.createVerifyProfile({
-          project: require_('project'),
-          name: require_('name'),
-          program: require_('program'),
-          argv,
-          cwd: opt.cwd,
-          timeoutMs: opt.timeout ? Number(opt.timeout) : undefined
-        }));
-        break;
-      }
-      case 'verify-profile:list':
-        print(svc.listVerifyProfiles(opt.project));
-        break;
-      case 'approve:': {
-        // DEF-04：必须通过 macOS 系统认证；TTY / 固定字符串不再构成授权依据
-        const taskRef = require_('task');
-        const preview = svc.approvalPreview(taskRef);
-        const auth = await runMacAuth({
-          reason: preview.reason,
-          timeoutSeconds: Number(process.env.JARVIS_AUTH_TIMEOUT || 60)
-        });
-        if (!auth.ok) {
-          fail(
-            `系统认证未通过（code=${auth.code}）：${auth.stderr || '无法确认用户在场'}。高风险授权保持拒绝。`
-          );
-        }
-        print(svc.issueApproval({
-          task: taskRef,
-          ttlHours: opt.ttl ? Number(opt.ttl) : 24,
-          issuedBy: `macos-localauth:uid=${process.getuid?.() ?? 'unknown'}@${hostname()}`,
-          auth
         }));
         break;
       }
       case 'approval:list':
         print(svc.listApprovals(require_('task')));
+        break;
+      case 'verify-profile:list':
+        print(svc.listVerifyProfiles(opt.project));
         break;
 
       /* 自检 */

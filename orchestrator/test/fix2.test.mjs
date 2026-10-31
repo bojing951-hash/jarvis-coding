@@ -166,10 +166,8 @@ test('DEF-04 认证超时（替身返回 3）不得授权', async () => {
   }
 });
 
-test('DEF-04 伪 TTY 不再是授权依据（旧接口已不参与审批）', () => {
-  // 审批路径只调用 runMacAuth；requireInteractiveOperator 若仍存在也不能被 CLI 使用
-  const cli = execFileSync('grep', ['-c', 'runMacAuth', join(process.cwd(), 'orchestrator/src/cli.mjs')], {
-    encoding: 'utf8'
-  }).trim();
-  assert.ok(Number(cli) >= 1, 'CLI 必须使用 runMacAuth');
+test('DEF-04 审批只走签名验签，不再用退出码认证', () => {
+  const src = execFileSync('cat', ['orchestrator/src/cli.mjs'], { encoding: 'utf8' });
+  assert.ok(src.includes('verifyApprovalSignature'), 'CLI 必须做服务端验签');
+  assert.ok(!src.includes('runMacAuth'), 'CLI 不得再用仅凭退出码的认证');
 });

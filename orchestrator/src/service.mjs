@@ -1324,6 +1324,26 @@ export function createAuthChallenge(taskRef, ttlMs = 5 * 60 * 1000) {
   };
 }
 
+/** 绑定任意内容的一次性挑战（用于登记类操作）。 */
+export function createContentChallenge(content, ttlMs = 5 * 60 * 1000) {
+  const digest = sha256(canonicalJson(content));
+  const nonce = newNonce();
+  const expiresAt = new Date(Date.now() + ttlMs).toISOString();
+  db().prepare('INSERT INTO auth_nonces (nonce,task_id,digest,expires_at,created_at) VALUES (?,?,?,?,?)')
+    .run(nonce, 'content', digest, expiresAt, now());
+  return {
+    nonce, digest, expires_at: expiresAt,
+    payload: Buffer.from(canonicalJson({ content, nonce, expires_at: expiresAt }), 'utf8')
+  };
+}
+
+export function consumeContentChallenge(nonce, digest) {
+  const r = db()
+    .prepare("UPDATE auth_nonces SET used_at=? WHERE nonce=? AND task_id='content' AND digest=? AND used_at IS NULL AND expires_at > ?")
+    .run(now(), nonce, digest, now());
+  return r.changes === 1;
+}
+
 /** 原子消耗挑战（防重放）。 */
 export function consumeAuthChallenge(nonce, taskId, digest) {
   const r = db()
