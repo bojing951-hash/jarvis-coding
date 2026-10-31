@@ -5,6 +5,9 @@
 
 ## 可用模型清单（决定 TEST-01 的边界）
 
+> 补充：另有一个**本地 mock provider** 验证脚本，证明「接第二个 provider 只需配置、不改代码」。
+> 见本文末尾「Provider 可插拔性」。该验证使用 mock 服务，**不代表已接入真实厂商**。
+
 `openclaw models list` 实际可用：**只有 zai（GLM 系列）有凭据**。
 
 ```text
@@ -209,11 +212,29 @@ task_create 报错 / handoff 报错 / workflow_run 报错
 `runWorkflow` 抛异常时状态不回滚，工作流永远停在 `running cursor=0`。
 修复：包一层 try/catch，异常时置 `failed` 并记录事件。
 
+## Provider 可插拔性（本地 mock，非厂商 API）
+
+```text
+node orchestrator/scripts/verify-provider-agnostic.mjs
+```
+
+| 步骤 | 结果 |
+|---|---|
+| 本地 mock OpenAI-compatible 服务启动 | PASS |
+| 注册第二个 provider（纯配置，零代码改动） | PASS |
+| 模型出现在 `models list` | PASS（`mock/mock-1`） |
+| 用新 provider 创建 Agent | PASS |
+| 真实调用返回预期回复 | PASS（`MOCK_PROVIDER_OK`） |
+| 清理并恢复配置 | PASS（providers 回到只有 `zai`） |
+
+结论：接入 GPT / Claude / DeepSeek 属于**配置工作**，不需要改动 orchestrator 代码。
+但「真实厂商调用」仍为 WAITING——mock 不能替代真实 API 证据。
+
 ## 单元测试
 
 ```text
 node --test orchestrator/test/*.test.mjs
-tests 7 / pass 7 / fail 0
+tests 14 / pass 14 / fail 0
 ```
 
 覆盖：项目创建与 slug 冲突、审批门拦截、项目暂停拦截、重试上限、空工作流拒绝。

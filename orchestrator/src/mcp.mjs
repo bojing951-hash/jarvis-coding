@@ -95,7 +95,7 @@ const TOOLS = [
   },
   {
     name: 'talk',
-    description: '向指定 Agent 发送消息并取得真实回复。不传 conversation 时自动新建独立会话；传入则续接该会话上下文。',
+    description: '与单个 Agent 多轮对话（独立会话）。只回答问题、不产生任务记录；需要留痕或交接时用 handoff / task_create。',
     inputSchema: {
       type: 'object',
       properties: {
@@ -109,7 +109,7 @@ const TOOLS = [
   },
   {
     name: 'handoff',
-    description: '把任务与成果从一个 Agent 交接给另一个 Agent 真实执行，返回接收方的实际执行结果。',
+    description: '【跨 Agent 交接的首选方式】把任务与成果从一个 Agent 交接给另一个 Agent 真实执行，自动建任务并落执行证据。用户说「交给/让 X 看/让 X 审核」时优先用这个，不要用 task_create + task_run 手工拼。',
     inputSchema: {
       type: 'object',
       properties: {
@@ -126,7 +126,7 @@ const TOOLS = [
   },
   {
     name: 'task_create',
-    description: '创建任务，可指定执行 Agent 与是否需人工审批。',
+    description: '创建任务（单 Agent 执行，或 executor 外部执行器）。跨 Agent 交接请改用 handoff；需要先人工审批时设 needs_approval。',
     inputSchema: {
       type: 'object',
       properties: {

@@ -47,7 +47,13 @@ function run(args, timeoutMs = 300_000) {
 /** OpenClaw 的 --json 会在 JSON 后追加状态行，需容错解析。 */
 export function parseJsonLoose(raw) {
   if (!raw) return null;
-  const start = raw.indexOf('{');
+  // 顶层可能是对象或数组，取最先出现的那个
+  const objAt = raw.indexOf('{');
+  const arrAt = raw.indexOf('[');
+  let start;
+  if (objAt < 0) start = arrAt;
+  else if (arrAt < 0) start = objAt;
+  else start = Math.min(objAt, arrAt);
   if (start < 0) return null;
   try {
     return new JSONDecoderShim().decode(raw.slice(start));

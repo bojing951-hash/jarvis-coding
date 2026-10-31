@@ -6,7 +6,7 @@
 
 | 编号 | 能力 | 状态 |
 |---|---|---|
-| P1-01 | 动态创建不同模型的独立对话 | **PASS**（GLM 家族）/ **WAITING**（GPT/Claude/DeepSeek） |
+| P1-01 | 动态创建不同模型的独立对话 | **PASS**（GLM 家族 + provider 可插拔已实证）/ **WAITING**（真实 GPT/Claude/DeepSeek） |
 | P1-02 | 动态创建 Agent（模型与角色解耦） | **PASS** |
 | P1-03 | 跨 Agent 通信 | **PASS** |
 | P1-04 | 动态项目管理 | **PASS** |
@@ -72,6 +72,15 @@
 | 轨迹 | `task_create ok` → `task_run ok` → `task_create ok` → `task_run ok` |
 
 首次失败没有粉饰：JARVIS 当时用模型自己回答了，**已被落库证据识破并修复**。
+
+## 运维能力
+
+| 能力 | 状态 |
+|---|---|
+| `doctor` 环境自检（9 项） | PASS，`8 PASS / 1 WARN`（WARN = 只有单一 provider） |
+| 单元测试 | 14 / 14 |
+| Provider 可插拔验证 | PASS，6/6（本地 mock） |
+| 执行证据可追溯 | PASS，`executions` 表含模型、耗时、错误、git 版本、verify、commit |
 
 ## 明确未做（不擅自扩范围）
 

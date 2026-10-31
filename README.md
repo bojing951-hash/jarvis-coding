@@ -53,9 +53,17 @@ OpenClaw（复用）
 - 安全审查：[docs/09-security-review.md](docs/09-security-review.md)
 - 功能状态：[docs/10-status.md](docs/10-status.md)
 - 调度层用法：[orchestrator/README.md](orchestrator/README.md)
+- 飞书使用手册：[docs/11-usage.md](docs/11-usage.md)
 
 已验证：多模型独立会话、跨 Agent 真实交接、并行研究→汇总工作流、人工审批门、
-Gateway 重启后状态恢复、Claude Code + GLM 只读执行。
+Gateway 重启后状态恢复、Claude Code + GLM 只读与写模式执行、测试校验、Git 提交、
+任务取消、完成通知、固定 commit 的只读审计。
+
+自检命令：
+
+```bash
+~/.openclaw/tools/node/bin/node ~/JarvisCoding/orchestrator/src/cli.mjs doctor
+```
 
 未验证（WAITING）：GPT / Claude / DeepSeek 真实 API 会话——本机无对应凭据。
 

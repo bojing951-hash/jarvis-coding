@@ -210,6 +210,19 @@ async function main() {
         print(svc.setWorkflowStatus(require_('workflow'), 'paused'));
         break;
 
+      /* 自检 */
+      case 'doctor:': {
+        const { runDoctor } = await import('./doctor.mjs');
+        const r = await runDoctor();
+        if (asJson) print(r);
+        else {
+          for (const c of r.checks) console.log(`${c.status.padEnd(5)} ${c.name.padEnd(20)} ${c.detail}`);
+          console.log('\n' + JSON.stringify(r.summary));
+        }
+        if (!r.ok) process.exit(2);
+        break;
+      }
+
       /* settings */
       case 'config:notify':
         print(svc.setSetting('notify_target', require_('target')));
@@ -244,6 +257,7 @@ async function main() {
             'handoff --project <ref> --from <agent> --to <agent> --requirement <文本> [--artifact <文本>] [--context <文本>] [--constraints <文本>]',
             'workflow create --project <ref> --name <n> --spec-file <json>',
             'workflow run --workflow <id|name> | workflow list [--project <ref>] | workflow pause --workflow <id>',
+            'doctor                      # 环境自检（PASS/WARN/FAIL）',
             'config notify --target <feishu chat_id> | config show',
             'models [--provider <id>]',
             'status --project <ref>'
