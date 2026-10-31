@@ -23,6 +23,25 @@ const ALLOW = (process.env.ALLOW_HOSTS || 'open.bigmodel.cn')
 const MODEL_PREFIX = process.env.MODEL_PROXY_PREFIX || '/api/anthropic';
 const UPSTREAM_HOST = process.env.MODEL_UPSTREAM_HOST || 'open.bigmodel.cn';
 const KEY_FILE = process.env.GLM_KEY_FILE || '/run/secrets/glm.key';
+const TOKENS_FILE = process.env.MODEL_TOKENS_FILE || '/run/secrets/model-tokens.json';
+
+/** 读取有效的执行级令牌（宿主写入，只读挂载）。 */
+function loadTokens() {
+  try {
+    const raw = readFileSync(TOKENS_FILE, 'utf8');
+    const obj = JSON.parse(raw || '{}');
+    const now = Date.now();
+    const out = {};
+    for (const [tok, meta] of Object.entries(obj)) {
+      if (!meta?.expires_at) continue;
+      if (new Date(meta.expires_at).getTime() <= now) continue;
+      out[tok] = meta;
+    }
+    return out;
+  } catch {
+    return {};
+  }
+}
 
 function loadKey() {
   try {
@@ -55,7 +74,20 @@ const server = createServer((req, res) => {
     return;
   }
 
-  const upstreamPath = req.url; // 保留 /api/anthropic/... 前缀
+  // FIX3-F：执行级令牌校验。路径形如 /api/anthropic/s/<token>/v1/messages
+  const rest = req.url.slice(MODEL_PREFIX.length);
+  const m = rest.match(/^\/s\/([A-Za-z0-9_-]{16,})\/?(.*)$/);
+  const headerTok = String(req.headers['x-jarvis-exec'] || '');
+  const token = m ? m[1] : headerTok;
+  const tokens = loadTokens();
+  if (!token || !tokens[token]) {
+    console.error(`[model-deny] ${req.method} ${req.url} token=${token ? token.slice(0, 6) + '…' : 'none'}`);
+    res.writeHead(401, { 'content-type': 'text/plain' });
+    res.end('model authorization required\n');
+    return;
+  }
+
+  const upstreamPath = MODEL_PREFIX + (m ? (m[2] ? '/' + m[2] : '/') : req.url.slice(MODEL_PREFIX.length));
   const headers = { ...req.headers };
   delete headers.host;
   headers.host = UPSTREAM_HOST;
@@ -76,7 +108,7 @@ const server = createServer((req, res) => {
     }
   });
   req.pipe(upstream);
-  console.error(`[model] ${req.method} ${upstreamPath}`);
+  console.error(`[model] exec=${tokens[token].execution_id} ${req.method} ${upstreamPath}`);
 });
 
 server.on('connect', (req, clientSocket, head) => {

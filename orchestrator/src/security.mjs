@@ -8,10 +8,12 @@
  * 3. 无法确认时一律拒绝（fail closed）。
  */
 import { createHash } from 'node:crypto';
-import { realpathSync, existsSync, statSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs';
+import { realpathSync, existsSync, statSync } from 'node:fs';
 import { resolve, sep } from 'node:path';
 import { hostname, homedir } from 'node:os';
 import { execFile } from 'node:child_process';
+import { createVerify, createPublicKey, randomBytes } from 'node:crypto';
+import { readFileSync, writeFileSync, mkdirSync, unlinkSync } from 'node:fs';
 
 /* ------------------------------- 参数摘要 ---------------------------------- */
 
@@ -247,6 +249,75 @@ export async function runMacAuth({ reason, timeoutSeconds = 60, helperPath } = {
       }
     );
   });
+}
+
+/* ------------------------- FIX3-A 审批签名证明 ------------------------------ */
+
+const AUTH_DIR = `${homedir()}/.openclaw/jarvis/auth`;
+export const AUTH_PUBKEY = `${AUTH_DIR}/pubkey.der`;
+export const AUTH_SIGNER = process.env.JARVIS_AUTH_SIGNER || `${homedir()}/.openclaw/jarvis/bin/jarvis-auth`;
+
+/** 审批载荷：绑定任务、参数摘要、一次性挑战与有效期。 */
+export function buildApprovalPayload({ taskId, digest, nonce, expiresAt }) {
+  return Buffer.from(
+    canonicalJson({ task_id: taskId, digest, nonce, expires_at: expiresAt }),
+    'utf8'
+  );
+}
+
+export function newNonce() {
+  return randomBytes(16).toString('hex');
+}
+
+/** 服务端独立验签：不信任助手退出码，只信公钥验证结果。 */
+export function verifyApprovalSignature({ payload, signatureB64, pubkeyDerPath = AUTH_PUBKEY }) {
+  let der;
+  try {
+    der = readFileSync(pubkeyDerPath);
+  } catch {
+    return { ok: false, error: `缺少审批公钥: ${pubkeyDerPath}` };
+  }
+  let pub;
+  try {
+    pub = createPublicKey({ key: der, format: 'der', type: 'spki' });
+  } catch (e) {
+    return { ok: false, error: `公钥不可解析: ${e.message}` };
+  }
+  let sig;
+  try {
+    sig = Buffer.from(signatureB64, 'base64');
+  } catch {
+    return { ok: false, error: '签名不是合法 base64' };
+  }
+  try {
+    const ok = createVerify('sha256').update(payload).verify(pub, sig);
+    return ok ? { ok: true } : { ok: false, error: '签名校验失败' };
+  } catch (e) {
+    return { ok: false, error: `验签异常: ${e.message}` };
+  }
+}
+
+/** 调用签名器；返回签名 base64。失败即拒绝（不降级到 TTY/固定串）。 */
+export async function signWithOsKey({ payload, reason, timeoutSeconds = 90 }) {
+  const dir = `${homedir()}/.openclaw/jarvis/run`;
+  mkdirSync(dir, { recursive: true });
+  const payloadFile = `${dir}/approval-payload-${randomBytes(6).toString('hex')}.json`;
+  writeFileSync(payloadFile, payload, { mode: 0o600 });
+  try {
+    return await new Promise((resolve) => {
+      execFile(
+        AUTH_SIGNER,
+        ['sign', payloadFile, reason],
+        { timeout: (timeoutSeconds + 10) * 1000, maxBuffer: 1024 * 1024 },
+        (err, stdout, stderr) => {
+          if (err) return resolve({ ok: false, error: (stderr || err.message).slice(0, 300) });
+          resolve({ ok: true, signature: String(stdout).trim() });
+        }
+      );
+    });
+  } finally {
+    try { unlinkSync(payloadFile); } catch {}
+  }
 }
 
 export function operatorIdentity() {

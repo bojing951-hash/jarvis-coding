@@ -5,7 +5,7 @@
  */
 import * as svc from './service.mjs';
 import * as oc from './oc.mjs';
-import { runMacAuth } from './security.mjs';
+import { runMacAuth, verifyApprovalSignature as secVerify } from './security.mjs';
 import { hostname } from 'node:os';
 
 const argv = process.argv.slice(2);
@@ -218,6 +218,56 @@ async function main() {
         break;
 
       /* 管理员入口（本地可信） */
+      case 'verify-profile:add': {
+        const auth = await runMacAuth({
+          reason: `登记可信校验配置：${opt.name}（${opt.program}）`,
+          timeoutSeconds: Number(process.env.JARVIS_AUTH_TIMEOUT || 60)
+        });
+        if (!auth.ok) fail(`系统认证未通过，拒绝登记校验配置（code=${auth.code}）`);
+        const argv = opt.argv ? JSON.parse(opt.argv) : [];
+        print(svc.createVerifyProfile({
+          project: require_('project'),
+          name: require_('name'),
+          program: require_('program'),
+          argv,
+          cwd: opt.cwd,
+          timeoutMs: opt.timeout ? Number(opt.timeout) : undefined
+        }));
+        break;
+      }
+      case 'verify-profile:list':
+        print(svc.listVerifyProfiles(opt.project));
+        break;
+      case 'approve:': {
+        // FIX3-A：一次性挑战 + 操作系统密钥签名，服务端独立验签。
+        // 助手不可用时 fail closed，不回退到 TTY / 固定字符串。
+        const taskRef = require_('task');
+        const challenge = svc.createAuthChallenge(taskRef);
+        const signed = await signWithOsKey({
+          payload: challenge.payload,
+          reason: challenge.reason.slice(0, 200)
+        });
+        if (!signed.ok) {
+          fail(`无法获得可信用户签名（${signed.error}）。高风险授权保持拒绝。`);
+        }
+        const verified = secVerify({
+          payload: challenge.payload,
+          signatureB64: signed.signature
+        });
+        if (!verified.ok) {
+          fail(`审批签名校验失败：${verified.error}`);
+        }
+        if (!svc.consumeAuthChallenge(challenge.nonce, challenge.task_id, challenge.digest)) {
+          fail('审批挑战无效或已被使用');
+        }
+        print(svc.issueApproval({
+          task: taskRef,
+          ttlHours: opt.ttl ? Number(opt.ttl) : 24,
+          issuedBy: `macos-signing:uid=${process.getuid?.() ?? 'unknown'}@${hostname()}`,
+          auth: { method: 'os-signature', nonce: challenge.nonce }
+        }));
+        break;
+      }
       case 'verify-profile:add': {
         const auth = await runMacAuth({
           reason: `登记可信校验配置：${opt.name}（${opt.program}）`,

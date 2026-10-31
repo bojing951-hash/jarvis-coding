@@ -8,8 +8,9 @@ import { homedir } from 'node:os';
 import { openDatabase, now, newId, slugify } from './db.mjs';
 import * as oc from './oc.mjs';
 import * as ex from './executor.mjs';
-import { validateExecutorConfig, resolveProjectPath, taskDigest, commitGate, canonicalJson, sha256, computeVerdict, operatorIdentity } from './security.mjs';
+import { buildApprovalPayload, newNonce, signWithOsKey, verifyApprovalSignature, validateExecutorConfig, resolveProjectPath, taskDigest, commitGate, canonicalJson, sha256, computeVerdict, operatorIdentity } from './security.mjs';
 import * as iso from './isolation.mjs';
+import { randomBytes } from 'node:crypto';
 
 const HOME = homedir();
 export const JARVIS_HOME = process.env.JARVIS_HOME || join(HOME, '.openclaw', 'jarvis');
@@ -343,7 +344,7 @@ export async function runTask(ref) {
   }
   if (task.attempts >= task.max_attempts) {
     db()
-      .prepare("UPDATE tasks SET status='failed', error='超过最大重试次数', updated_at=? WHERE id=? AND status NOT IN ('done','cancelled','cancel_failed')")
+      .prepare("UPDATE tasks SET status='failed', error='超过最大重试次数', updated_at=? WHERE id=? AND status IN ('pending','approved','retry_pending')")
       .run(now(), task.id);
     return { ok: false, blocked: 'max_attempts', error: '超过最大重试次数' };
   }
@@ -602,7 +603,7 @@ function recordAttempt({ task, project, phase, status, blocked, reason, plan }) 
  * 运行时凭据文件：只读挂载进容器，入口脚本 source 后并删除。
  * 不写入镜像，也不通过 docker run -e 传递（避免出现在 docker inspect）。
  */
-function writeCredentialFile(execId, proxyUrl) {
+function writeCredentialFile(execId, proxyUrl, modelToken) {
   const settingsPath = join(HOME, '.claude/settings.json');
   let env = {};
   try {
@@ -618,7 +619,7 @@ function writeCredentialFile(execId, proxyUrl) {
   // RISK-01：容器内只放代理地址与模型名，不包含任何 API Key
   // 占位凭据：让 CLI 认为已登录；真实密钥由宿主代理注入，容器内不存在
   const body = [
-    `ANTHROPIC_BASE_URL=${proxyUrl}/api/anthropic`,
+    `ANTHROPIC_BASE_URL=${proxyUrl}/api/anthropic/s/${modelToken}`,
     `ANTHROPIC_API_KEY=proxy-managed-placeholder`,
     `ANTHROPIC_AUTH_TOKEN=proxy-managed-placeholder`,
     `ANTHROPIC_MODEL=${env.ANTHROPIC_MODEL ?? env.ANTHROPIC_CUSTOM_MODEL_OPTION ?? 'glm-5.3'}`
@@ -668,16 +669,48 @@ async function runExecutorTask(task, project) {
     return { ok: false, blocked: 'missing_worktree_spec', error: msg };
   }
 
-  const claim = db()
-    .prepare(`UPDATE tasks SET status='running', attempts=attempts+1, updated_at=?
-              WHERE id=? AND status IN ('pending','authorized','retry_pending')`)
-    .run(now(), task.id);
-  if (claim.changes !== 1) {
-    recordAttempt({ task, project, phase: 'claim', status: 'rejected', blocked: 'already_running', reason: '状态不允许执行', plan: resolved });
-    return { ok: false, blocked: 'already_running', error: '任务已在运行或状态不允许执行' };
+  // FIX3-B：授权检查 + 状态抢占 + 一次性授权消耗，必须在同一事务内完成。
+  // 并发请求只有一个能同时满足三者。
+  let claimedApprovalId = null;
+  db().exec('BEGIN IMMEDIATE');
+  try {
+    if (needsApproval) {
+      const recheck = findValidApproval(task.id, resolved.digest);
+      if (!recheck.valid) {
+        db().exec('ROLLBACK');
+        recordAttempt({ task, project, phase: 'authorize', status: 'rejected', blocked: 'needs_approval', reason: recheck.reason, plan: resolved });
+        return { ok: false, blocked: 'needs_approval', error: `需要本地管理员审批：${recheck.reason}` };
+      }
+      const consume = db()
+        .prepare('UPDATE approvals SET used_at=? WHERE id=? AND used_at IS NULL AND revoked_at IS NULL')
+        .run(now(), recheck.approval.id);
+      if (consume.changes !== 1) {
+        db().exec('ROLLBACK');
+        recordAttempt({ task, project, phase: 'authorize', status: 'rejected', blocked: 'approval_consumed', reason: '授权已被其它执行消耗', plan: resolved });
+        return { ok: false, blocked: 'approval_consumed', error: '该授权已被其它执行消耗' };
+      }
+      claimedApprovalId = recheck.approval.id;
+      approval = { valid: true, approval: recheck.approval };
+    }
+
+    const claim = db()
+      .prepare(`UPDATE tasks SET status='running', attempts=attempts+1, updated_at=?
+                WHERE id=? AND status IN ('pending','authorized','retry_pending')`)
+      .run(now(), task.id);
+    if (claim.changes !== 1) {
+      db().exec('ROLLBACK');
+      recordAttempt({ task, project, phase: 'claim', status: 'rejected', blocked: 'already_running', reason: '状态不允许执行', plan: resolved });
+      return { ok: false, blocked: 'already_running', error: '任务已在运行或状态不允许执行' };
+    }
+    db().exec('COMMIT');
+  } catch (e) {
+    try { db().exec('ROLLBACK'); } catch {}
+    throw e;
   }
 
+
   const execId = recordAttempt({ task, project, phase: 'execute', status: 'running', plan: resolved });
+  const modelToken = registerModelToken(execId, task.id);
   const dest = join(JARVIS_HOME, 'worktrees', task.id);
   let credFile = null;
   let commit = null;
@@ -697,14 +730,16 @@ async function runExecutorTask(task, project) {
     }
 
     const proxyUrl = await iso.egressProxyUrl();
-    const cred = writeCredentialFile(execId, proxyUrl);
+    const cred = writeCredentialFile(execId, proxyUrl, modelToken);
     if (!cred.ok) {
       finalizeAttempt(task, execId, { status: 'failed', reason: cred.error });
       return { ok: false, blocked: 'credentials_unavailable', error: cred.error };
     }
     credFile = cred.file;
     const containerName = `jarvis-exec-${execId}`;
+    const execResId = registerResource({ executionId: execId, taskId: task.id, kind: 'claude', name: containerName });
     const res = await iso.runClaudeIsolated({
+      modelToken,
       name: containerName,
       workdir: dest,
       prompt: task.input,
@@ -724,14 +759,17 @@ async function runExecutorTask(task, project) {
     let verify = null;
     if (res.ok && resolved.profile) {
       db().prepare("UPDATE tasks SET status='verifying', updated_at=? WHERE id=? AND status='running'").run(now(), task.id);
+      const verifyName = `jarvis-verify-${execId}`;
+      const verifyResId = registerResource({ executionId: execId, taskId: task.id, kind: 'verify', name: verifyName });
       const vr = await iso.runInWorkdir({
-        name: `jarvis-verify-${execId}`,
+        name: verifyName,
         workdir: dest,
         program: resolved.profile.program,
         args: JSON.parse(resolved.profile.argv || '[]'),
         image: st.image
       });
       verify = { exitCode: vr.exitCode, ok: vr.ok, output: vr.output, program: resolved.profile.program, argv: JSON.parse(resolved.profile.argv || '[]') };
+      finishResource(verifyResId, 'stopped');
     }
 
     // 修改范围检查
@@ -800,7 +838,7 @@ async function runExecutorTask(task, project) {
       },
       authorization: { required: needsApproval, approval: approval.approval ? { id: approval.approval.id, digest: resolved.digest } : null }
     };
-    if (approval.approval) db().prepare('UPDATE approvals SET used_at=? WHERE id=?').run(now(), approval.approval.id);
+    // 授权已在事务内消耗，此处不再重复标记
 
     finalizeAttempt(task, execId, {
       status: verdict.status === 'done' ? 'ok' : verdict.status === 'cancelled' ? 'cancelled' : 'failed',
@@ -822,6 +860,7 @@ async function runExecutorTask(task, project) {
       execution: execId
     };
   } finally {
+    revokeModelToken(modelToken);
     try { if (credFile) rmSync(credFile, { force: true }); } catch {}
     if (evidenceRefPreserve) {
       event('worktree.preserved', project.id, { task: task.id, path: evidenceRefPreserve });
@@ -1046,10 +1085,22 @@ export async function cancelTask(ref) {
       }
     }
 
-    // DEF-02：同一 Execution 的执行容器与验证容器都要纳入控制
-    const targets = [`jarvis-exec-${exRow.id}`, `jarvis-verify-${exRow.id}`];
+    // FIX3-C：以执行资源登记为准，不依赖硬编码名称
+    const resources = db()
+      .prepare("SELECT * FROM execution_resources WHERE execution_id=? AND state IN ('started','running','stopping')")
+      .all(exRow.id);
+    const targets = resources.filter((r) => ['claude', 'verify', 'audit'].includes(r.kind)).map((r) => r.name);
+    if (!targets.length) {
+      // 兼容：老执行没有资源登记
+      targets.push(`jarvis-exec-${exRow.id}`, `jarvis-verify-${exRow.id}`);
+    }
     const containerResults = [];
-    for (const tname of targets) containerResults.push({ name: tname, ...(await iso.killContainer(tname)) });
+    for (const tname of targets) {
+      const r = await iso.killContainer(tname);
+      containerResults.push({ name: tname, ...r });
+      db().prepare("UPDATE execution_resources SET state=?, stopped_at=? WHERE execution_id=? AND name=? AND state IN ('started','running','stopping')")
+        .run(r.confirmed ? 'stopped' : 'unknown', now(), exRow.id, tname);
+    }
     containerKilled = { results: containerResults };
 
     const daemonLost = containerResults.some((r) => r.reason === 'docker_daemon_unreachable');
@@ -1135,6 +1186,7 @@ async function runAuditTask(task, project) {
   const dest = join(JARVIS_HOME, 'audit', task.id);
   let credFile = null;
   let preserved = false;
+  const modelToken = registerModelToken(execId, task.id);
   try {
     rmSync(dest, { recursive: true, force: true });
     mkdirSync(join(JARVIS_HOME, 'audit'), { recursive: true });
@@ -1151,7 +1203,7 @@ async function runAuditTask(task, project) {
     }
 
     const proxyUrl = await iso.egressProxyUrl();
-    const cred = writeCredentialFile(execId, proxyUrl);
+    const cred = writeCredentialFile(execId, proxyUrl, modelToken);
     if (!cred.ok) {
       finalizeAttempt(task, execId, { status: 'failed', reason: cred.error });
       return { ok: false, blocked: 'credentials_unavailable', error: cred.error };
@@ -1172,6 +1224,9 @@ async function runAuditTask(task, project) {
       '不要臆造未看到的代码。'
     ].join('\n');
 
+    const auditTmp = join(JARVIS_HOME, 'audit-tmp', execId);
+    mkdirSync(auditTmp, { recursive: true });
+    const auditResId = registerResource({ executionId: execId, taskId: task.id, kind: 'audit', name: `jarvis-audit-${execId}` });
     const res = await iso.runClaudeIsolated({
       name: `jarvis-audit-${execId}`,
       workdir: dest,
@@ -1179,8 +1234,12 @@ async function runAuditTask(task, project) {
       mode: 'plan',
       image: st.image,
       credentialsFile: credFile,
+      modelToken,
+      readOnly: true,
+      tmpDir: auditTmp,
       proxyUrl
     });
+    finishResource(auditResId, 'stopped');
 
     const after = await ex.worktreeStatus(dest);
     const evidence = {
@@ -1202,6 +1261,7 @@ async function runAuditTask(task, project) {
 
     return { ...res, ok, evidence, task: getTask(task.id), execution: execId };
   } finally {
+    revokeModelToken(modelToken);
     try { if (credFile) rmSync(credFile, { force: true }); } catch {}
     if (!preserved) {
       try { await ex.removeWorktree({ repo: rc.cwd, dest }); } catch {}
@@ -1242,6 +1302,86 @@ export function listVerifyProfiles(projectRef) {
   if (!projectRef) return db().prepare('SELECT * FROM verify_profiles ORDER BY created_at').all();
   const p = getProject(projectRef);
   return db().prepare('SELECT * FROM verify_profiles WHERE project_id = ?').all(p.id);
+}
+
+/* ------------------------------ 审批挑战 ------------------------------------ */
+
+/** 签发一次性挑战（绑定任务与参数摘要）。 */
+export function createAuthChallenge(taskRef, ttlMs = 5 * 60 * 1000) {
+  const preview = approvalPreview(taskRef);
+  const nonce = newNonce();
+  const expiresAt = new Date(Date.now() + ttlMs).toISOString();
+  db()
+    .prepare('INSERT INTO auth_nonces (nonce,task_id,digest,expires_at,created_at) VALUES (?,?,?,?,?)')
+    .run(nonce, preview.task_id, preview.digest, expiresAt, now());
+  return {
+    nonce,
+    task_id: preview.task_id,
+    digest: preview.digest,
+    expires_at: expiresAt,
+    reason: preview.reason,
+    payload: buildApprovalPayload({ taskId: preview.task_id, digest: preview.digest, nonce, expiresAt })
+  };
+}
+
+/** 原子消耗挑战（防重放）。 */
+export function consumeAuthChallenge(nonce, taskId, digest) {
+  const r = db()
+    .prepare("UPDATE auth_nonces SET used_at=? WHERE nonce=? AND task_id=? AND digest=? AND used_at IS NULL AND expires_at > ?")
+    .run(now(), nonce, taskId, digest, now());
+  return r.changes === 1;
+}
+
+/* ------------------------------ 模型调用令牌 -------------------------------- */
+
+const TOKEN_FILE = () => join(JARVIS_HOME, 'proxy', 'active-tokens.json');
+
+function readTokens() {
+  try {
+    return JSON.parse(readFileSync(TOKEN_FILE(), 'utf8') || '{}');
+  } catch {
+    return {};
+  }
+}
+
+function writeTokens(obj) {
+  const f = TOKEN_FILE();
+  mkdirSync(join(JARVIS_HOME, 'proxy'), { recursive: true });
+  writeFileSync(f, JSON.stringify(obj, null, 2), { mode: 0o600 });
+}
+
+/** 为一次执行签发短期模型调用令牌（FIX3-F）。 */
+export function registerModelToken(execId, taskId, ttlMs = 2 * 3600 * 1000) {
+  const token = randomBytes(18).toString('base64url');
+  const tokens = readTokens();
+  tokens[token] = { execution_id: execId, task_id: taskId, expires_at: new Date(Date.now() + ttlMs).toISOString() };
+  writeTokens(tokens);
+  return token;
+}
+
+export function revokeModelToken(token) {
+  if (!token) return;
+  const tokens = readTokens();
+  delete tokens[token];
+  writeTokens(tokens);
+}
+
+/* ------------------------------ 执行资源登记 -------------------------------- */
+
+function registerResource({ executionId, taskId, kind, name }) {
+  const id = newId('res');
+  db()
+    .prepare('INSERT INTO execution_resources (id,execution_id,task_id,kind,name,state,started_at) VALUES (?,?,?,?,?,?,?)')
+    .run(id, executionId, taskId, kind, name ?? '', 'started', now());
+  return id;
+}
+
+function finishResource(id, state) {
+  db().prepare('UPDATE execution_resources SET state=?, stopped_at=? WHERE id=?').run(state, now(), id);
+}
+
+export function listResources(taskId) {
+  return db().prepare('SELECT * FROM execution_resources WHERE task_id=? ORDER BY started_at').all(taskId);
 }
 
 /* -------------------------------- Notifications ------------------------------- */

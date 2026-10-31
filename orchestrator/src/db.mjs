@@ -126,6 +126,29 @@ CREATE TABLE IF NOT EXISTS approvals (
 
 CREATE INDEX IF NOT EXISTS idx_approvals_task ON approvals(task_id, digest);
 
+CREATE TABLE IF NOT EXISTS execution_resources (
+  id           TEXT PRIMARY KEY,
+  execution_id TEXT NOT NULL,
+  task_id      TEXT NOT NULL,
+  kind         TEXT NOT NULL,             -- claude | verify | audit | git_commit | git_ref
+  name         TEXT NOT NULL DEFAULT '',  -- 容器名等
+  state        TEXT NOT NULL DEFAULT 'started', -- started | running | stopping | stopped | unknown
+  started_at   TEXT NOT NULL,
+  stopped_at   TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_res_exec ON execution_resources(execution_id);
+CREATE INDEX IF NOT EXISTS idx_res_task ON execution_resources(task_id, state);
+
+CREATE TABLE IF NOT EXISTS auth_nonces (
+  nonce      TEXT PRIMARY KEY,
+  task_id    TEXT NOT NULL,
+  digest     TEXT NOT NULL,
+  expires_at TEXT NOT NULL,
+  used_at    TEXT,
+  created_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS settings (
   key   TEXT PRIMARY KEY,
   value TEXT NOT NULL

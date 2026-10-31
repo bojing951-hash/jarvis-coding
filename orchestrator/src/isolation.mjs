@@ -90,39 +90,6 @@ export async function isolationStatus() {
  * - 不挂载 docker socket、不挂载用户目录、不传宿主机密钥
  * - 非 root 用户
  */
-export async function runIsolated({ image, mount, workdir, command, args = [], timeoutMs = 900_000, network = 'none' }) {
-  const st = await isolationStatus();
-  if (!st.available) {
-    return { ok: false, blocked: 'isolation_unavailable', error: st.reason };
-  }
-  const dockerArgs = [
-    'run', '--rm',
-    ...(name ? ['--name', name] : []),
-    '--network', network,
-    '--user', '1000:1000',
-    '--security-opt', 'no-new-privileges',
-    '--cap-drop', 'ALL',
-    '--pids-limit', '256',
-    '--memory', '2g',
-    '-v', `${mount}:/work:rw`,
-    '-w', workdir || '/work',
-    image,
-    command,
-    ...args
-  ];
-  const started = Date.now();
-  const r = await sh(DOCKER, dockerArgs, { timeoutMs });
-  return {
-    ok: r.code === 0,
-    exitCode: r.code,
-    durationMs: Date.now() - started,
-    output: r.out.slice(-8000),
-    isolated: true,
-    network,
-    image
-  };
-}
-
 /**
  * 在隔离容器里运行 Claude Code。
  *
@@ -152,7 +119,10 @@ export async function runClaudeIsolated({
   image,
   credentialsFile,
   proxyUrl,
+  modelToken,
   name,
+  readOnly = false,
+  tmpDir,
   network = process.env.JARVIS_EXECUTOR_NETWORK || 'jarvis-internal',
   timeoutMs = 900_000
 }) {
@@ -168,12 +138,14 @@ export async function runClaudeIsolated({
     '--cap-drop', 'ALL',
     '--pids-limit', '256',
     '--memory', '2g',
-    '-v', `${workdir}:/work:rw`,
+    '-v', `${workdir}:/work:${readOnly ? 'ro' : 'rw'}`,
+    ...(tmpDir ? ['-v', `${tmpDir}:/tmp:rw`] : []),
     '-w', '/work'
   ];
   if (credentialsFile) args.push('-v', `${credentialsFile}:/run/secrets/glm.env:ro`);
   // 不再注入 HTTP(S)_PROXY：模型流量通过 ANTHROPIC_BASE_URL 指向代理，
   // 直接走内网 IP；其余出网在 --internal 网络里本就没有路由。
+  if (modelToken) args.push('-e', `JARVIS_MODEL_TOKEN=${modelToken}`);
   args.push(image, '-p', prompt, '--output-format', 'json', '--permission-mode', mode);
 
   const started = Date.now();
@@ -231,7 +203,8 @@ export async function killContainer(name) {
         await sleep(200);
         continue;
       }
-      return { ok: true, confirmed: true, state: st || 'gone' };
+      // 未知状态一律视为未确认（FIX3-E）
+      return { ok: false, confirmed: false, reason: 'unknown_container_state', state: st };
     }
     // inspect 失败：区分「容器不存在」与「daemon 问题」
     if (/No such object|could not be found/i.test(r.out)) {
@@ -246,7 +219,7 @@ export async function killContainer(name) {
 }
 
 /** 在同一隔离网络/挂载里运行任意受控程序（校验用）。 */
-export async function runInWorkdir({ workdir, program, args = [], image, name, network = process.env.JARVIS_EXECUTOR_NETWORK || 'jarvis-internal', timeoutMs = 300_000 }) {
+export async function runInWorkdir({ workdir, program, args = [], image, name, readOnly = false, network = process.env.JARVIS_EXECUTOR_NETWORK || 'jarvis-internal', timeoutMs = 300_000 }) {
   const st = await isolationStatus();
   if (!st.available) return { ok: false, blocked: 'isolation_unavailable', error: st.reason };
   const dockerArgs = [
@@ -258,7 +231,7 @@ export async function runInWorkdir({ workdir, program, args = [], image, name, n
     '--cap-drop', 'ALL',
     '--pids-limit', '256',
     '--memory', '2g',
-    '-v', `${workdir}:/work:rw`,
+    '-v', `${workdir}:/work:${readOnly ? 'ro' : 'rw'}`,
     '-w', '/work',
     '--entrypoint', program,
     image,
