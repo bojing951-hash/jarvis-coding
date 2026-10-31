@@ -1,18 +1,15 @@
 {
   "contract_id": "JARVIS-P0-SEC-01-AC-v1.0",
-  "status": "FROZEN_BUT_ORIGINAL_NOT_YET_ARCHIVED",
-  "frozen_source_file": "JARVIS-P0-SEC-01-AC-v1.0-FROZEN.md",
-  "expected_sha256": "af15737713c554509612d8296aee148387649f0ebf8b0644d933ecf8b40691b0",
-  "expected_bytes": 21297,
-  "original_received": false,
-  "transcript_copy": {
-    "file": "docs/contracts/p0-sec-01-ac-v1.0.transcript-copy.md",
-    "sha256": "fc2c9f0de0552bd5531022cf4c66fb3c51beb3aaba3631e58e4924a8a8f0d560",
-    "bytes":    20978,
-    "note": "由用户在对话中粘贴的正文转写而来，非字节级原件；可读、可对照，但不能用于校验冻结哈希"
-  },
-  "blocking_item": "CONTRACT_ORIGINAL_PENDING: 需要把 JARVIS-P0-SEC-01-AC-v1.0-FROZEN.md 保存到本机或作为文件附件提供",
+  "status": "FROZEN_VERIFIED",
+  "frozen_source_file": "JARVIS_AC_v1_FROZEN.md",
+  "source_path_at_receipt": "/Users/cast/Library/Containers/com.tencent.xinWeChat/Data/Documents/xwechat_files/wxid_gv1tt7mgxmkj22_e964/temp/RWTemp/2026-10/ba43ea658d293cdebe665970d3a48aff/JARVIS_AC_v1_FROZEN.md",
+  "archived_file": "docs/contracts/p0-sec-01-ac-v1.0.md",
+  "sha256": "af15737713c554509612d8296aee148387649f0ebf8b0644d933ecf8b40691b0",
+  "bytes": 21297,
+  "byte_identical_to_source": true,
+  "verified_at": "2026-10-31T22:41:00+08:00",
   "ac_count": 22,
   "e2e_count": 10,
-  "ev_count": 15
+  "ev_count": 15,
+  "note": "原件逐字节复制，未做任何格式化或改写。此前基于聊天粘贴的转写副本（sha256 fc2c9f0d…, 20978 bytes）已删除，差异原因：转写版丢失了 Markdown 标记。"
 }
