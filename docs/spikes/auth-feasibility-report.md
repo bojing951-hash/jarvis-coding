@@ -122,8 +122,10 @@ Apple TN3137《On Mac keychain APIs and implementations》：
 | E11 | ad-hoc 签名 + `keychain-access-groups` entitlement | AMFI 直接 kill（exit 137）：`code has restricted entitlements, but validation failed` | ad-hoc 不能携带受限 entitlement |
 | E12 | 无签名数据保护 generic password | `-34018` | 数据保护钥匙串整体需要 entitlement |
 | E13 | 无签名 file-based generic password | `OSStatus=0` | 传统钥匙串不要求该 entitlement |
-| E14 | 自签名证书导入 + codesign | 证书未被信任，`0 valid identities`，codesign 仍回退 ad-hoc | 未成立，不作为结论依据 |
+| E14 | 自签名证书导入 + codesign | 证书未被信任，`0 valid identities`，codesign 未找到身份，二进制仍为 ad-hoc | 未成立，不作为结论依据 |
 | E15 | 复制二进制 + 同一 presence blob + 禁止交互 | `-1004` 拒绝 | ACL 随 blob，不因换二进制而绕过 |
+
+服务端绑定与一次性挑战：本轮没有改服务端逻辑。现有 `FIX3-A` 6 项测试（合法签名、篡改、缺公钥、助手替换、重放、跨任务）本地 **6/6 通过**；真实 SE 签名使用同一 SHA-256 / SPKI / DER 方案，已验证与 `verifyApprovalSignature` 兼容。挑战只能消耗一次、挑战与任务绑定由服务端已有测试覆盖。
 
 ### 4.1 关键输出
 
