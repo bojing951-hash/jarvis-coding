@@ -205,8 +205,8 @@ export function listConversations(agentRef) {
  * 与指定 Agent 对话。会话隔离由 OpenClaw session 保证：
  * 同一 sessionKey 续接上下文，不同 sessionKey 完全隔离。
  */
-export async function talk({ agent: agentRef, message, conversation: convRef, sessionKey }) {
-  const a = getAgent(agentRef);
+export async function talk({ agent: agentRef, message, conversation: convRef, sessionKey, project: projectRef }) {
+  const a = getAgent(agentRef, projectRef);
   const project = getProject(a.project_id);
   if (project.status === 'paused') {
     return { ok: false, blocked: 'project_paused', error: `项目 ${project.slug} 已暂停，不执行新对话` };
@@ -251,7 +251,8 @@ function finishExecution(execId, res) {
 
 export function createTask({ project: projectRef, title, input, assignee, kind, needsApproval, maxAttempts, parentTaskId, workflowId, executor, executorConfig }) {
   const project = getProject(projectRef);
-  const a = assignee ? getAgent(assignee) : null;
+  // 在项目范围内解析，避免跨项目同名 Agent 歧义
+  const a = assignee ? getAgent(assignee, project.id) : null;
   if (a && a.project_id !== project.id) throw new Error('Agent 不属于该项目，禁止跨项目直接指派');
   const id = newId('tsk');
   const t = now();
@@ -489,6 +490,17 @@ export function setWorkflowStatus(ref, status) {
  * 遇审批节点、项目暂停、或轮次超限会停下并报告原因。
  */
 export async function runWorkflow(ref) {
+  try {
+    return await runWorkflowInner(ref);
+  } catch (err) {
+    const w = getWorkflow(ref);
+    db().prepare('UPDATE workflows SET status=?, updated_at=? WHERE id=?').run('failed', now(), w.id);
+    event('workflow.error', w.project_id, { name: w.name, error: err.message });
+    return { ok: false, blocked: 'exception', error: err.message, workflow: getWorkflow(w.id) };
+  }
+}
+
+async function runWorkflowInner(ref) {
   let w = getWorkflow(ref);
   const project = getProject(w.project_id);
   const spec = JSON.parse(w.spec);

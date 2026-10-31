@@ -99,6 +99,38 @@ zai/glm-5.3-flash  zai/glm-4.5-air    zai/glm-5-turbo …
 | 无无限循环 | PASS | `maxRounds` + `max_attempts` 双重上限 |
 | 不能擅自合并主干 | PASS | 未配置任何 git push/merge 权限给 Agent |
 
+## TEST-01/02 飞书端到端（W7 实测）
+
+由用户在 iPhone 飞书发起，JARVIS 自行调用 MCP 工具完成。
+
+**第一条消息 → 建项目 + 两个 Agent**
+
+```text
+18:45:32 DM: 创建一个新项目「飞书验收」，slug 用 feishu-e2e…
+落库：project feishu-e2e
+      agent analyst  zai/glm-4.6
+      agent reviewer zai/glm-5.3-flash
+```
+
+**第二条消息 → 跨 Agent 真实交接**
+
+```text
+18:47 首次尝试：task_create / handoff / workflow_run 全部 error
+19:01 修复后重试：全部 ok
+```
+
+真实执行证据（`executions` 表）：
+
+```text
+11:01:17Z ok glm-4.6       个人知识库最该先解决的是"可靠地找回来"…
+11:01:38Z ok glm-5.3-flash 风险：该回答默认"未来知道自己该查什么"…
+```
+
+对应任务 `tsk_...` 状态均为 `done`，轨迹显示
+`jarvis-control__task_create ok` → `task_run ok` → `task_create ok` → `task_run ok`。
+
+结论：**PASS**。JARVIS 未扮演其他 Agent，而是真实调度了两次独立模型调用。
+
 ## 实测中发现并修复的缺陷
 
 **同名 Agent 跨项目冲突**（由 JARVIS 在真实执行中报告）：
@@ -118,6 +150,22 @@ Agent 名称有歧义: reviewer（命中 2 个：p1-orch/reviewer、p1-verify/re
 ```
 
 验证：`agent role --agent p1-verify/reviewer` 正常解析；裸 `reviewer` 报歧义。
+
+**第二处：项目内解析未生效**（飞书首次实测暴露）
+
+```text
+task_create 报错 / handoff 报错 / workflow_run 报错
+```
+
+根因：`createTask` 用全局 `getAgent(assignee)` 而非项目范围，
+`analyst` 同时存在于 p1-verify 与 feishu-e2e，导致歧义失败。
+
+修复：`createTask` 改为 `getAgent(assignee, project.id)`；`talk` 增加 `project` 参数。
+
+**第三处：工作流异常后卡在 running**
+
+`runWorkflow` 抛异常时状态不回滚，工作流永远停在 `running cursor=0`。
+修复：包一层 try/catch，异常时置 `failed` 并记录事件。
 
 ## 单元测试
 

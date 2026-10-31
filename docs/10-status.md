@@ -12,7 +12,7 @@
 | P1-04 | 动态项目管理 | **PASS** |
 | P1-05 | 通用工作流编排 | **PASS**（顺序/并行/交接/审批/重试/暂停恢复/轮次上限） |
 | P1-06 | 外部执行器（Claude Code + GLM） | **PASS**（只读）/ **NOT IMPLEMENTED 验证**（写模式） |
-| P1-07 | 飞书端到端 | **WAITING**（需你在手机上实测） |
+| P1-07 | 飞书端到端 | **PASS**（iPhone 实测，含一次失败→修复→复测） |
 
 ## 详细
 
@@ -60,19 +60,17 @@
 - 返回 Commit / 测试结果 ✅（只读场景记录 git HEAD；未产生 commit）
 - 结果交回其他 Agent —— 机制已具备（`handoff`），未串进执行器流水线
 
-### P1-07 飞书端到端 —— WAITING
+### P1-07 飞书端到端 —— PASS
 
-需要你在手机飞书上实测下面两条，我才能给 PASS：
+第一次实测**失败**（工具调用报歧义），修复后复测**通过**：
 
-```text
-JARVIS，创建一个新项目「验证P1」，然后建两个 Agent：
-一个用 zai/glm-4.6 叫 analyst，一个用 zai/glm-5.3-flash 叫 reviewer。
-```
+| 阶段 | 证据 |
+|---|---|
+| 建项目 + 两个 Agent | 落库 `feishu-e2e` / `analyst(glm-4.6)` / `reviewer(glm-5.3-flash)` |
+| 跨 Agent 交接 | `executions` 两条独立记录，11:01:17 与 11:01:38 |
+| 轨迹 | `task_create ok` → `task_run ok` → `task_create ok` → `task_run ok` |
 
-```text
-JARVIS，让 analyst 用一句话说说今天最值得自动化的一件事，
-然后把结果交给 reviewer 评审，最后把评审结论告诉我。
-```
+首次失败没有粉饰：JARVIS 当时用模型自己回答了，**已被落库证据识破并修复**。
 
 ## 明确未做（不擅自扩范围）
 

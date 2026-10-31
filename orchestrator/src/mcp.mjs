@@ -101,6 +101,7 @@ const TOOLS = [
       properties: {
         agent: { type: 'string', description: '名称，或 项目slug/名称' },
         message: { type: 'string' },
+        project: { type: 'string', description: '可选：项目 slug，用于消解同名 Agent 歧义' },
         conversation: { type: 'string', description: '会话 id，可省略' }
       },
       required: ['agent', 'message']
@@ -219,7 +220,7 @@ async function callTool(name, args) {
     case 'conversation_list':
       return ok(JSON.stringify(svc.listConversations(args.agent).map((c) => ({ id: c.id, title: c.title })), null, 2));
     case 'talk': {
-      const r = await svc.talk({ agent: args.agent, message: args.message, conversation: args.conversation });
+      const r = await svc.talk({ agent: args.agent, message: args.message, conversation: args.conversation, project: args.project });
       return r.ok
         ? ok(JSON.stringify({ agent: r.agent, model: r.model, conversation: r.sessionKey, reply: r.text }, null, 2))
         : err(JSON.stringify({ agent: args.agent, error: r.error, blocked: r.blocked ?? null }, null, 2));
