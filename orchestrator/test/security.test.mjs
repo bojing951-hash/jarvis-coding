@@ -203,9 +203,18 @@ test('AC-07 同一任务不得并发启动两次', async () => {
     executorConfig: { mode: 'plan', repo: 'repo', base_commit: head }
   });
   svc.updateTask(t.id, { status: 'running' });
-  const r = await svc.runTask(t.id);
-  assert.equal(r.ok, false);
-  assert.equal(r.blocked, 'already_running');
+  // 强制模拟 CI 条件：没有执行器镜像。并发保护必须独立于 Docker 可用性，
+  // 否则本测试会在有 Docker 的机器上通过、在 CI 上失败（DEF-CI-01）。
+  const prevImage = process.env.JARVIS_EXECUTOR_IMAGE;
+  process.env.JARVIS_EXECUTOR_IMAGE = 'jarvis-ci-nonexistent:0';
+  try {
+    const r = await svc.runTask(t.id);
+    assert.equal(r.ok, false);
+    assert.equal(r.blocked, 'already_running');
+  } finally {
+    if (prevImage === undefined) delete process.env.JARVIS_EXECUTOR_IMAGE;
+    else process.env.JARVIS_EXECUTOR_IMAGE = prevImage;
+  }
 });
 
 /* ---------------------------------- AC-08 --------------------------------- */

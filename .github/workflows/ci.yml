@@ -4,17 +4,37 @@ on:
     branches: ['fix/**', 'dev/**']
   pull_request:
     branches: [main, 'dev/**']
+
+permissions:
+  contents: read
+
 jobs:
-  test:
+  # 契约完整性独立成 job：不再依赖测试结果，也不会因测试失败而被 skip。
+  contract:
+    name: contract integrity
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: '24'
+      - name: verify frozen contract
+        run: node scripts/verify-contract.mjs
+
+  test:
+    name: unit + fault-injection
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - name: environment
+        run: |
+          node --version
+          npm --version
+          uname -a
       - name: unit + fault-injection tests
         run: node --test orchestrator/test/*.test.mjs
-      - name: contract integrity
-        run: |
-          test "$(wc -c < docs/contracts/p0-sec-01-ac-v1.0.md)" = "21297"
-          test "$(sha256sum docs/contracts/p0-sec-01-ac-v1.0.md | cut -d' ' -f1)" = "af15737713c554509612d8296aee148387649f0ebf8b0644d933ecf8b40691b0"

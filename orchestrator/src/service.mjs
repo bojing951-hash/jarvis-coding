@@ -633,6 +633,14 @@ function writeCredentialFile(execId, proxyUrl, modelToken) {
  * 授权 → 隔离工作树 → 容器内执行 → 容器内校验 → 范围检查 → 提交 → 裁决 → 证据
  */
 async function runExecutorTask(task, project) {
+  // DEF-CI-01：并发保护必须先于环境探测。任务已在运行时，不能因为
+  // Docker / 执行镜像不可用而返回 isolation_unavailable（CI 无执行镜像时
+  // 会掩盖 already_running，导致同一任务并发启动的语义不稳定）。
+  if (task.status === 'running') {
+    recordAttempt({ task, project, phase: 'claim', status: 'rejected', blocked: 'already_running', reason: '任务已在运行' });
+    return { ok: false, blocked: 'already_running', error: '任务已在运行或状态不允许执行' };
+  }
+
   if (task.executor !== 'claude-code') {
     recordAttempt({ task, project, phase: 'validate', status: 'rejected', blocked: 'unknown_executor', reason: task.executor });
     return { ok: false, blocked: 'unknown_executor', error: `未支持的执行器: ${task.executor}` };
