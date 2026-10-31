@@ -134,11 +134,21 @@ exit 0
 
 /* ------------------------------- 审计只读挂载 ------------------------------- */
 
-test('FIX3-D 只读挂载真实阻止容器写入', () => {
+test('FIX3-D 只读挂载真实阻止容器写入', (t) => {
+  const dockerBin = '/Applications/Docker.app/Contents/Resources/bin/docker';
+  let hasImage = false;
+  try {
+    execFileSync(dockerBin, ['image', 'inspect', 'jarvis-executor:2.1.104'], { stdio: 'ignore', timeout: 20000 });
+    hasImage = true;
+  } catch {}
+  if (!hasImage) {
+    t.skip('执行器镜像不存在（CI 环境），跳过真实挂载测试');
+    return;
+  }
   let out = '';
   try {
     out = execFileSync(
-      '/Applications/Docker.app/Contents/Resources/bin/docker',
+      dockerBin,
       [
         'run', '--rm', '--network', 'none', '--user', '1000:1000',
         '-v', `${tmp}:/work:ro`, '-w', '/work',

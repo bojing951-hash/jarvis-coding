@@ -182,40 +182,54 @@ export async function daemonReachable() {
  *  - reason=docker_daemon_unreachable  daemon 失联，终止结果无法确认
  *  - reason=container_still_running    daemon 健康但容器仍在
  */
-export async function killContainer(name) {
+export async function killContainer(name, { graceMs = 5000 } = {}) {
   if (!name) return { ok: false, confirmed: false, reason: 'no_container_name' };
 
-  await sh(DOCKER, ['kill', name], { timeoutMs: 15_000 });
+  const inspectState = async () => {
+    const r = await sh(DOCKER, ['inspect', name, '--format', '{{.State.Status}}'], { timeoutMs: 8_000 });
+    if (r.code === 0) return { kind: 'state', value: r.out.trim() };
+    if (/No such object|could not be found/i.test(r.out)) return { kind: 'gone' };
+    if (/Cannot connect|daemon|connection refused/i.test(r.out)) return { kind: 'daemon' };
+    return { kind: 'error', value: r.out.slice(0, 120) };
+  };
 
-  // 先确认 daemon 仍在：失联 ≠ 容器已停止
   if (!(await daemonReachable())) {
     return { ok: false, confirmed: false, reason: 'docker_daemon_unreachable', error: '无法连接 Docker daemon，终止结果无法确认' };
   }
 
-  for (let i = 0; i < 25; i++) {
-    const r = await sh(DOCKER, ['inspect', name, '--format', '{{.State.Status}}'], { timeoutMs: 8_000 });
-    if (r.code === 0) {
-      const st = r.out.trim();
-      if (st === 'exited' || st === 'dead' || st === 'removing') {
-        return { ok: true, confirmed: true, state: st };
-      }
-      if (st === 'created' || st === 'running' || st === 'restarting' || st === 'paused') {
-        await sleep(200);
-        continue;
-      }
-      // 未知状态一律视为未确认（FIX3-E）
-      return { ok: false, confirmed: false, reason: 'unknown_container_state', state: st };
+  const STOPPED = new Set(['exited', 'dead', 'removing']);
+
+  // 1) 先请求优雅终止（SIGTERM）
+  await sh(DOCKER, ['kill', '--signal', 'TERM', name], { timeoutMs: 15_000 });
+
+  let escalated = false;
+  const deadline = Date.now() + graceMs;
+  while (Date.now() < deadline) {
+    const st = await inspectState();
+    if (st.kind === 'gone') return { ok: true, confirmed: true, state: 'gone', escalated };
+    if (st.kind === 'daemon') return { ok: false, confirmed: false, reason: 'docker_daemon_unreachable' };
+    if (st.kind === 'state' && STOPPED.has(st.value)) return { ok: true, confirmed: true, state: st.value, escalated };
+    if (st.kind === 'state' && !['running', 'created', 'restarting', 'paused'].includes(st.value)) {
+      // 未知状态：不得判为已停止（FIX3-E）
+      return { ok: false, confirmed: false, reason: 'unknown_container_state', state: st.value, escalated };
     }
-    // inspect 失败：区分「容器不存在」与「daemon 问题」
-    if (/No such object|could not be found/i.test(r.out)) {
-      return { ok: true, confirmed: true, state: 'gone' };
-    }
-    if (/Cannot connect|daemon|connection refused/i.test(r.out)) {
-      return { ok: false, confirmed: false, reason: 'docker_daemon_unreachable', error: r.out.slice(0, 120) };
-    }
-    await sleep(200); // 瞬时错误重试
+    await sleep(200);
   }
-  return { ok: false, confirmed: false, reason: 'container_still_running' };
+
+  // 2) 仍未退出 → 升级 SIGKILL
+  escalated = true;
+  await sh(DOCKER, ['kill', '--signal', 'KILL', name], { timeoutMs: 15_000 });
+  for (let i = 0; i < 25; i++) {
+    const st = await inspectState();
+    if (st.kind === 'gone') return { ok: true, confirmed: true, state: 'gone', escalated };
+    if (st.kind === 'daemon') return { ok: false, confirmed: false, reason: 'docker_daemon_unreachable', escalated };
+    if (st.kind === 'state' && STOPPED.has(st.value)) return { ok: true, confirmed: true, state: st.value, escalated };
+    if (st.kind === 'state' && !['running', 'created', 'restarting', 'paused'].includes(st.value)) {
+      return { ok: false, confirmed: false, reason: 'unknown_container_state', state: st.value, escalated };
+    }
+    await sleep(200);
+  }
+  return { ok: false, confirmed: false, reason: 'container_still_running', escalated };
 }
 
 /** 在同一隔离网络/挂载里运行任意受控程序（校验用）。 */

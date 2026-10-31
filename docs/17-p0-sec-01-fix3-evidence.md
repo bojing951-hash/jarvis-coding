@@ -39,6 +39,33 @@ node --test orchestrator/test/*.test.mjs
 tests 71 / pass 71 / fail 0
 ```
 
+## 真实场景验证（本轮补做）
+
+`node orchestrator/scripts/verify-cancel-sigkill.mjs` → **6/6 PASS**（真实 Docker）
+
+```text
+PASS 启动忽略 SIGTERM 的容器
+PASS 取消升级到 SIGKILL（6281ms，SIGTERM 无效后升级）
+PASS 取消结果确认为已终止
+PASS 容器已停止（exited）
+PASS 任务状态为 cancelled
+PASS 新进程读到终态且拒绝重复执行（terminal_state）
+```
+
+**真实模型执行（令牌路径）**
+
+```text
+代理日志  [model] exec=exe_mvwlpb1m01tk62 POST /api/anthropic/v1/messages
+容器内    带令牌 → HTTP 200（真实 GLM 响应）
+          无令牌 → HTTP 401
+任务结果  ok=true，Claude Code 正确回答仓库导出函数
+```
+
+## CI
+
+`.github/workflows/ci.yml`：Node 24 跑全部单元/注入测试，并校验冻结契约大小与 SHA-256。
+真实 Docker 挂载测试在无执行器镜像的环境自动 skip。
+
 ## FIX3-A 的阻断（必须记录）
 
 生产环境 `jarvis-auth keygen` 返回：

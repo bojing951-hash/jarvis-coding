@@ -121,7 +121,7 @@ test('DEF-02 取消同时覆盖执行容器与验证容器', async () => {
   writeFileSync(callLog, '');
   const r = await svc.cancelTask(t.id);
   const calls = readFileSync(callLog, 'utf8');
-  assert.match(calls, new RegExp(`kill jarvis-exec-${execId}`));
-  assert.match(calls, new RegExp(`kill jarvis-verify-${execId}`));
+  assert.match(calls, new RegExp(`kill --signal TERM jarvis-exec-${execId}`));
+  assert.match(calls, new RegExp(`kill --signal TERM jarvis-verify-${execId}`));
   assert.equal(r.ok, true);
 });
