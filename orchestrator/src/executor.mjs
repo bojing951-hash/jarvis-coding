@@ -231,6 +231,70 @@ export async function removeFrozenWorktree({ repo, dest }) {
   });
 }
 
+/* ------------------------------ 隔离工作树（DEF-07） ----------------------- */
+
+/** 从固定 commit 创建一次性工作树；不触碰用户工作目录。 */
+export async function createWorktree({ repo, commit, dest }) {
+  const git = (args, cwd = repo) =>
+    new Promise((resolve) => {
+      execFile('git', ['-C', cwd, ...args], { timeout: 120_000, env: safeChildEnv() }, (e, so, se) =>
+        resolve({ code: e?.code ?? 0, out: (so || '') + (se || '') })
+      );
+    });
+
+  const exists = await git(['cat-file', '-e', `${commit}^{commit}`]);
+  if (exists.code !== 0) return { ok: false, error: `commit 不存在: ${commit}` };
+
+  const add = await git(['worktree', 'add', '--detach', dest, commit]);
+  if (add.code !== 0) return { ok: false, error: add.out.slice(0, 400) };
+
+  const head = await git(['rev-parse', 'HEAD'], dest);
+  return { ok: true, path: dest, sha: head.out.trim() };
+}
+
+/** 工作树状态：初始必须干净（AC-15）。 */
+export async function worktreeStatus(dir) {
+  return new Promise((resolve) => {
+    execFile('git', ['-C', dir, 'status', '--porcelain'], { timeout: 30_000 }, (e, so) =>
+      resolve({ clean: (so || '').trim() === '', raw: (so || '').trim() })
+    );
+  });
+}
+
+/** 解析工作树改动文件（porcelain 前两列状态 + 分隔空白）。 */
+export async function changedFiles(dir) {
+  return new Promise((resolve) => {
+    execFile('git', ['-C', dir, 'status', '--porcelain'], { timeout: 30_000 }, (e, so) => {
+      const files = (so || '')
+        .split('\n')
+        .filter((l) => l.trim().length > 0)
+        .map((l) => l.replace(/^..\s+/, '').trim())
+        .filter(Boolean);
+      resolve(files);
+    });
+  });
+}
+
+/**
+ * 把工作树里的新 commit 固定到仓库的一个 ref 上。
+ * 不修改用户当前分支；detach 工作树删除后 commit 仍可达、可核对。
+ */
+export async function publishRef({ repo, ref, sha }) {
+  return new Promise((resolve) => {
+    execFile('git', ['-C', repo, 'update-ref', ref, sha], { timeout: 30_000 }, (e, so, se) =>
+      resolve({ ok: !e, ref, sha, out: (so || '') + (se || '') })
+    );
+  });
+}
+
+export async function removeWorktree({ repo, dest }) {
+  return new Promise((resolve) => {
+    execFile('git', ['-C', repo, 'worktree', 'remove', '--force', dest], { timeout: 60_000 }, (e, so, se) =>
+      resolve({ ok: !e, out: (so || '') + (se || '') })
+    );
+  });
+}
+
 /** 执行器能力自检（不消耗额度）。 */
 export async function executorStatus() {
   const r = await run(claudeBin(), ['--version'], { cwd: HOME, timeoutMs: 30_000 });

@@ -72,7 +72,7 @@ test('裁决：取消优先于其它结果', () => {
 
 /* ------------------------------ 隔离 fail closed --------------------------- */
 
-test('写模式在隔离不可用时被拒绝（fail closed）', async () => {
+test('写模式缺少工作树规格被拒绝（DEF-07）', async () => {
   const p = svc.createProject({ name: '隔离门禁', slug: 'fix1-iso' });
   const t = svc.createTask({
     project: p.id,
@@ -82,15 +82,11 @@ test('写模式在隔离不可用时被拒绝（fail closed）', async () => {
     executor: 'claude-code',
     executorConfig: { mode: 'acceptEdits' }
   });
-  // 先给出合法审批，确保拒绝来自隔离而非授权
   const ap = svc.issueApproval({ task: t.id });
   assert.equal(ap.ok, true, ap.error || '');
   const r = await svc.runTask(t.id);
   assert.equal(r.ok, false);
-  assert.ok(['isolation_unavailable', 'needs_approval'].includes(r.blocked), `实际: ${r.blocked}`);
-  if (r.blocked === 'isolation_unavailable') {
-    assert.match(r.error, /docker|镜像|隔离/i);
-  }
+  assert.ok(['missing_worktree_spec', 'isolation_unavailable'].includes(r.blocked), `实际: ${r.blocked}`);
 });
 
 test('隔离状态探测返回结构化结果', async () => {

@@ -4,7 +4,7 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
@@ -168,13 +168,24 @@ test('AC-05 未声明提交范围不得提交', () => {
 
 test('AC-07 同一任务不得并发启动两次', async () => {
   const p = svc.createProject({ name: '并发', slug: 'sec-conc' });
+  // 准备一个真实 git 仓库，供工作树使用
+  const repo = join(p.dir, 'repo');
+  rmSync(repo, { recursive: true, force: true });
+  mkdirSync(repo, { recursive: true });
+  const g = (...args) => execFileSync('git', ['-C', repo, ...args], { encoding: 'utf8' });
+  g('init', '-q');
+  writeFileSync(join(repo, 'a.txt'), 'x');
+  g('add', '-A');
+  g('-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-q', '-m', 'init');
+  const head = g('rev-parse', 'HEAD').trim();
+
   const t = svc.createTask({
     project: p.id,
     title: '并发任务',
     input: 'x',
     kind: 'executor',
     executor: 'claude-code',
-    executorConfig: { mode: 'plan' }
+    executorConfig: { mode: 'plan', repo: 'repo', base_commit: head }
   });
   svc.updateTask(t.id, { status: 'running' });
   const r = await svc.runTask(t.id);

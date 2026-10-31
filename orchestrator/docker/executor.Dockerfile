@@ -25,9 +25,12 @@ RUN npm install -g @anthropic-ai/claude-code@${CLAUDE_CODE_VERSION} \
 # 非特权用户：直接复用 node 镜像内置的 node 用户（uid 1000）
 RUN mkdir -p /work && chown -R node:node /work
 
+COPY --chown=root:root orchestrator/docker/entrypoint.sh /usr/local/bin/jarvis-entrypoint.sh
+RUN chmod 0555 /usr/local/bin/jarvis-entrypoint.sh
+
 USER node
 WORKDIR /work
 
-# 由编排层覆盖为实际任务提示
-ENTRYPOINT ["claude"]
+# 入口负责加载只读挂载的凭据文件，再 exec claude
+ENTRYPOINT ["/usr/local/bin/jarvis-entrypoint.sh"]
 CMD ["--version"]

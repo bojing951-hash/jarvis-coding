@@ -140,6 +140,8 @@ async function main() {
               : opt.executor
               ? {
                   cwd: opt.cwd,
+                  repo: opt.repo,
+                  base_commit: opt['base-commit'],
                   mode: opt.mode ?? 'plan',
                   verify_profile_id: opt['verify-profile'],
                   commit: Boolean(opt.commit),

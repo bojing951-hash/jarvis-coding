@@ -436,7 +436,23 @@ export function resolveExecutorPlan(task, project) {
     }
   }
 
-  const resolved = { mode, cwd: pathCheck.cwd, verifyProfileId, commit, commitPaths, profile };
+  let repoPath = null;
+  if (cfg.repo) {
+    const rc = resolveProjectPath(cfg.repo, project.dir);
+    if (!rc.ok) return { ok: false, blocked: 'repo_outside_project', error: rc.error };
+    repoPath = rc.cwd;
+  }
+
+  const resolved = {
+    mode,
+    cwd: pathCheck.cwd,
+    verifyProfileId,
+    commit,
+    commitPaths,
+    profile,
+    repo: repoPath,
+    baseCommit: cfg.base_commit ?? null
+  };
   resolved.digest = taskDigest(task, resolved);
   return { ok: true, resolved };
 }
@@ -508,7 +524,7 @@ function recordAttempt({ task, project, phase, status, blocked, reason, plan }) 
       task.id,
       null,
       status,
-      'claude-code',
+      'claude-code-isolated',
       plan?.cwd ?? '',
       now(),
       status === 'running' ? null : now(),
@@ -520,13 +536,35 @@ function recordAttempt({ task, project, phase, status, blocked, reason, plan }) 
 }
 
 /**
- * 外部执行器任务：授权 → 隔离执行 → 校验 → 提交 → 裁决 → 证据。
- *
- * 与上一版的差别：
- * - 任务状态由完整链路裁决（computeVerdict），不由执行器返回值决定
- * - 写模式必须有隔离环境，否则 fail closed
- * - 每次尝试（含拒绝）都留下 execution 记录
- * - 提交前重新校验授权与取消状态
+ * 运行时凭据文件：只读挂载进容器，入口脚本 source 后并删除。
+ * 不写入镜像，也不通过 docker run -e 传递（避免出现在 docker inspect）。
+ */
+function writeCredentialFile(execId) {
+  const settingsPath = join(HOME, '.claude/settings.json');
+  let env = {};
+  try {
+    env = JSON.parse(readFileSync(settingsPath, 'utf8')).env ?? {};
+  } catch {
+    return { ok: false, error: `无法读取模型凭据配置: ${settingsPath}` };
+  }
+  const key = env.ANTHROPIC_API_KEY;
+  if (!key) return { ok: false, error: '未找到 ANTHROPIC_API_KEY（GLM 凭据）' };
+
+  const dir = join(JARVIS_HOME, 'run');
+  mkdirSync(dir, { recursive: true });
+  const file = join(dir, `${execId}.env`);
+  const body = [
+    `ANTHROPIC_BASE_URL=${env.ANTHROPIC_BASE_URL ?? 'https://open.bigmodel.cn/api/anthropic'}`,
+    `ANTHROPIC_API_KEY=${key}`,
+    `ANTHROPIC_MODEL=${env.ANTHROPIC_MODEL ?? 'glm-5.3'}`
+  ].join('\n');
+  writeFileSync(file, body, { mode: 0o600 });
+  return { ok: true, file };
+}
+
+/**
+ * 外部执行器任务（FIX1）：
+ * 授权 → 隔离工作树 → 容器内执行 → 容器内校验 → 范围检查 → 提交 → 裁决 → 证据
  */
 async function runExecutorTask(task, project) {
   if (task.executor !== 'claude-code') {
@@ -540,10 +578,8 @@ async function runExecutorTask(task, project) {
     return { ok: false, blocked: plan.blocked, error: plan.error };
   }
   const { resolved } = plan;
-  const { mode, cwd } = resolved;
-  const needsApproval = mode === 'acceptEdits' || resolved.commit;
 
-  // 授权：必须存在摘要匹配的审批记录
+  const needsApproval = resolved.mode === 'acceptEdits' || resolved.commit;
   let approval = { valid: !needsApproval };
   if (needsApproval) {
     approval = findValidApproval(task.id, resolved.digest);
@@ -553,114 +589,151 @@ async function runExecutorTask(task, project) {
     }
   }
 
-  // 写权限必须先有隔离环境（AC-11：无法证明隔离时 fail closed）
-  if (mode === 'acceptEdits' || resolved.commit) {
-    const st = await iso.isolationStatus();
-    if (!st.available) {
-      recordAttempt({ task, project, phase: 'isolation', status: 'rejected', blocked: 'isolation_unavailable', reason: st.reason, plan: resolved });
-      updateTask(task.id, { status: 'failed', error: `写模式被拒绝：${st.reason}` });
-      return { ok: false, blocked: 'isolation_unavailable', error: st.reason };
-    }
+  const st = await iso.isolationStatus();
+  if (!st.available) {
+    recordAttempt({ task, project, phase: 'isolation', status: 'rejected', blocked: 'isolation_unavailable', reason: st.reason, plan: resolved });
+    updateTask(task.id, { status: 'failed', error: `隔离不可用：${st.reason}` });
+    return { ok: false, blocked: 'isolation_unavailable', error: st.reason };
   }
 
-  // 状态机：pending/authorized/retry_pending → running（原子，防并发 AC-19）
+  // DEF-07：执行必须基于固定 commit 的一次性工作树
+  if (!resolved.repo || !resolved.baseCommit) {
+    const msg = '执行器任务必须提供 repo 与 base_commit（禁止直接在用户工作目录执行）';
+    recordAttempt({ task, project, phase: 'validate', status: 'rejected', blocked: 'missing_worktree_spec', reason: msg, plan: resolved });
+    return { ok: false, blocked: 'missing_worktree_spec', error: msg };
+  }
+
   const claim = db()
     .prepare(`UPDATE tasks SET status='running', attempts=attempts+1, updated_at=?
               WHERE id=? AND status IN ('pending','authorized','retry_pending','failed')`)
     .run(now(), task.id);
   if (claim.changes !== 1) {
-    recordAttempt({ task, project, phase: 'claim', status: 'rejected', blocked: 'already_running', reason: `当前状态不允许执行`, plan: resolved });
+    recordAttempt({ task, project, phase: 'claim', status: 'rejected', blocked: 'already_running', reason: '状态不允许执行', plan: resolved });
     return { ok: false, blocked: 'already_running', error: '任务已在运行或状态不允许执行' };
   }
 
-  mkdirSync(cwd, { recursive: true });
   const execId = recordAttempt({ task, project, phase: 'execute', status: 'running', plan: resolved });
-  const runDir = join(JARVIS_HOME, 'run');
-  mkdirSync(runDir, { recursive: true });
-  const pidFile = join(runDir, `${execId}.pid`);
-
-  const res = await ex.runClaudeCode({
-    cwd,
-    prompt: task.input,
-    mode,
-    maxTurns: resolved.maxTurns,
-    timeoutMs: resolved.timeoutMs,
-    onPid: (pid) => {
-      try { writeFileSync(pidFile, String(pid), { mode: 0o600 }); } catch {}
-    }
-  });
-  try { rmSync(pidFile, { force: true }); } catch {}
-  const cancelledNow = () => db().prepare('SELECT status FROM tasks WHERE id=?').get(task.id)?.status === 'cancelled';
-
-  if (cancelledNow()) {
-    finalizeAttempt(task, execId, { status: 'cancelled', reason: '取消于校验前' });
-    return { ok: false, blocked: 'cancelled', error: '任务已取消' };
-  }
-
-  // 校验：只接受登记配置，且必须在取消后停止
-  let verify = null;
-  if (res.ok && resolved.profile) {
-    db().prepare("UPDATE tasks SET status='verifying', updated_at=? WHERE id=? AND status='running'").run(now(), task.id);
-    verify = await ex.runVerifyProfile({
-      program: resolved.profile.program,
-      argv: JSON.parse(resolved.profile.argv || '[]'),
-      cwd,
-      timeoutMs: resolved.profile.timeout_ms
-    });
-  }
-
-  // 提交前：重新确认授权与取消状态（AC-17 / FIX1-H）
+  const dest = join(JARVIS_HOME, 'worktrees', task.id);
+  let credFile = null;
   let commit = null;
-  if (resolved.commit) {
+
+  try {
+    rmSync(dest, { recursive: true, force: true });
+    const wt = await ex.createWorktree({ repo: resolved.repo, commit: resolved.baseCommit, dest });
+    if (!wt.ok) {
+      finalizeAttempt(task, execId, { status: 'failed', reason: `创建隔离工作树失败: ${wt.error}` });
+      return { ok: false, blocked: 'worktree_failed', error: wt.error };
+    }
+    const init = await ex.worktreeStatus(dest);
+    if (!init.clean) {
+      finalizeAttempt(task, execId, { status: 'failed', reason: `初始工作树不干净: ${init.raw.slice(0, 200)}` });
+      return { ok: false, blocked: 'dirty_worktree', error: '初始工作树不干净，拒绝自动提交' };
+    }
+
+    const cred = writeCredentialFile(execId);
+    if (!cred.ok) {
+      finalizeAttempt(task, execId, { status: 'failed', reason: cred.error });
+      return { ok: false, blocked: 'credentials_unavailable', error: cred.error };
+    }
+    credFile = cred.file;
+
+    const proxyUrl = await iso.egressProxyUrl();
+    const res = await iso.runClaudeIsolated({
+      workdir: dest,
+      prompt: task.input,
+      mode: resolved.mode,
+      image: st.image,
+      credentialsFile: credFile,
+      proxyUrl
+    });
+
+    const cancelledNow = () => db().prepare('SELECT status FROM tasks WHERE id=?').get(task.id)?.status === 'cancelled';
     if (cancelledNow()) {
-      finalizeAttempt(task, execId, { status: 'cancelled', reason: '取消于提交前', verify });
+      finalizeAttempt(task, execId, { status: 'cancelled', reason: '取消于校验前' });
       return { ok: false, blocked: 'cancelled', error: '任务已取消' };
     }
-    const recheck = findValidApproval(task.id, resolved.digest);
-    const gate = commitGate({
+
+    // 容器内校验（与执行同一隔离环境）
+    let verify = null;
+    if (res.ok && resolved.profile) {
+      db().prepare("UPDATE tasks SET status='verifying', updated_at=? WHERE id=? AND status='running'").run(now(), task.id);
+      const vr = await iso.runInWorkdir({
+        workdir: dest,
+        program: resolved.profile.program,
+        args: JSON.parse(resolved.profile.argv || '[]'),
+        image: st.image
+      });
+      verify = { exitCode: vr.exitCode, ok: vr.ok, output: vr.output, program: resolved.profile.program, argv: JSON.parse(resolved.profile.argv || '[]') };
+    }
+
+    // 修改范围检查
+    const changed = await ex.changedFiles(dest);
+    const outside = changed.filter((f) => !resolved.commitPaths.some((p) => f === p || f.startsWith(p.replace(/\/$/, '') + '/')));
+    const scopeOk = outside.length === 0;
+
+    if (resolved.commit && scopeOk && !cancelledNow()) {
+      const recheck = findValidApproval(task.id, resolved.digest);
+      const gate = commitGate({ execOk: res.ok, verify, approval: recheck, commitPaths: resolved.commitPaths });
+      if (gate.ok) {
+        db().prepare("UPDATE tasks SET status='committing', updated_at=? WHERE id=? AND status='running'").run(now(), task.id);
+        commit = await ex.gitCommit({ cwd: dest, message: resolved.commitMessage || `chore(executor): ${task.title}`, paths: resolved.commitPaths });
+        // 让 commit 在仓库中保持可达（工作树是 detach 的，删除后会变成孤立对象）
+        if (commit?.ok && commit.sha) {
+          const refName = `refs/heads/jarvis/${task.id}`;
+          const published = await ex.publishRef({ repo: resolved.repo, ref: refName, sha: commit.sha });
+          commit.ref = refName;
+          commit.refPublished = published.ok;
+        }
+      } else {
+        commit = { ok: false, skipped: true, reason: gate.reason };
+      }
+    } else if (resolved.commit && !scopeOk) {
+      commit = { ok: false, skipped: true, reason: `修改超出授权范围: ${outside.join(', ')}` };
+    }
+
+    const verdict = computeVerdict({
+      cancelled: res.cancelled,
       execOk: res.ok,
       verify,
-      approval: recheck,
-      commitPaths: resolved.commitPaths
+      requiresVerify: Boolean(resolved.profile) || resolved.commit,
+      commit,
+      requiresCommit: resolved.commit,
+      approvalValid: approval.valid
     });
-    if (gate.ok) {
-      db().prepare("UPDATE tasks SET status='committing', updated_at=? WHERE id=? AND status='running'").run(now(), task.id);
-      commit = await ex.gitCommit({ cwd, message: resolved.commitMessage || `chore(executor): ${task.title}`, paths: resolved.commitPaths });
-    } else {
-      commit = { ok: false, skipped: true, reason: gate.reason };
-    }
+
+    const evidence = {
+      isolated: true,
+      network: st.network,
+      image: st.image,
+      worktree: { path: dest, base_commit: wt.sha, initialClean: init.clean, changed, outsideScope: outside },
+      verify,
+      commit,
+      verdict,
+      plan: {
+        mode: resolved.mode,
+        repo: resolved.repo,
+        base_commit: resolved.baseCommit,
+        verify_profile: resolved.verifyProfileId,
+        commit: resolved.commit,
+        commit_paths: resolved.commitPaths,
+        digest: resolved.digest
+      },
+      authorization: { required: needsApproval, approval: approval.approval ? { id: approval.approval.id, digest: resolved.digest } : null }
+    };
+    if (approval.approval) db().prepare('UPDATE approvals SET used_at=? WHERE id=?').run(now(), approval.approval.id);
+
+    finalizeAttempt(task, execId, {
+      status: verdict.status === 'done' ? 'ok' : verdict.status === 'cancelled' ? 'cancelled' : 'failed',
+      reason: verdict.reasons.join('; '),
+      evidence,
+      text: res.text
+    });
+
+    return { ok: verdict.status === 'done', ...res, verdict, verify, commit, evidence, task: getTask(task.id), execution: execId };
+  } finally {
+    try { if (credFile) rmSync(credFile, { force: true }); } catch {}
+    try { await ex.removeWorktree({ repo: resolved.repo, dest }); } catch {}
   }
-
-  // 统一裁决
-  const verdict = computeVerdict({
-    cancelled: res.cancelled,
-    execOk: res.ok,
-    verify,
-    requiresVerify: Boolean(resolved.profile) || resolved.commit,
-    commit,
-    requiresCommit: resolved.commit,
-    approvalValid: approval.valid
-  });
-
-  const evidence = {
-    ...(res.evidence ?? {}),
-    verify,
-    commit,
-    verdict,
-    plan: {
-      mode, cwd,
-      verify_profile: resolved.verifyProfileId,
-      commit: resolved.commit,
-      commit_paths: resolved.commitPaths,
-      digest: resolved.digest
-    },
-    authorization: { required: needsApproval, approval: approval.approval ? { id: approval.approval.id, digest: resolved.digest } : null }
-  };
-  if (approval.approval) db().prepare('UPDATE approvals SET used_at=? WHERE id=?').run(now(), approval.approval.id);
-
-  finalizeAttempt(task, execId, { status: verdict.status === 'done' ? 'ok' : verdict.status, reason: verdict.reasons.join('; '), evidence, text: res.text });
-
-  return { ...res, evidence, verify, commit, verdict, task: getTask(task.id), execution: execId };
 }
 
 function finalizeAttempt(task, execId, { status, reason, evidence, text }) {

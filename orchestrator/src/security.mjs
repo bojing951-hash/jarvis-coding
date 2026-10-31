@@ -38,6 +38,8 @@ export function taskDigest(task, resolved) {
       executor: task.executor,
       mode: resolved.mode,
       cwd: resolved.cwd,
+      repo: resolved.repo ?? null,
+      base_commit: resolved.baseCommit ?? null,
       verify_profile_id: resolved.verifyProfileId ?? null,
       commit: Boolean(resolved.commit),
       commit_paths: [...(resolved.commitPaths ?? [])].sort(),
@@ -55,6 +57,8 @@ export function taskDigest(task, resolved) {
  */
 export const EXECUTOR_CONFIG_KEYS = new Set([
   'cwd',
+  'repo',
+  'base_commit',
   'mode',
   'verify_profile_id',
   'commit',
