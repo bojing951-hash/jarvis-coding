@@ -137,7 +137,11 @@ const TOOLS = [
         needs_approval: { type: 'boolean' },
         max_attempts: { type: 'number' },
         executor: { type: 'string', description: '可选：claude-code' },
-        executor_config: { type: 'object', description: '{cwd, mode, approved, verify}' }
+        cwd: { type: 'string', description: '执行目录（必须在项目目录内）' },
+        mode: { type: 'string', enum: ['plan', 'acceptEdits'], description: '写模式必须由管理员审批' },
+        verify_profile_id: { type: 'string', description: '已登记的可信校验配置 ID' },
+        commit: { type: 'boolean', description: '是否提交（需要审批 + 校验通过 + commit_paths）' },
+        commit_paths: { type: 'array', items: { type: 'string' }, description: '允许提交的相对路径' }
       },
       required: ['project', 'title']
     }
@@ -146,11 +150,6 @@ const TOOLS = [
     name: 'task_list',
     description: '列出任务及状态。',
     inputSchema: { type: 'object', properties: { project: { type: 'string' }, status: { type: 'string' } } }
-  },
-  {
-    name: 'task_approve',
-    description: '人工批准一个需要审批的任务。',
-    inputSchema: { type: 'object', properties: { task: { type: 'string' } }, required: ['task'] }
   },
   {
     name: 'task_run',
@@ -188,6 +187,11 @@ const TOOLS = [
   {
     name: 'task_cancel',
     description: '取消正在执行的任务（终止执行器进程组）。若无法终止会如实返回失败。',
+    inputSchema: { type: 'object', properties: { task: { type: 'string' } }, required: ['task'] }
+  },
+  {
+    name: 'approval_list',
+    description: '查看任务已签发的审批记录（只读）。审批本身只能由本地管理员签发，Agent 无权签发。',
     inputSchema: { type: 'object', properties: { task: { type: 'string' } }, required: ['task'] }
   },
   {
@@ -256,14 +260,20 @@ async function callTool(name, args) {
         maxAttempts: args.max_attempts,
         kind: args.executor ? 'executor' : undefined,
         executor: args.executor,
-        executorConfig: args.executor_config
+        executorConfig: args.executor
+          ? {
+              cwd: args.cwd,
+              mode: args.mode,
+              verify_profile_id: args.verify_profile_id,
+              commit: args.commit,
+              commit_paths: args.commit_paths
+            }
+          : undefined
       })));
     case 'task_list':
       return ok(JSON.stringify(svc.listTasks(args.project, args.status).map((t) => ({
         id: t.id, title: t.title, status: t.status, attempts: t.attempts
       })), null, 2));
-    case 'task_approve':
-      return ok(JSON.stringify(svc.approveTask(args.task)));
     case 'task_cancel': {
       const r = svc.cancelTask(args.task);
       return r.ok ? ok(JSON.stringify(r)) : err(JSON.stringify({ error: r.error }));
@@ -282,6 +292,8 @@ async function callTool(name, args) {
       return ok(JSON.stringify(svc.listWorkflows(args.project).map((w) => ({ id: w.id, name: w.name, status: w.status, cursor: w.cursor })), null, 2));
     case 'workflow_pause':
       return ok(JSON.stringify(svc.setWorkflowStatus(args.workflow, 'paused')));
+    case 'approval_list':
+      return ok(JSON.stringify(svc.listApprovals(args.task), null, 2));
     case 'models_list':
       return ok(JSON.stringify((await oc.listModels(args.provider)).map((m) => m.ref), null, 2));
     default:

@@ -8,6 +8,7 @@ import { homedir } from 'node:os';
 import { openDatabase, now, newId, slugify } from './db.mjs';
 import * as oc from './oc.mjs';
 import * as ex from './executor.mjs';
+import { validateExecutorConfig, resolveProjectPath, taskDigest, commitGate, canonicalJson, sha256 } from './security.mjs';
 
 const HOME = homedir();
 export const JARVIS_HOME = process.env.JARVIS_HOME || join(HOME, '.openclaw', 'jarvis');
@@ -257,11 +258,13 @@ export function createTask({ project: projectRef, title, input, assignee, kind, 
   const id = newId('tsk');
   const t = now();
   db()
-    .prepare(`INSERT INTO tasks (id,project_id,workflow_id,parent_task_id,title,kind,status,assignee_agent_id,input,max_attempts,needs_approval,executor,executor_config,created_at,updated_at)
-              VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+    .prepare(`INSERT INTO tasks (id,project_id,workflow_id,parent_task_id,title,kind,status,assignee_agent_id,input,max_attempts,needs_approval,executor,executor_config,verify_profile_id,commit_paths,created_at,updated_at)
+              VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
     .run(id, project.id, workflowId ?? null, parentTaskId ?? null, title, kind ?? 'agent_turn', 'pending',
          a?.id ?? null, input ?? '', maxAttempts ?? 3, needsApproval ? 1 : 0,
-         executor ?? 'agent', JSON.stringify(executorConfig ?? {}), t, t);
+         executor ?? 'agent', JSON.stringify(executorConfig ?? {}),
+         executorConfig?.verify_profile_id ?? null,
+         JSON.stringify(executorConfig?.commit_paths ?? []), t, t);
   event('task.created', project.id, { title, assignee: a?.name ?? null });
   return getTask(id);
 }
@@ -405,19 +408,123 @@ export async function handoff({ project: projectRef, from, to, title, requiremen
  * 外部执行器任务：调用 Claude Code，记录真实证据。
  * 与聊天 Agent 的权限完全分离——执行器不是 Agent，Agent 也拿不到 Shell。
  */
+/**
+ * 解析执行计划：把不可信配置转成受约束的计划。
+ * 任何一项不合法都返回 blocked，不做"尽力而为"。
+ */
+export function resolveExecutorPlan(task, project) {
+  const parsed = JSON.parse(task.executor_config || '{}');
+  const v = validateExecutorConfig(parsed);
+  if (!v.ok) return { ok: false, blocked: 'invalid_executor_config', error: v.errors.join('; ') };
+  const cfg = v.config;
+
+  const pathCheck = resolveProjectPath(cfg.cwd, project.dir);
+  if (!pathCheck.ok) return { ok: false, blocked: 'path_outside_project', error: pathCheck.error };
+
+  const mode = cfg.mode ?? 'plan';
+  const commit = Boolean(cfg.commit);
+  const commitPaths = cfg.commit_paths ?? [];
+  const verifyProfileId = task.verify_profile_id ?? cfg.verify_profile_id ?? null;
+
+  let profile = null;
+  if (verifyProfileId) {
+    profile = db().prepare('SELECT * FROM verify_profiles WHERE id = ?').get(verifyProfileId);
+    if (!profile) return { ok: false, blocked: 'unknown_verify_profile', error: `校验配置不存在: ${verifyProfileId}` };
+    if (profile.project_id !== project.id) {
+      return { ok: false, blocked: 'verify_profile_cross_project', error: '校验配置不属于该项目' };
+    }
+  }
+
+  const resolved = { mode, cwd: pathCheck.cwd, verifyProfileId, commit, commitPaths, profile };
+  resolved.digest = taskDigest(task, resolved);
+  return { ok: true, resolved };
+}
+
+/** 当前有效的审批记录（摘要必须完全匹配，过期/撤销/已用都算无效）。 */
+export function findValidApproval(taskId, digest) {
+  const row = db()
+    .prepare(`SELECT * FROM approvals
+              WHERE task_id = ? AND digest = ? AND revoked_at IS NULL AND used_at IS NULL
+              ORDER BY issued_at DESC LIMIT 1`)
+    .get(taskId, digest);
+  if (!row) return { valid: false, reason: '没有与该任务参数匹配的审批记录' };
+  if (new Date(row.expires_at).getTime() < Date.now()) {
+    return { valid: false, reason: '审批已过期' };
+  }
+  return { valid: true, approval: row };
+}
+
+/**
+ * 签发审批——只能由本地管理员入口调用（CLI）。
+ * MCP 不暴露此能力（AC-02）。
+ */
+export function issueApproval({ task: taskRef, ttlHours = 24, issuedBy = 'local-operator' }) {
+  const task = getTask(taskRef);
+  const project = getProject(task.project_id);
+  const plan = resolveExecutorPlan(task, project);
+  if (!plan.ok) return { ok: false, error: `${plan.blocked}: ${plan.error}` };
+  const { resolved } = plan;
+
+  const id = newId('apv');
+  const issued = now();
+  const expires = new Date(Date.now() + ttlHours * 3600_000).toISOString();
+  const scope = {
+    project: project.slug,
+    executor: task.executor,
+    mode: resolved.mode,
+    cwd: resolved.cwd,
+    verify_profile: resolved.verifyProfileId,
+    commit: resolved.commit,
+    commit_paths: resolved.commitPaths
+  };
+  db()
+    .prepare('INSERT INTO approvals (id,task_id,digest,scope,issued_by,issued_at,expires_at) VALUES (?,?,?,?,?,?,?)')
+    .run(id, task.id, resolved.digest, JSON.stringify(scope), issuedBy, issued, expires);
+  event('approval.issued', project.id, { task: task.id, scope });
+  return { ok: true, approval: { id, task: task.id, digest: resolved.digest, scope, expires_at: expires } };
+}
+
+export function listApprovals(taskRef) {
+  const task = getTask(taskRef);
+  return db().prepare('SELECT * FROM approvals WHERE task_id = ? ORDER BY issued_at DESC').all(task.id);
+}
+
+/**
+ * 外部执行器任务。
+ *
+ * 阶段：授权 → 执行 → 校验 → 提交前检查 → Commit → 记录
+ * 取消后不得再进入后续副作用阶段（AC-06）。
+ */
 async function runExecutorTask(task, project) {
   if (task.executor !== 'claude-code') {
     return { ok: false, blocked: 'unknown_executor', error: `未支持的执行器: ${task.executor}` };
   }
-  const cfg = JSON.parse(task.executor_config || '{}');
-  const cwd = cfg.cwd || join(project.dir, 'exec');
-  const mode = cfg.mode || 'plan';
-  if (mode === 'acceptEdits' && cfg.approved !== true) {
-    return { ok: false, blocked: 'needs_approval', error: '写模式需要先审批（executor_config.approved=true 且任务已批准）' };
-  }
-  mkdirSync(cwd, { recursive: true });
 
-  updateTask(task.id, { status: 'running', attempts: task.attempts + 1 });
+  const plan = resolveExecutorPlan(task, project);
+  if (!plan.ok) return { ok: false, blocked: plan.blocked, error: plan.error };
+  const { resolved } = plan;
+  const { mode, cwd, commitPaths } = resolved;
+
+  // 写模式或提交必须有有效审批（AC-02 / AC-09：不认 executor_config.approved 与历史 approved_at）
+  const needsApproval = mode === 'acceptEdits' || resolved.commit;
+  let approval = { valid: !needsApproval, reason: '' };
+  if (needsApproval) {
+    approval = findValidApproval(task.id, resolved.digest);
+    if (!approval.valid) {
+      return { ok: false, blocked: 'needs_approval', error: `需要本地管理员审批：${approval.reason}` };
+    }
+  }
+
+  // 并发保护：只有 pending/retry_pending/approved/failed 能转为 running（AC-07）
+  const claim = db()
+    .prepare(`UPDATE tasks SET status='running', attempts=attempts+1, updated_at=?
+              WHERE id=? AND status IN ('pending','retry_pending','approved','failed')`)
+    .run(now(), task.id);
+  if (claim.changes !== 1) {
+    return { ok: false, blocked: 'already_running', error: '任务已在运行或状态不允许执行' };
+  }
+
+  mkdirSync(cwd, { recursive: true });
   const execId = newId('exe');
   const started = now();
   db()
@@ -432,36 +539,77 @@ async function runExecutorTask(task, project) {
     cwd,
     prompt: task.input,
     mode,
-    allowedTools: cfg.allowedTools,
-    maxTurns: cfg.maxTurns,
-    timeoutMs: cfg.timeoutMs,
+    maxTurns: resolved.maxTurns,
+    timeoutMs: resolved.timeoutMs,
     onPid: (pid) => {
       try { writeFileSync(pidFile, String(pid), { mode: 0o600 }); } catch {}
-      db().prepare('UPDATE executions SET evidence=? WHERE id=?')
-        .run(JSON.stringify({ pid }), execId);
+      db().prepare('UPDATE executions SET evidence=? WHERE id=?').run(JSON.stringify({ pid }), execId);
     }
   });
   try { rmSync(pidFile, { force: true }); } catch {}
 
-  // 执行后校验（operator 指定命令）
+  const isCancelled = () =>
+    db().prepare('SELECT status FROM tasks WHERE id = ?').get(task.id)?.status === 'cancelled';
+
+  // 校验（只认登记配置，不经 shell）
   let verify = null;
-  if (cfg.verify) {
-    verify = await ex.runVerify({ cwd: res.evidence?.cwd || cwd, command: cfg.verify, timeoutMs: cfg.verifyTimeoutMs });
+  if (res.ok && !isCancelled() && resolved.profile) {
+    verify = await ex.runVerifyProfile({
+      program: resolved.profile.program,
+      argv: JSON.parse(resolved.profile.argv || '[]'),
+      cwd: resolved.profile.cwd ? resolveProjectPath(resolved.profile.cwd, project.dir).cwd ?? cwd : cwd,
+      timeoutMs: resolved.profile.timeout_ms
+    });
   }
+
+  // 提交门禁：执行成功 ≠ 可以提交
   let commit = null;
-  if (cfg.commit && res.ok) {
-    commit = await ex.gitCommit({ cwd: res.evidence?.cwd || cwd, message: cfg.commitMessage || `chore(executor): ${task.title}` });
+  if (resolved.commit && !isCancelled()) {
+    const gate = commitGate({
+      execOk: res.ok,
+      verify,
+      approval: needsApproval ? { valid: true } : approval,
+      commitPaths
+    });
+    if (gate.ok) {
+      commit = await ex.gitCommit({
+        cwd,
+        message: JSON.parse(task.executor_config || '{}').commit_message || `chore(executor): ${task.title}`,
+        paths: commitPaths
+      });
+    } else {
+      commit = { ok: false, skipped: true, reason: gate.reason };
+    }
   }
-  const evidence = { ...(res.evidence ?? {}), verify, commit };
-  const finalStatus = res.cancelled ? 'cancelled' : res.ok ? 'ok' : 'failed';
-  // 只在仍为 running 时回写，避免覆盖 cancelTask 已写入的 cancelled
+
+  const approvalRecord = approval.valid ? { id: approval.approval?.id, digest: resolved.digest } : null;
+  if (approvalRecord?.id) {
+    db().prepare('UPDATE approvals SET used_at=? WHERE id=?').run(now(), approvalRecord.id);
+  }
+
+  const evidence = {
+    ...(res.evidence ?? {}),
+    verify,
+    commit,
+    plan: {
+      mode,
+      cwd,
+      verify_profile: resolved.verifyProfileId,
+      commit: resolved.commit,
+      commit_paths: commitPaths,
+      digest: resolved.digest
+    },
+    authorization: { required: needsApproval, approval: approvalRecord }
+  };
+
+  const cancelledNow = res.cancelled || isCancelled();
+  const finalStatus = cancelledNow ? 'cancelled' : res.ok ? 'ok' : 'failed';
   db()
     .prepare("UPDATE executions SET status=?, model=?, output=?, error=?, evidence=?, finished_at=? WHERE id=? AND status='running'")
     .run(finalStatus, 'claude-code', res.text ?? '', res.ok ? '' : res.error ?? '',
          JSON.stringify(evidence), now(), execId);
 
-  // 所有回写都加 status='running' 守卫：一旦被 cancel，任何后续结果都不得覆盖
-  if (res.cancelled) {
+  if (cancelledNow) {
     db().prepare("UPDATE tasks SET status='cancelled', updated_at=? WHERE id=? AND status='running'").run(now(), task.id);
   } else if (res.ok) {
     db().prepare("UPDATE tasks SET status='done', output=?, error='', updated_at=? WHERE id=? AND status='running'")
@@ -471,9 +619,8 @@ async function runExecutorTask(task, project) {
       .run(res.error ?? '', now(), task.id);
   }
 
-  return { ...res, evidence, verify, commit, task: getTask(task.id), execution: execId };
+  return { ...res, evidence, verify, commit, approval: approvalRecord, task: getTask(task.id), execution: execId };
 }
-
 
 /* --------------------------------- Workflows --------------------------------- */
 
@@ -660,6 +807,13 @@ export function cancelTask(ref) {
     try { rmSync(pidFile, { force: true }); } catch {}
     results.push({ execution: exRow.id, pid, killed });
   }
+  const allKilled = results.every((r) => r.killed);
+  // AC-06：无法确认终止时不得虚报「已取消」
+  if (!allKilled) {
+    db().prepare("UPDATE tasks SET status='cancel_requested', updated_at=? WHERE id=?").run(now(), task.id);
+    event('task.cancel_unconfirmed', task.project_id, { title: task.title, results });
+    return { ok: false, error: '无法确认执行器已终止，状态标记为 cancel_requested，需人工核查', task: getTask(task.id), results };
+  }
   db().prepare("UPDATE tasks SET status='cancelled', updated_at=? WHERE id=?").run(now(), task.id);
   event('task.cancelled', task.project_id, { title: task.title });
   return { ok: true, task: getTask(task.id), results };
@@ -733,6 +887,42 @@ async function runAuditTask(task, project) {
   if (res.ok) updateTask(task.id, { status: 'done', output: res.text, error: '' });
   else updateTask(task.id, { status: 'failed', error: res.error ?? '' });
   return { ...res, evidence, task: getTask(task.id), execution: execId };
+}
+
+
+/* ----------------------------- Verify Profiles ------------------------------- */
+
+/**
+ * 登记可信校验配置——只能由本地管理员入口调用（CLI）。
+ * 校验命令由管理员固定，任务只能引用 id（AC-01）。
+ */
+export function createVerifyProfile({ project: projectRef, name, program, argv = [], cwd, timeoutMs = 300_000, createdBy = 'local-operator' }) {
+  const project = getProject(projectRef);
+  if (!name || !program) throw new Error('必须提供 name 与 program');
+  if (!Array.isArray(argv)) throw new Error('argv 必须是数组');
+  const shellNames = ['sh', 'bash', 'zsh', 'dash', 'csh', 'ksh'];
+  const base = String(program).split('/').pop();
+  if (shellNames.includes(program) || shellNames.includes(base)) {
+    throw new Error('不允许把 shell 解释器登记为校验程序');
+  }
+  const id = newId('vpr');
+  db()
+    .prepare('INSERT INTO verify_profiles (id,project_id,name,program,argv,cwd,timeout_ms,created_by,created_at) VALUES (?,?,?,?,?,?,?,?,?)')
+    .run(id, project.id, name, program, JSON.stringify(argv), cwd ?? null, timeoutMs, createdBy, now());
+  event('verify_profile.created', project.id, { name, program, argv });
+  return getVerifyProfile(id);
+}
+
+export function getVerifyProfile(ref) {
+  const row = db().prepare('SELECT * FROM verify_profiles WHERE id = ? OR name = ?').get(ref, ref);
+  if (!row) throw new Error(`校验配置不存在: ${ref}`);
+  return row;
+}
+
+export function listVerifyProfiles(projectRef) {
+  if (!projectRef) return db().prepare('SELECT * FROM verify_profiles ORDER BY created_at').all();
+  const p = getProject(projectRef);
+  return db().prepare('SELECT * FROM verify_profiles WHERE project_id = ?').all(p.id);
 }
 
 /* -------------------------------- Notifications ------------------------------- */

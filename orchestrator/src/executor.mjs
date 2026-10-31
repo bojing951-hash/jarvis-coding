@@ -11,6 +11,7 @@
 import { execFile, spawn } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { homedir } from 'node:os';
+import { safeChildEnv } from './security.mjs';
 import { join } from 'node:path';
 
 const HOME = homedir();
@@ -35,7 +36,7 @@ function run(cmd, args, { cwd, timeoutMs = 900_000, onPid }) {
     const child = spawn(cmd, args, {
       cwd,
       detached: true,
-      env: process.env,
+      env: safeChildEnv(),
       stdio: ['ignore', 'pipe', 'pipe']
     });
     if (onPid && child.pid) onPid(child.pid);
@@ -129,20 +130,33 @@ export async function runClaudeCode({ cwd, prompt, mode = 'plan', allowedTools, 
 }
 
 /**
- * 执行后校验：由编排层执行**运维指定**的命令（不是模型指定），
- * 因此不需要给 Claude 放开 Shell 权限。
+ * 执行后校验——只接受**已登记的可信配置**，不经 Shell（AC-01）。
+ * program + argv 直接交给 execFile，模型无法注入元字符。
  */
-export async function runVerify({ cwd, command, timeoutMs = 300_000 }) {
-  if (!command) return null;
+export async function runVerifyProfile({ program, argv = [], cwd, timeoutMs = 300_000 }) {
+  if (!program || typeof program !== 'string') {
+    return { exitCode: -1, ok: false, error: '缺少校验程序', output: '' };
+  }
+  // 禁止通过 shell 解释器伪装成程序
+  const banned = ['sh', 'bash', 'zsh', 'dash', 'csh', 'ksh', '/bin/sh', '/bin/bash', '/bin/zsh'];
+  const base = program.split('/').pop();
+  if (banned.includes(program) || banned.includes(base)) {
+    return { exitCode: -1, ok: false, error: `不允许以 shell 执行校验: ${program}`, output: '' };
+  }
   const started = Date.now();
-  // 固定用 /bin/sh -c，命令来自 operator 配置而非模型输出
   const r = await new Promise((resolve) => {
-    execFile('/bin/sh', ['-c', command], { cwd, timeout: timeoutMs, maxBuffer: 8 * 1024 * 1024 }, (err, stdout, stderr) => {
-      resolve({ code: err?.code ?? 0, stdout: stdout ?? '', stderr: stderr ?? '' });
-    });
+    execFile(
+      program,
+      argv,
+      { cwd, timeout: timeoutMs, maxBuffer: 8 * 1024 * 1024, env: safeChildEnv(), shell: false },
+      (err, stdout, stderr) => {
+        resolve({ code: err?.code ?? 0, stdout: stdout ?? '', stderr: stderr ?? '' });
+      }
+    );
   });
   return {
-    command,
+    program,
+    argv,
     exitCode: r.code,
     ok: r.code === 0,
     durationMs: Date.now() - started,
@@ -151,27 +165,38 @@ export async function runVerify({ cwd, command, timeoutMs = 300_000 }) {
 }
 
 /**
- * 由编排层代为提交（不使用模型能力，避免给 Claude 开 git 权限）。
- * 用 -c 传入身份，不修改用户的全局 git 配置。
+ * 由编排层代为提交（不使用模型能力）。
+ * 只 add 任务声明的路径，避免把无关修改一起提交（AC-05）。
  */
-export async function gitCommit({ cwd, message }) {
-  const identity = [
-    '-c', 'user.name=JARVIS Executor',
-    '-c', 'user.email=jarvis-executor@localhost'
-  ];
-  const add = await new Promise((resolve) => {
-    execFile('git', ['-C', cwd, 'add', '-A'], { timeout: 60_000 }, (e, so, se) => resolve({ code: e?.code ?? 0, out: so + se }));
-  });
+export async function gitCommit({ cwd, message, paths }) {
+  if (!Array.isArray(paths) || paths.length === 0) {
+    return { ok: false, error: '未声明提交路径' };
+  }
+  const git = (args) =>
+    new Promise((resolve) => {
+      execFile('git', ['-C', cwd, ...args], { timeout: 60_000, env: safeChildEnv() }, (e, so, se) =>
+        resolve({ code: e?.code ?? 0, out: (so || '') + (se || '') })
+      );
+    });
+
+  const add = await git(['add', '--', ...paths]);
   if (add.code !== 0) return { ok: false, error: add.out.slice(0, 500) };
 
-  const commit = await new Promise((resolve) => {
-    execFile('git', ['-C', cwd, ...identity, 'commit', '-m', message], { timeout: 60_000 }, (e, so, se) => resolve({ code: e?.code ?? 0, out: so + se }));
-  });
+  // 只允许提交声明的路径：暂存区出现其它文件则拒绝
+  const staged = await git(['diff', '--cached', '--name-only']);
+  const stagedFiles = staged.out.split('\n').map((x) => x.trim()).filter(Boolean);
+  const outside = stagedFiles.filter((f) => !paths.some((p) => f === p || f.startsWith(p.replace(/\/$/, '') + '/')));
+  if (outside.length) {
+    await git(['reset']);
+    return { ok: false, error: `提交范围外存在改动: ${outside.join(', ')}` };
+  }
 
+  const identity = ['-c', 'user.name=JARVIS Executor', '-c', 'user.email=jarvis-executor@localhost'];
+  const commit = await git([...identity, 'commit', '-m', message]);
   const head = await new Promise((resolve) => {
     execFile('git', ['-C', cwd, 'rev-parse', 'HEAD'], { timeout: 15_000 }, (e, so) => resolve(e ? null : so.trim()));
   });
-  return { ok: commit.code === 0, sha: head, output: commit.out.slice(-1500) };
+  return { ok: commit.code === 0, sha: head, files: stagedFiles, output: commit.out.slice(-1500) };
 }
 
 /**

@@ -5,6 +5,7 @@
  */
 import * as svc from './service.mjs';
 import * as oc from './oc.mjs';
+import { assertOperator, operatorKeyPath } from './security.mjs';
 
 const argv = process.argv.slice(2);
 
@@ -210,6 +211,45 @@ async function main() {
         print(svc.setWorkflowStatus(require_('workflow'), 'paused'));
         break;
 
+      /* 管理员入口（本地可信） */
+      case 'operator:init': {
+        const { writeFileSync, mkdirSync, existsSync } = await import('node:fs');
+        const { randomBytes } = await import('node:crypto');
+        const dir = `${process.env.HOME}/.openclaw/jarvis`;
+        const file = operatorKeyPath(process.env.HOME);
+        mkdirSync(dir, { recursive: true });
+        if (existsSync(file) && !opt.force) {
+          fail('管理员密钥已存在；如需重建请加 --force');
+        }
+        writeFileSync(file, randomBytes(32).toString('hex'), { mode: 0o600 });
+        print({ ok: true, key: file, note: '此密钥仅用于本地签发审批，不要提交到仓库' });
+        break;
+      }
+      case 'verify-profile:add': {
+        assertOperator(operatorKeyPath(process.env.HOME));
+        const argv = opt.argv ? JSON.parse(opt.argv) : [];
+        print(svc.createVerifyProfile({
+          project: require_('project'),
+          name: require_('name'),
+          program: require_('program'),
+          argv,
+          cwd: opt.cwd,
+          timeoutMs: opt.timeout ? Number(opt.timeout) : undefined
+        }));
+        break;
+      }
+      case 'verify-profile:list':
+        print(svc.listVerifyProfiles(opt.project));
+        break;
+      case 'approve:': {
+        assertOperator(operatorKeyPath(process.env.HOME));
+        print(svc.issueApproval({ task: require_('task'), ttlHours: opt.ttl ? Number(opt.ttl) : 24 }));
+        break;
+      }
+      case 'approval:list':
+        print(svc.listApprovals(require_('task')));
+        break;
+
       /* 自检 */
       case 'doctor:': {
         const { runDoctor } = await import('./doctor.mjs');
@@ -257,6 +297,11 @@ async function main() {
             'handoff --project <ref> --from <agent> --to <agent> --requirement <文本> [--artifact <文本>] [--context <文本>] [--constraints <文本>]',
             'workflow create --project <ref> --name <n> --spec-file <json>',
             'workflow run --workflow <id|name> | workflow list [--project <ref>] | workflow pause --workflow <id>',
+            'operator init [--force]     # 生成本地管理员密钥（审批用）',
+            'verify-profile add --project <ref> --name <n> --program <exe> [--argv <json>] [--cwd <dir>] [--timeout ms]',
+            'verify-profile list [--project <ref>]',
+            'approve --task <id> [--ttl 24]   # 本地管理员签发审批（Agent 无法调用）',
+            'approval list --task <id>',
             'doctor                      # 环境自检（PASS/WARN/FAIL）',
             'config notify --target <feishu chat_id> | config show',
             'models [--provider <id>]',

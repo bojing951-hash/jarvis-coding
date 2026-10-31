@@ -65,6 +65,8 @@ CREATE TABLE IF NOT EXISTS tasks (
   needs_approval   INTEGER NOT NULL DEFAULT 0,
   executor         TEXT NOT NULL DEFAULT 'agent',
   executor_config  TEXT NOT NULL DEFAULT '{}',
+  verify_profile_id TEXT,
+  commit_paths     TEXT NOT NULL DEFAULT '[]',
   approved_at      TEXT,
   created_at       TEXT NOT NULL,
   updated_at       TEXT NOT NULL
@@ -97,6 +99,33 @@ CREATE TABLE IF NOT EXISTS workflows (
   updated_at  TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS verify_profiles (
+  id          TEXT PRIMARY KEY,
+  project_id  TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  name        TEXT NOT NULL,
+  program     TEXT NOT NULL,
+  argv        TEXT NOT NULL DEFAULT '[]',
+  cwd         TEXT,
+  timeout_ms  INTEGER NOT NULL DEFAULT 300000,
+  created_by  TEXT NOT NULL DEFAULT 'operator',
+  created_at  TEXT NOT NULL,
+  UNIQUE(project_id, name)
+);
+
+CREATE TABLE IF NOT EXISTS approvals (
+  id          TEXT PRIMARY KEY,
+  task_id     TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+  digest      TEXT NOT NULL,
+  scope       TEXT NOT NULL DEFAULT '{}',
+  issued_by   TEXT NOT NULL,
+  issued_at   TEXT NOT NULL,
+  expires_at  TEXT NOT NULL,
+  revoked_at  TEXT,
+  used_at     TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_approvals_task ON approvals(task_id, digest);
+
 CREATE TABLE IF NOT EXISTS settings (
   key   TEXT PRIMARY KEY,
   value TEXT NOT NULL
@@ -126,6 +155,12 @@ function migrate(db) {
   }
   if (!hasColumn(db, 'tasks', 'executor_config')) {
     db.exec("ALTER TABLE tasks ADD COLUMN executor_config TEXT NOT NULL DEFAULT '{}'");
+  }
+  if (!hasColumn(db, 'tasks', 'verify_profile_id')) {
+    db.exec('ALTER TABLE tasks ADD COLUMN verify_profile_id TEXT');
+  }
+  if (!hasColumn(db, 'tasks', 'commit_paths')) {
+    db.exec("ALTER TABLE tasks ADD COLUMN commit_paths TEXT NOT NULL DEFAULT '[]'");
   }
 }
 
