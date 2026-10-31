@@ -638,7 +638,9 @@ async function runExecutorTask(task, project) {
     credFile = cred.file;
 
     const proxyUrl = await iso.egressProxyUrl();
+    const containerName = `jarvis-exec-${execId}`;
     const res = await iso.runClaudeIsolated({
+      name: containerName,
       workdir: dest,
       prompt: task.input,
       mode: resolved.mode,
@@ -647,7 +649,7 @@ async function runExecutorTask(task, project) {
       proxyUrl
     });
 
-    const cancelledNow = () => db().prepare('SELECT status FROM tasks WHERE id=?').get(task.id)?.status === 'cancelled';
+    const cancelledNow = () => ['cancelled', 'cancel_requested'].includes(db().prepare('SELECT status FROM tasks WHERE id=?').get(task.id)?.status);
     if (cancelledNow()) {
       finalizeAttempt(task, execId, { status: 'cancelled', reason: '取消于校验前' });
       return { ok: false, blocked: 'cancelled', error: '任务已取消' };
@@ -729,7 +731,18 @@ async function runExecutorTask(task, project) {
       text: res.text
     });
 
-    return { ok: verdict.status === 'done', ...res, verdict, verify, commit, evidence, task: getTask(task.id), execution: execId };
+    // 注意：ok 必须放在展开之后，否则会被 res.ok（容器执行成功）覆盖，
+    // 造成「任务 failed 但 API 返回成功」的不一致（DEF-01）。
+    return {
+      ...res,
+      ok: verdict.status === 'done',
+      verdict,
+      verify,
+      commit,
+      evidence,
+      task: getTask(task.id),
+      execution: execId
+    };
   } finally {
     try { if (credFile) rmSync(credFile, { force: true }); } catch {}
     try { await ex.removeWorktree({ repo: resolved.repo, dest }); } catch {}
@@ -908,7 +921,7 @@ async function runWorkflowInner(ref) {
  * 取消任务：杀掉执行器进程组，并把状态置为 cancelled。
  * 不做「假装已取消」——无法终止时如实返回失败。
  */
-export function cancelTask(ref) {
+export async function cancelTask(ref) {
   const task = getTask(ref);
   const running = db()
     .prepare("SELECT * FROM executions WHERE task_id = ? AND status = 'running' ORDER BY started_at DESC")
@@ -916,30 +929,74 @@ export function cancelTask(ref) {
   if (!running.length) {
     return { ok: false, error: '该任务没有正在运行的执行', task: getTask(task.id) };
   }
+
+  // 先标记取消意图，避免执行侧在终止过程中把任务写成 failed（DEF-02 竞态）
+  db().prepare("UPDATE tasks SET status='cancel_requested', updated_at=? WHERE id=? AND status IN ('running','verifying','committing')").run(now(), task.id);
+
+  const alive = (pid) => {
+    try { process.kill(pid, 0); return true; } catch { return false; }
+  };
+  const waitGone = async (pid, ms) => {
+    const deadline = Date.now() + ms;
+    while (Date.now() < deadline) {
+      if (!alive(pid)) return true;
+      await new Promise((r) => setTimeout(r, 200));
+    }
+    return !alive(pid);
+  };
+
   const results = [];
   for (const exRow of running) {
     const pidFile = join(JARVIS_HOME, 'run', `${exRow.id}.pid`);
     let pid = null;
     try { pid = Number(readFileSync(pidFile, 'utf8').trim()); } catch { pid = null; }
-    let killed = false;
+
+    let confirmed = false;
+    let escalated = false;
+    let containerKilled = null;
     if (Number.isFinite(pid) && pid > 0) {
-      try { process.kill(-pid, 'SIGTERM'); killed = true; } catch {
-        try { process.kill(pid, 'SIGTERM'); killed = true; } catch { killed = false; }
+      try { process.kill(-pid, 'SIGTERM'); } catch { try { process.kill(pid, 'SIGTERM'); } catch {} }
+      confirmed = await waitGone(pid, 5000);
+      if (!confirmed) {
+        escalated = true;
+        try { process.kill(-pid, 'SIGKILL'); } catch { try { process.kill(pid, 'SIGKILL'); } catch {} }
+        confirmed = await waitGone(pid, 5000);
       }
     }
-    db().prepare("UPDATE executions SET status='cancelled', finished_at=? WHERE id=?").run(now(), exRow.id);
-    try { rmSync(pidFile, { force: true }); } catch {}
-    results.push({ execution: exRow.id, pid, killed });
+
+    // 容器可能仍在运行（杀死 docker run 客户端不等于停止容器）
+    const cname = `jarvis-exec-${exRow.id}`;
+    containerKilled = await iso.killContainer(cname);
+    // 容器确认消失是最强证据；没有容器时才回退到宿主进程确认
+    const fullyStopped = containerKilled.confirmed === true || (confirmed && containerKilled.reason === 'no container name');
+
+    if (fullyStopped) {
+      db().prepare("UPDATE executions SET status='cancelled', finished_at=? WHERE id=? AND status='running'").run(now(), exRow.id);
+      try { rmSync(pidFile, { force: true }); } catch {}
+    }
+    results.push({
+      execution: exRow.id,
+      pid,
+      confirmedExit: fullyStopped,
+      escalatedToSigkill: escalated,
+      container: containerKilled
+    });
   }
-  const allKilled = results.every((r) => r.killed);
-  // AC-06：无法确认终止时不得虚报「已取消」
-  if (!allKilled) {
-    db().prepare("UPDATE tasks SET status='cancel_requested', updated_at=? WHERE id=?").run(now(), task.id);
+
+  const allConfirmed = results.every((r) => r.confirmedExit);
+  if (!allConfirmed) {
+    db().prepare("UPDATE tasks SET status='cancel_requested', updated_at=? WHERE id=? AND status NOT IN ('cancelled','done')").run(now(), task.id);
     event('task.cancel_unconfirmed', task.project_id, { title: task.title, results });
-    return { ok: false, error: '无法确认执行器已终止，状态标记为 cancel_requested，需人工核查', task: getTask(task.id), results };
+    return {
+      ok: false,
+      error: '无法确认执行器已终止（已尝试 SIGTERM→SIGKILL），状态标记为 cancel_requested，需人工核查',
+      task: getTask(task.id),
+      results
+    };
   }
-  db().prepare("UPDATE tasks SET status='cancelled', updated_at=? WHERE id=?").run(now(), task.id);
-  event('task.cancelled', task.project_id, { title: task.title });
+
+  db().prepare("UPDATE tasks SET status='cancelled', updated_at=? WHERE id=? AND status IN ('running','verifying','committing','cancel_requested')").run(now(), task.id);
+  event('task.cancelled', task.project_id, { title: task.title, results });
   return { ok: true, task: getTask(task.id), results };
 }
 

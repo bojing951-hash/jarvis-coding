@@ -139,6 +139,21 @@ test('AC-04 相对路径穿越被拒绝', () => {
   assert.equal(r.ok, false);
 });
 
+test('AC-10 指向项目外的符号链接被拒绝', () => {
+  const a = svc.createProject({ name: '链接源', slug: 'sec-link-a' });
+  const b = svc.createProject({ name: '链接目标', slug: 'sec-link-b' });
+  const link = join(a.dir, 'escape');
+  try { rmSync(link, { force: true }); } catch {}
+  try {
+    execFileSync('ln', ['-s', b.dir, link]);
+  } catch {
+    return; // 无法创建符号链接时跳过（环境限制）
+  }
+  const r = sec.resolveProjectPath('escape', a.dir);
+  assert.equal(r.ok, false, '指向其他项目的符号链接必须被拒绝');
+  assert.match(r.error, /越界|不在项目/);
+});
+
 /* ---------------------------------- AC-05 --------------------------------- */
 
 test('AC-05 校验失败不得提交', () => {

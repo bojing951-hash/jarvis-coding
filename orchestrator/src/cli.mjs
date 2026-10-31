@@ -160,7 +160,7 @@ async function main() {
         print(svc.getTask(require_('task')));
         break;
       case 'task:cancel': {
-        const r = svc.cancelTask(require_('task'));
+        const r = await svc.cancelTask(require_('task'));
         print(r);
         if (!r.ok) process.exit(2);
         break;

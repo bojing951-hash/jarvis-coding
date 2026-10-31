@@ -66,10 +66,10 @@ test('工作流 spec 为空应报错', () => {
   assert.throws(() => svc.createWorkflow({ project: p.id, name: 'x', spec: { stages: [] } }), /不能为空/);
 });
 
-test('取消一个没有运行中执行的任务应如实失败', () => {
+test('取消一个没有运行中执行的任务应如实失败', async () => {
   const p = svc.createProject({ name: '取消测试', slug: 't-cancel' });
   const t = svc.createTask({ project: p.id, title: '未执行', input: 'x' });
-  const r = svc.cancelTask(t.id);
+  const r = await svc.cancelTask(t.id);
   assert.equal(r.ok, false);
   assert.match(r.error, /没有正在运行/);
 });

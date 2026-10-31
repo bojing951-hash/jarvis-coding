@@ -46,13 +46,30 @@ function run(cmd, args, { cwd, timeoutMs = 900_000, onPid }) {
     child.stdout?.on('data', (d) => (stdout += d.toString()));
     child.stderr?.on('data', (d) => (stderr += d.toString()));
 
-    const timer = setTimeout(() => {
-      try { process.kill(-child.pid, 'SIGTERM'); } catch {}
-    }, timeoutMs);
+    // 超时/取消时的终止升级：SIGTERM → 等待 grace → SIGKILL
+    let killSignal = null;
+    const terminate = (sig) => {
+      killSignal = sig;
+      try { process.kill(-child.pid, sig); } catch {
+        try { process.kill(child.pid, sig); } catch {}
+      }
+    };
+    const termTimer = setTimeout(() => terminate('SIGTERM'), timeoutMs);
+    const killTimer = setTimeout(() => {
+      if (killSignal && child.exitCode === null) terminate('SIGKILL');
+    }, timeoutMs + 5000);
 
     const done = (code, signal) => {
-      clearTimeout(timer);
-      resolve({ code: code ?? 1, signaled: signal != null, stdout, stderr });
+      clearTimeout(termTimer);
+      clearTimeout(killTimer);
+      resolve({
+        code: code ?? 1,
+        signaled: signal != null || killSignal != null,
+        killSignal,
+        confirmedExit: child.exitCode !== null || child.signalCode !== null,
+        stdout,
+        stderr
+      });
     };
     child.on('close', done);
     child.on('error', (e) => done(1, null));

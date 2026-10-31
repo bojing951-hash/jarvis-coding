@@ -138,6 +138,7 @@ export async function runClaudeIsolated({
   image,
   credentialsFile,
   proxyUrl,
+  name,
   network = process.env.JARVIS_EXECUTOR_NETWORK || 'jarvis-internal',
   timeoutMs = 900_000
 }) {
@@ -146,6 +147,7 @@ export async function runClaudeIsolated({
 
   const args = [
     'run', '--rm',
+    ...(name ? ['--name', name] : []),
     '--network', network,
     '--user', '1000:1000',
     '--security-opt', 'no-new-privileges',
@@ -178,6 +180,18 @@ export async function runClaudeIsolated({
     image,
     raw: r.out.slice(-2000)
   };
+}
+
+/** 强制终止容器（取消用）；以容器实际消失为准。 */
+export async function killContainer(name) {
+  if (!name) return { ok: false, reason: 'no container name' };
+  await sh(DOCKER, ['kill', name], { timeoutMs: 15_000 });
+  for (let i = 0; i < 20; i++) {
+    const r = await sh(DOCKER, ['inspect', name, '--format', '{{.State.Status}}'], { timeoutMs: 8_000 });
+    if (r.code !== 0) return { ok: true, confirmed: true };
+    await new Promise((res) => setTimeout(res, 200));
+  }
+  return { ok: false, confirmed: false, reason: '容器仍存在' };
 }
 
 /** 在同一隔离网络/挂载里运行任意受控程序（校验用）。 */

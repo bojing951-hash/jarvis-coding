@@ -275,7 +275,7 @@ async function callTool(name, args) {
         id: t.id, title: t.title, status: t.status, attempts: t.attempts
       })), null, 2));
     case 'task_cancel': {
-      const r = svc.cancelTask(args.task);
+      const r = await svc.cancelTask(args.task);
       return r.ok ? ok(JSON.stringify(r)) : err(JSON.stringify({ error: r.error }));
     }
     case 'task_run': {
