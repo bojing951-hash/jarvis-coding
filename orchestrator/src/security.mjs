@@ -10,7 +10,8 @@
 import { createHash } from 'node:crypto';
 import { realpathSync, existsSync, statSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import { resolve, sep } from 'node:path';
-import { hostname } from 'node:os';
+import { hostname, homedir } from 'node:os';
+import { execFile } from 'node:child_process';
 
 /* ------------------------------- 参数摘要 ---------------------------------- */
 
@@ -182,7 +183,7 @@ export function isTerminal(state) {
  * 统一裁决（DEF-01）：任务状态由完整执行链推导，
  * 不由执行器返回值单独决定。
  */
-export function computeVerdict({ cancelled, execOk, verify, requiresVerify, commit, requiresCommit, approvalValid }) {
+export function computeVerdict({ cancelled, execOk, verify, requiresVerify, commit, requiresCommit, approvalValid, commitRefOk }) {
   const reasons = [];
   if (cancelled) return { status: 'cancelled', reasons: ['执行被取消'] };
 
@@ -198,6 +199,7 @@ export function computeVerdict({ cancelled, execOk, verify, requiresVerify, comm
     if (!commit) reasons.push('未执行提交');
     else if (!commit.ok) reasons.push(`提交失败: ${commit.error ?? commit.reason ?? 'unknown'}`);
     else if (!commit.sha) reasons.push('提交未返回真实 SHA');
+    else if (commitRefOk === false) reasons.push('提交引用发布失败，成果不可按引用取回');
   }
 
   return { status: reasons.length ? 'failed' : 'done', reasons };
@@ -220,6 +222,33 @@ export function operatorKeyPath(home) {
  * 改为要求真实交互式终端：Agent 没有 TTY，MCP 进程也没有。
  * 这是当前环境可验证的最强本地来源；其局限在文档中明确记录。
  */
+/**
+ * 调用 macOS LocalAuthentication 助手做真实用户在场认证（DEF-04）。
+ * TTY 或固定字符串不再构成授权依据。
+ */
+export async function runMacAuth({ reason, timeoutSeconds = 60, helperPath } = {}) {
+  const bin = helperPath || process.env.JARVIS_AUTH_HELPER || `${homedir()}/.openclaw/jarvis/bin/jarvis-approve`;
+  if (!existsSync(bin)) {
+    return { ok: false, code: 2, error: `认证助手不存在: ${bin}（未编译则拒绝高风险授权）` };
+  }
+  return new Promise((resolve) => {
+    execFile(
+      bin,
+      [reason, String(timeoutSeconds)],
+      { timeout: (timeoutSeconds + 10) * 1000, maxBuffer: 1024 * 1024 },
+      (err, stdout, stderr) => {
+        const code = err?.code ?? 0;
+        resolve({
+          ok: code === 0,
+          code: typeof code === 'number' ? code : 3,
+          stdout: (stdout || '').trim(),
+          stderr: (stderr || '').trim().slice(0, 500)
+        });
+      }
+    );
+  });
+}
+
 export function operatorIdentity() {
   const tty = Boolean(process.stdin.isTTY && process.stdout.isTTY);
   let user = 'unknown';

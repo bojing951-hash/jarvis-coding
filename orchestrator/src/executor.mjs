@@ -304,6 +304,13 @@ export async function publishRef({ repo, ref, sha }) {
   });
 }
 
+/** 读取引用指向的 SHA（用于确认发布是否真的可用）。 */
+export async function revParseRef({ repo, ref }) {
+  return new Promise((resolve) => {
+    execFile('git', ['-C', repo, 'rev-parse', ref], { timeout: 20_000 }, (e, so) => resolve(e ? null : so.trim()));
+  });
+}
+
 export async function removeWorktree({ repo, dest }) {
   return new Promise((resolve) => {
     execFile('git', ['-C', repo, 'worktree', 'remove', '--force', dest], { timeout: 60_000 }, (e, so, se) =>

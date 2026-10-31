@@ -300,6 +300,19 @@ export function updateTask(ref, patch) {
   return getTask(t.id);
 }
 
+/** 显式重试：终态任务必须经此入口回到可执行状态（DEF-08）。 */
+export function retryTask(ref) {
+  const t = getTask(ref);
+  if (!['failed', 'cancelled', 'cancel_failed'].includes(t.status)) {
+    throw new Error(`只有 failed/cancelled/cancel_failed 状态可以重试，当前 ${t.status}`);
+  }
+  db()
+    .prepare("UPDATE tasks SET status='retry_pending', error='', updated_at=? WHERE id=? AND status IN ('failed','cancelled','cancel_failed')")
+    .run(now(), t.id);
+  event('task.retry_requested', t.project_id, { title: t.title });
+  return getTask(t.id);
+}
+
 export function approveTask(ref) {
   const t = getTask(ref);
   db().prepare('UPDATE tasks SET approved_at=?, status=?, updated_at=? WHERE id=?')
@@ -318,11 +331,20 @@ export async function runTask(ref) {
   if (project.status === 'paused') {
     return { ok: false, blocked: 'project_paused', error: '项目已暂停' };
   }
-  if (task.needs_approval && !task.approved_at) {
+  // DEF-08：终态保护，先于一切重试/审批判断；终态不可被重复调用改变
+  if (['done', 'cancelled', 'cancel_failed'].includes(task.status)) {
+    return { ok: false, blocked: 'terminal_state', error: `任务已处于终态 ${task.status}，不允许重复执行` };
+  }
+  // DEF-05：旧 approved_at 只约束普通 Agent 任务；
+  // 执行器/审计任务只认新的 approvals 记录，不被旧字段阻断，也不被其放行
+  const highRisk = task.kind === 'executor' || task.kind === 'audit';
+  if (!highRisk && task.needs_approval && !task.approved_at) {
     return { ok: false, blocked: 'needs_approval', error: '该任务需要人工审批后才能执行' };
   }
   if (task.attempts >= task.max_attempts) {
-    updateTask(task.id, { status: 'failed', error: '超过最大重试次数' });
+    db()
+      .prepare("UPDATE tasks SET status='failed', error='超过最大重试次数', updated_at=? WHERE id=? AND status NOT IN ('done','cancelled','cancel_failed')")
+      .run(now(), task.id);
     return { ok: false, blocked: 'max_attempts', error: '超过最大重试次数' };
   }
   if (task.kind === 'executor') {
@@ -336,7 +358,12 @@ export async function runTask(ref) {
   }
 
   const agent = getAgent(task.assignee_agent_id);
-  updateTask(task.id, { status: 'running', attempts: task.attempts + 1 });
+  const claim = db()
+    .prepare("UPDATE tasks SET status='running', attempts=attempts+1, updated_at=? WHERE id=? AND status IN ('pending','approved','retry_pending')")
+    .run(now(), task.id);
+  if (claim.changes !== 1) {
+    return { ok: false, blocked: 'already_running', error: '任务已在运行或状态不允许执行' };
+  }
 
   const execId = newId('exe');
   const started = now();
@@ -475,7 +502,42 @@ export function findValidApproval(taskId, digest) {
  * 签发审批——只能由本地管理员入口调用（CLI）。
  * MCP 不暴露此能力（AC-02）。
  */
-export function issueApproval({ task: taskRef, ttlHours = 24, issuedBy = 'local-operator' }) {
+/**
+ * 审批预览：把「正在批准什么」变成可读文本，作为系统认证弹窗的理由（DEF-04）。
+ */
+export function approvalPreview(taskRef) {
+  const task = getTask(taskRef);
+  const project = getProject(task.project_id);
+  const plan = resolveExecutorPlan(task, project);
+  if (!plan.ok) {
+    const err = new Error(`${plan.blocked}: ${plan.error}`);
+    err.blocked = plan.blocked;
+    throw err;
+  }
+  const r = plan.resolved;
+  const scope = {
+    project: project.slug,
+    executor: task.executor,
+    mode: r.mode,
+    cwd: r.cwd,
+    repo: r.repo,
+    base_commit: r.baseCommit,
+    verify_profile: r.verifyProfileId,
+    commit: r.commit,
+    commit_paths: r.commitPaths
+  };
+  const reason = [
+    `JARVIS 高风险授权：${task.title}`,
+    `任务 ${task.id} / 项目 ${project.slug}`,
+    `执行器 ${task.executor} / 模式 ${r.mode}`,
+    `目录 ${r.cwd}`,
+    r.commit ? `提交范围 ${r.commitPaths.join(', ')}` : '不允许提交',
+    `参数摘要 ${r.digest.slice(0, 16)}`
+  ].join('\n');
+  return { task_id: task.id, digest: r.digest, reason, scope };
+}
+
+export function issueApproval({ task: taskRef, ttlHours = 24, issuedBy = 'local-operator', auth = null }) {
   const task = getTask(taskRef);
   const project = getProject(task.project_id);
   const plan = resolveExecutorPlan(task, project);
@@ -488,6 +550,7 @@ export function issueApproval({ task: taskRef, ttlHours = 24, issuedBy = 'local-
   const operator = operatorIdentity();
   const scope = {
     _operator: { method: operator.method, uid: operator.uid, host: operator.host },
+    _auth: auth ? { method: 'macos-localauth', code: auth.code } : null,
     project: project.slug,
     executor: task.executor,
     mode: resolved.mode,
@@ -539,24 +602,26 @@ function recordAttempt({ task, project, phase, status, blocked, reason, plan }) 
  * 运行时凭据文件：只读挂载进容器，入口脚本 source 后并删除。
  * 不写入镜像，也不通过 docker run -e 传递（避免出现在 docker inspect）。
  */
-function writeCredentialFile(execId) {
+function writeCredentialFile(execId, proxyUrl) {
   const settingsPath = join(HOME, '.claude/settings.json');
   let env = {};
   try {
     env = JSON.parse(readFileSync(settingsPath, 'utf8')).env ?? {};
   } catch {
-    return { ok: false, error: `无法读取模型凭据配置: ${settingsPath}` };
+    return { ok: false, error: `无法读取模型配置: ${settingsPath}` };
   }
-  const key = env.ANTHROPIC_API_KEY;
-  if (!key) return { ok: false, error: '未找到 ANTHROPIC_API_KEY（GLM 凭据）' };
+  if (!proxyUrl) return { ok: false, error: '受控模型代理不可用，拒绝把原始密钥交给容器' };
 
   const dir = join(JARVIS_HOME, 'run');
   mkdirSync(dir, { recursive: true });
   const file = join(dir, `${execId}.env`);
+  // RISK-01：容器内只放代理地址与模型名，不包含任何 API Key
+  // 占位凭据：让 CLI 认为已登录；真实密钥由宿主代理注入，容器内不存在
   const body = [
-    `ANTHROPIC_BASE_URL=${env.ANTHROPIC_BASE_URL ?? 'https://open.bigmodel.cn/api/anthropic'}`,
-    `ANTHROPIC_API_KEY=${key}`,
-    `ANTHROPIC_MODEL=${env.ANTHROPIC_MODEL ?? 'glm-5.3'}`
+    `ANTHROPIC_BASE_URL=${proxyUrl}/api/anthropic`,
+    `ANTHROPIC_API_KEY=proxy-managed-placeholder`,
+    `ANTHROPIC_AUTH_TOKEN=proxy-managed-placeholder`,
+    `ANTHROPIC_MODEL=${env.ANTHROPIC_MODEL ?? env.ANTHROPIC_CUSTOM_MODEL_OPTION ?? 'glm-5.3'}`
   ].join('\n');
   writeFileSync(file, body, { mode: 0o600 });
   return { ok: true, file };
@@ -605,7 +670,7 @@ async function runExecutorTask(task, project) {
 
   const claim = db()
     .prepare(`UPDATE tasks SET status='running', attempts=attempts+1, updated_at=?
-              WHERE id=? AND status IN ('pending','authorized','retry_pending','failed')`)
+              WHERE id=? AND status IN ('pending','authorized','retry_pending')`)
     .run(now(), task.id);
   if (claim.changes !== 1) {
     recordAttempt({ task, project, phase: 'claim', status: 'rejected', blocked: 'already_running', reason: '状态不允许执行', plan: resolved });
@@ -616,6 +681,7 @@ async function runExecutorTask(task, project) {
   const dest = join(JARVIS_HOME, 'worktrees', task.id);
   let credFile = null;
   let commit = null;
+  let evidenceRefPreserve = null;
 
   try {
     rmSync(dest, { recursive: true, force: true });
@@ -630,14 +696,13 @@ async function runExecutorTask(task, project) {
       return { ok: false, blocked: 'dirty_worktree', error: '初始工作树不干净，拒绝自动提交' };
     }
 
-    const cred = writeCredentialFile(execId);
+    const proxyUrl = await iso.egressProxyUrl();
+    const cred = writeCredentialFile(execId, proxyUrl);
     if (!cred.ok) {
       finalizeAttempt(task, execId, { status: 'failed', reason: cred.error });
       return { ok: false, blocked: 'credentials_unavailable', error: cred.error };
     }
     credFile = cred.file;
-
-    const proxyUrl = await iso.egressProxyUrl();
     const containerName = `jarvis-exec-${execId}`;
     const res = await iso.runClaudeIsolated({
       name: containerName,
@@ -660,6 +725,7 @@ async function runExecutorTask(task, project) {
     if (res.ok && resolved.profile) {
       db().prepare("UPDATE tasks SET status='verifying', updated_at=? WHERE id=? AND status='running'").run(now(), task.id);
       const vr = await iso.runInWorkdir({
+        name: `jarvis-verify-${execId}`,
         workdir: dest,
         program: resolved.profile.program,
         args: JSON.parse(resolved.profile.argv || '[]'),
@@ -685,6 +751,17 @@ async function runExecutorTask(task, project) {
           const published = await ex.publishRef({ repo: resolved.repo, ref: refName, sha: commit.sha });
           commit.ref = refName;
           commit.refPublished = published.ok;
+          // 复核：能从该引用真正取回同一个 SHA
+          if (published.ok) {
+            const verifyRef = await ex.revParseRef({ repo: resolved.repo, ref: refName });
+            commit.refVerified = verifyRef === commit.sha;
+            if (!commit.refVerified) commit.refPublished = false;
+          }
+          if (!commit.refPublished) {
+            // 不丢成果：保留工作树路径写入证据，finally 不删除
+            commit.refError = published.out?.slice(0, 300) ?? 'ref publish failed';
+            evidenceRefPreserve = dest;
+          }
         }
       } else {
         commit = { ok: false, skipped: true, reason: gate.reason };
@@ -700,7 +777,8 @@ async function runExecutorTask(task, project) {
       requiresVerify: Boolean(resolved.profile) || resolved.commit,
       commit,
       requiresCommit: resolved.commit,
-      approvalValid: approval.valid
+      approvalValid: approval.valid,
+      commitRefOk: resolved.commit ? commit?.refPublished !== false : undefined
     });
 
     const evidence = {
@@ -745,7 +823,11 @@ async function runExecutorTask(task, project) {
     };
   } finally {
     try { if (credFile) rmSync(credFile, { force: true }); } catch {}
-    try { await ex.removeWorktree({ repo: resolved.repo, dest }); } catch {}
+    if (evidenceRefPreserve) {
+      event('worktree.preserved', project.id, { task: task.id, path: evidenceRefPreserve });
+    } else {
+      try { await ex.removeWorktree({ repo: resolved.repo, dest }); } catch {}
+    }
   }
 }
 
@@ -964,11 +1046,16 @@ export async function cancelTask(ref) {
       }
     }
 
-    // 容器可能仍在运行（杀死 docker run 客户端不等于停止容器）
-    const cname = `jarvis-exec-${exRow.id}`;
-    containerKilled = await iso.killContainer(cname);
-    // 容器确认消失是最强证据；没有容器时才回退到宿主进程确认
-    const fullyStopped = containerKilled.confirmed === true || (confirmed && containerKilled.reason === 'no container name');
+    // DEF-02：同一 Execution 的执行容器与验证容器都要纳入控制
+    const targets = [`jarvis-exec-${exRow.id}`, `jarvis-verify-${exRow.id}`];
+    const containerResults = [];
+    for (const tname of targets) containerResults.push({ name: tname, ...(await iso.killContainer(tname)) });
+    containerKilled = { results: containerResults };
+
+    const daemonLost = containerResults.some((r) => r.reason === 'docker_daemon_unreachable');
+    const allConfirmed = containerResults.every((r) => r.confirmed === true);
+    // daemon 失联优先报告「无法确认」，绝不当作已停止
+    const fullyStopped = daemonLost ? false : allConfirmed;
 
     if (fullyStopped) {
       db().prepare("UPDATE executions SET status='cancelled', finished_at=? WHERE id=? AND status='running'").run(now(), exRow.id);
@@ -979,7 +1066,7 @@ export async function cancelTask(ref) {
       pid,
       confirmedExit: fullyStopped,
       escalatedToSigkill: escalated,
-      container: containerKilled
+      containers: containerKilled.results
     });
   }
 
@@ -1006,6 +1093,11 @@ export async function cancelTask(ref) {
  * - 只读模式，不得修改被审计代码
  * - 契约文本随任务冻结进证据
  */
+/**
+ * 审计任务（DEF-07）：与执行器一致的隔离原则。
+ * 固定 commit → 一次性工作树 → 容器内只读执行（plan）→ 校验未被修改。
+ * 注意：审计任务执行成功 ≠ 独立审计结论 PASS。
+ */
 async function runAuditTask(task, project) {
   const cfg = JSON.parse(task.executor_config || '{}');
   const { repo, commit, contract } = cfg;
@@ -1016,61 +1108,106 @@ async function runAuditTask(task, project) {
     return { ok: false, blocked: 'no_contract', error: '审计任务必须提供冻结的验收契约（contract）' };
   }
 
-  const dest = join(JARVIS_HOME, 'audit', `${task.id}`);
-  mkdirSync(join(JARVIS_HOME, 'audit'), { recursive: true });
-  const wt = await ex.createFrozenWorktree({ repo, commit, dest });
-  if (!wt.ok) return { ok: false, blocked: 'worktree_failed', error: wt.error };
+  const rc = resolveProjectPath(repo, project.dir);
+  if (!rc.ok) {
+    recordAttempt({ task, project, phase: 'validate', status: 'rejected', blocked: 'repo_outside_project', reason: rc.error });
+    return { ok: false, blocked: 'repo_outside_project', error: rc.error };
+  }
 
-  updateTask(task.id, { status: 'running', attempts: task.attempts + 1 });
+  const st = await iso.isolationStatus();
+  if (!st.available) {
+    recordAttempt({ task, project, phase: 'isolation', status: 'rejected', blocked: 'isolation_unavailable', reason: st.reason });
+    return { ok: false, blocked: 'isolation_unavailable', error: st.reason };
+  }
+
+  const claim = db()
+    .prepare("UPDATE tasks SET status='running', attempts=attempts+1, updated_at=? WHERE id=? AND status IN ('pending','authorized','retry_pending')")
+    .run(now(), task.id);
+  if (claim.changes !== 1) {
+    return { ok: false, blocked: 'already_running', error: '任务已在运行或状态不允许执行' };
+  }
+
   const execId = newId('exe');
-  const started = now();
   db()
     .prepare('INSERT INTO executions (id,task_id,agent_id,status,model,session_key,started_at) VALUES (?,?,?,?,?,?,?)')
-    .run(execId, task.id, null, 'running', 'claude-code-audit', wt.path, started);
+    .run(execId, task.id, null, 'running', 'claude-code-audit-isolated', '', now());
 
-  const prompt = [
-    '你是独立审计员。只读审计，禁止修改任何文件。',
-    '',
-    `## 被审计版本`,
-    `仓库: ${repo}`,
-    `固定 commit: ${wt.sha}`,
-    '',
-    '## 冻结的验收契约',
-    contract,
-    '',
-    '## 要求',
-    '逐条核对契约，给出 PASS / FAIL / 无法判定，并给出证据（文件与行号）。',
-    '不要臆造未看到的代码。'
-  ].join('\n');
+  const dest = join(JARVIS_HOME, 'audit', task.id);
+  let credFile = null;
+  let preserved = false;
+  try {
+    rmSync(dest, { recursive: true, force: true });
+    mkdirSync(join(JARVIS_HOME, 'audit'), { recursive: true });
 
-  const res = await ex.runClaudeCode({ cwd: wt.path, prompt, mode: 'plan' });
+    const wt = await ex.createWorktree({ repo: rc.cwd, commit, dest });
+    if (!wt.ok) {
+      finalizeAttempt(task, execId, { status: 'failed', reason: `审计工作树创建失败: ${wt.error}` });
+      return { ok: false, blocked: 'worktree_failed', error: wt.error };
+    }
+    const init = await ex.worktreeStatus(dest);
+    if (!init.clean) {
+      finalizeAttempt(task, execId, { status: 'failed', reason: '审计工作树初始不干净' });
+      return { ok: false, blocked: 'dirty_worktree', error: '审计工作树初始不干净' };
+    }
 
-  // 证明审计没有改动被审计代码
-  const dirty = await new Promise((resolve) => {
-    import('node:child_process').then(({ execFile }) => {
-      execFile('git', ['-C', wt.path, 'status', '--porcelain'], { timeout: 30_000 }, (e, so) =>
-        resolve((so || '').trim())
-      );
+    const proxyUrl = await iso.egressProxyUrl();
+    const cred = writeCredentialFile(execId, proxyUrl);
+    if (!cred.ok) {
+      finalizeAttempt(task, execId, { status: 'failed', reason: cred.error });
+      return { ok: false, blocked: 'credentials_unavailable', error: cred.error };
+    }
+    credFile = cred.file;
+
+    const prompt = [
+      '你是独立审计员。只读审计，禁止修改任何文件。',
+      '',
+      '## 被审计版本',
+      `固定 commit: ${wt.sha}`,
+      '',
+      '## 冻结的验收契约',
+      contract,
+      '',
+      '## 要求',
+      '逐条核对契约，给出 PASS / FAIL / 无法判定，并给出证据（文件与行号）。',
+      '不要臆造未看到的代码。'
+    ].join('\n');
+
+    const res = await iso.runClaudeIsolated({
+      name: `jarvis-audit-${execId}`,
+      workdir: dest,
+      prompt,
+      mode: 'plan',
+      image: st.image,
+      credentialsFile: credFile,
+      proxyUrl
     });
-  });
 
-  const evidence = {
-    ...(res.evidence ?? {}),
-    audit: { repo, commit: wt.sha, contract, path: wt.path, worktreeClean: dirty === '' }
-  };
-  db()
-    .prepare("UPDATE executions SET status=?, model=?, output=?, error=?, evidence=?, finished_at=? WHERE id=? AND status='running'")
-    .run(res.ok ? 'ok' : 'failed', 'claude-code-audit', res.text ?? '', res.ok ? '' : res.error ?? '',
-         JSON.stringify(evidence), now(), execId);
+    const after = await ex.worktreeStatus(dest);
+    const evidence = {
+      isolated: true,
+      network: st.network,
+      image: st.image,
+      audit: {
+        repo: rc.cwd,
+        commit: wt.sha,
+        contract_sha256: sha256(contract),
+        worktreeClean: after.clean,
+        dirty: after.raw.slice(0, 300)
+      }
+    };
 
-  await ex.removeFrozenWorktree({ repo, dest });
+    const ok = res.ok && after.clean;
+    const reason = res.ok ? (after.clean ? '' : '审计过程修改了被审计代码') : (res.error ?? '执行失败');
+    finalizeAttempt(task, execId, { status: ok ? 'ok' : 'failed', reason, evidence, text: res.text });
 
-  if (res.ok) updateTask(task.id, { status: 'done', output: res.text, error: '' });
-  else updateTask(task.id, { status: 'failed', error: res.error ?? '' });
-  return { ...res, evidence, task: getTask(task.id), execution: execId };
+    return { ...res, ok, evidence, task: getTask(task.id), execution: execId };
+  } finally {
+    try { if (credFile) rmSync(credFile, { force: true }); } catch {}
+    if (!preserved) {
+      try { await ex.removeWorktree({ repo: rc.cwd, dest }); } catch {}
+    }
+  }
 }
-
-
 
 /* ----------------------------- Verify Profiles ------------------------------- */
 

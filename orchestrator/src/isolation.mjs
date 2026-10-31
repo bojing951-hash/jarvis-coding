@@ -58,13 +58,26 @@ export async function isolationStatus() {
   if (netCheck.code !== 0) {
     return { available: false, backend: 'docker', serverVersion: info.out.trim(), image: img.out.trim(), reason: `隔离网络不存在: ${net}` };
   }
+  const internal = netCheck.out.trim() === 'true';
+  // DEF-03：策略要求内部隔离网络。Internal=false 意味着存在外网路由，必须 fail closed。
+  if (!internal) {
+    return {
+      available: false,
+      backend: 'docker',
+      serverVersion: info.out.trim(),
+      image: img.out.trim(),
+      network: net,
+      networkInternal: false,
+      reason: `隔离网络 ${net} 的 Internal=false（存在外网路由），拒绝执行`
+    };
+  }
   return {
     available: true,
     backend: 'docker',
     serverVersion: info.out.trim(),
     image: img.out.trim(),
     network: net,
-    networkInternal: netCheck.out.trim() === 'true'
+    networkInternal: true
   };
 }
 
@@ -84,6 +97,7 @@ export async function runIsolated({ image, mount, workdir, command, args = [], t
   }
   const dockerArgs = [
     'run', '--rm',
+    ...(name ? ['--name', name] : []),
     '--network', network,
     '--user', '1000:1000',
     '--security-opt', 'no-new-privileges',
@@ -158,9 +172,8 @@ export async function runClaudeIsolated({
     '-w', '/work'
   ];
   if (credentialsFile) args.push('-v', `${credentialsFile}:/run/secrets/glm.env:ro`);
-  if (proxyUrl) {
-    args.push('-e', `HTTPS_PROXY=${proxyUrl}`, '-e', `HTTP_PROXY=${proxyUrl}`, '-e', 'NO_PROXY=127.0.0.1,localhost');
-  }
+  // 不再注入 HTTP(S)_PROXY：模型流量通过 ANTHROPIC_BASE_URL 指向代理，
+  // 直接走内网 IP；其余出网在 --internal 网络里本就没有路由。
   args.push(image, '-p', prompt, '--output-format', 'json', '--permission-mode', mode);
 
   const started = Date.now();
@@ -183,23 +196,62 @@ export async function runClaudeIsolated({
 }
 
 /** 强制终止容器（取消用）；以容器实际消失为准。 */
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/** 确认 Docker daemon 是否可用（与「容器不存在」区分）。 */
+export async function daemonReachable() {
+  const r = await sh(DOCKER, ['info', '--format', '{{.ServerVersion}}'], { timeoutMs: 8_000 });
+  return r.code === 0;
+}
+
+/**
+ * 终止容器并确认。三种结果严格区分（DEF-01）：
+ *  - confirmed=true             容器已退出/消失，且 daemon 健康
+ *  - reason=docker_daemon_unreachable  daemon 失联，终止结果无法确认
+ *  - reason=container_still_running    daemon 健康但容器仍在
+ */
 export async function killContainer(name) {
-  if (!name) return { ok: false, reason: 'no container name' };
+  if (!name) return { ok: false, confirmed: false, reason: 'no_container_name' };
+
   await sh(DOCKER, ['kill', name], { timeoutMs: 15_000 });
-  for (let i = 0; i < 20; i++) {
-    const r = await sh(DOCKER, ['inspect', name, '--format', '{{.State.Status}}'], { timeoutMs: 8_000 });
-    if (r.code !== 0) return { ok: true, confirmed: true };
-    await new Promise((res) => setTimeout(res, 200));
+
+  // 先确认 daemon 仍在：失联 ≠ 容器已停止
+  if (!(await daemonReachable())) {
+    return { ok: false, confirmed: false, reason: 'docker_daemon_unreachable', error: '无法连接 Docker daemon，终止结果无法确认' };
   }
-  return { ok: false, confirmed: false, reason: '容器仍存在' };
+
+  for (let i = 0; i < 25; i++) {
+    const r = await sh(DOCKER, ['inspect', name, '--format', '{{.State.Status}}'], { timeoutMs: 8_000 });
+    if (r.code === 0) {
+      const st = r.out.trim();
+      if (st === 'exited' || st === 'dead' || st === 'removing') {
+        return { ok: true, confirmed: true, state: st };
+      }
+      if (st === 'created' || st === 'running' || st === 'restarting' || st === 'paused') {
+        await sleep(200);
+        continue;
+      }
+      return { ok: true, confirmed: true, state: st || 'gone' };
+    }
+    // inspect 失败：区分「容器不存在」与「daemon 问题」
+    if (/No such object|could not be found/i.test(r.out)) {
+      return { ok: true, confirmed: true, state: 'gone' };
+    }
+    if (/Cannot connect|daemon|connection refused/i.test(r.out)) {
+      return { ok: false, confirmed: false, reason: 'docker_daemon_unreachable', error: r.out.slice(0, 120) };
+    }
+    await sleep(200); // 瞬时错误重试
+  }
+  return { ok: false, confirmed: false, reason: 'container_still_running' };
 }
 
 /** 在同一隔离网络/挂载里运行任意受控程序（校验用）。 */
-export async function runInWorkdir({ workdir, program, args = [], image, network = process.env.JARVIS_EXECUTOR_NETWORK || 'jarvis-internal', timeoutMs = 300_000 }) {
+export async function runInWorkdir({ workdir, program, args = [], image, name, network = process.env.JARVIS_EXECUTOR_NETWORK || 'jarvis-internal', timeoutMs = 300_000 }) {
   const st = await isolationStatus();
   if (!st.available) return { ok: false, blocked: 'isolation_unavailable', error: st.reason };
   const dockerArgs = [
     'run', '--rm',
+    ...(name ? ['--name', name] : []),
     '--network', network,
     '--user', '1000:1000',
     '--security-opt', 'no-new-privileges',

@@ -5,7 +5,8 @@
  */
 import * as svc from './service.mjs';
 import * as oc from './oc.mjs';
-import { requireInteractiveOperator } from './security.mjs';
+import { runMacAuth } from './security.mjs';
+import { hostname } from 'node:os';
 
 const argv = process.argv.slice(2);
 
@@ -165,6 +166,10 @@ async function main() {
         if (!r.ok) process.exit(2);
         break;
       }
+      case 'task:retry': {
+        print(svc.retryTask(require_('task')));
+        break;
+      }
       case 'task:approve':
         print(svc.approveTask(require_('task')));
         break;
@@ -214,7 +219,11 @@ async function main() {
 
       /* 管理员入口（本地可信） */
       case 'verify-profile:add': {
-        requireInteractiveOperator(opt.confirm);
+        const auth = await runMacAuth({
+          reason: `登记可信校验配置：${opt.name}（${opt.program}）`,
+          timeoutSeconds: Number(process.env.JARVIS_AUTH_TIMEOUT || 60)
+        });
+        if (!auth.ok) fail(`系统认证未通过，拒绝登记校验配置（code=${auth.code}）`);
         const argv = opt.argv ? JSON.parse(opt.argv) : [];
         print(svc.createVerifyProfile({
           project: require_('project'),
@@ -230,12 +239,23 @@ async function main() {
         print(svc.listVerifyProfiles(opt.project));
         break;
       case 'approve:': {
-        // 必须真实终端 + 显式确认；Agent/MCP 没有 TTY，无法伪造
-        const id = requireInteractiveOperator(opt.confirm);
+        // DEF-04：必须通过 macOS 系统认证；TTY / 固定字符串不再构成授权依据
+        const taskRef = require_('task');
+        const preview = svc.approvalPreview(taskRef);
+        const auth = await runMacAuth({
+          reason: preview.reason,
+          timeoutSeconds: Number(process.env.JARVIS_AUTH_TIMEOUT || 60)
+        });
+        if (!auth.ok) {
+          fail(
+            `系统认证未通过（code=${auth.code}）：${auth.stderr || '无法确认用户在场'}。高风险授权保持拒绝。`
+          );
+        }
         print(svc.issueApproval({
-          task: require_('task'),
+          task: taskRef,
           ttlHours: opt.ttl ? Number(opt.ttl) : 24,
-          issuedBy: `local-tty:uid=${id.uid}@${id.host}`
+          issuedBy: `macos-localauth:uid=${process.getuid?.() ?? 'unknown'}@${hostname()}`,
+          auth
         }));
         break;
       }
@@ -286,7 +306,7 @@ async function main() {
             'conv create --agent <ref> [--title <t>] | conv list --agent <ref>',
             'talk --agent <ref> --message <文本> [--conversation <id>] [--session-key <k>]',
             'task create --project <ref> --title <t> [--input <文本>] [--agent <ref>] [--needs-approval]',
-            'task list [--project <ref>] [--status <s>] | task show --task <id> | task approve --task <id> | task run --task <id> | task cancel --task <id>',
+            'task list [--project <ref>] [--status <s>] | task show --task <id> | task approve --task <id> | task retry --task <id> | task run --task <id> | task cancel --task <id>',
             'handoff --project <ref> --from <agent> --to <agent> --requirement <文本> [--artifact <文本>] [--context <文本>] [--constraints <文本>]',
             'workflow create --project <ref> --name <n> --spec-file <json>',
             'workflow run --workflow <id|name> | workflow list [--project <ref>] | workflow pause --workflow <id>',

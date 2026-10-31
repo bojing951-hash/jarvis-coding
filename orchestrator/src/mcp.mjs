@@ -185,6 +185,11 @@ const TOOLS = [
     inputSchema: { type: 'object', properties: { workflow: { type: 'string' } }, required: ['workflow'] }
   },
   {
+    name: 'task_retry',
+    description: '把 failed/cancelled 的任务置为可重试状态（retry_pending）。终态任务不能直接 run。',
+    inputSchema: { type: 'object', properties: { task: { type: 'string' } }, required: ['task'] }
+  },
+  {
     name: 'task_cancel',
     description: '取消正在执行的任务（终止执行器进程组）。若无法终止会如实返回失败。',
     inputSchema: { type: 'object', properties: { task: { type: 'string' } }, required: ['task'] }
@@ -274,6 +279,13 @@ async function callTool(name, args) {
       return ok(JSON.stringify(svc.listTasks(args.project, args.status).map((t) => ({
         id: t.id, title: t.title, status: t.status, attempts: t.attempts
       })), null, 2));
+    case 'task_retry': {
+      try {
+        return ok(JSON.stringify(svc.retryTask(args.task)));
+      } catch (e) {
+        return err(e.message);
+      }
+    }
     case 'task_cancel': {
       const r = await svc.cancelTask(args.task);
       return r.ok ? ok(JSON.stringify(r)) : err(JSON.stringify({ error: r.error }));
