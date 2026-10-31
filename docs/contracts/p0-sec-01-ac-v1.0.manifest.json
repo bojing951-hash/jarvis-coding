@@ -1,15 +1,18 @@
 {
   "contract_id": "JARVIS-P0-SEC-01-AC-v1.0",
-  "status": "FROZEN",
-  "frozen_at": "2026-10-31T21:32:47+08:00",
-  "frozen_by": "user (approved in session)",
-  "source": "user-provided verbatim text",
-  "file": "docs/contracts/p0-sec-01-ac-v1.0.md",
-  "sha256": "fc2c9f0de0552bd5531022cf4c66fb3c51beb3aaba3631e58e4924a8a8f0d560",
-  "bytes":    20978,
-  "lines":     1071,
+  "status": "FROZEN_BUT_ORIGINAL_NOT_YET_ARCHIVED",
+  "frozen_source_file": "JARVIS-P0-SEC-01-AC-v1.0-FROZEN.md",
+  "expected_sha256": "af15737713c554509612d8296aee148387649f0ebf8b0644d933ecf8b40691b0",
+  "expected_bytes": 21297,
+  "original_received": false,
+  "transcript_copy": {
+    "file": "docs/contracts/p0-sec-01-ac-v1.0.transcript-copy.md",
+    "sha256": "fc2c9f0de0552bd5531022cf4c66fb3c51beb3aaba3631e58e4924a8a8f0d560",
+    "bytes":    20978,
+    "note": "由用户在对话中粘贴的正文转写而来，非字节级原件；可读、可对照，但不能用于校验冻结哈希"
+  },
+  "blocking_item": "CONTRACT_ORIGINAL_PENDING: 需要把 JARVIS-P0-SEC-01-AC-v1.0-FROZEN.md 保存到本机或作为文件附件提供",
   "ac_count": 22,
   "e2e_count": 10,
-  "ev_count": 15,
-  "note": "契约原文逐字保存，本 manifest 与契约分离，不修改原文"
+  "ev_count": 15
 }
