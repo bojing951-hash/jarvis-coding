@@ -6,10 +6,13 @@ import assert from 'node:assert/strict';
 import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { installTestAuthKey } from './helpers/auth.mjs';
 
 const tmp = mkdtempSync(join(tmpdir(), 'jarvis-fix1-'));
+process.env.HOME = tmp;
 process.env.JARVIS_HOME = tmp;
 process.env.JARVIS_DB = join(tmp, 'state.db');
+const auth = installTestAuthKey(tmp);
 
 const svc = await import('../src/service.mjs');
 const sec = await import('../src/security.mjs');
@@ -82,7 +85,7 @@ test('写模式缺少工作树规格被拒绝（DEF-07）', async () => {
     executor: 'claude-code',
     executorConfig: { mode: 'acceptEdits' }
   });
-  const ap = svc.issueApproval({ task: t.id });
+  const ap = auth.issueApproval(svc, t.id);
   assert.equal(ap.ok, true, ap.error || '');
   const r = await svc.runTask(t.id);
   assert.equal(r.ok, false);

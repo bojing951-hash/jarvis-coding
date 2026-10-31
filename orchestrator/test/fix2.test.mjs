@@ -8,10 +8,13 @@ import { mkdtempSync, mkdirSync, writeFileSync, rmSync, chmodSync } from 'node:f
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
+import { installTestAuthKey } from './helpers/auth.mjs';
 
 const tmp = mkdtempSync(join(tmpdir(), 'jarvis-fix2-'));
+process.env.HOME = tmp;
 process.env.JARVIS_HOME = tmp;
 process.env.JARVIS_DB = join(tmp, 'state.db');
+const auth = installTestAuthKey(tmp);
 
 const svc = await import('../src/service.mjs');
 const sec = await import('../src/security.mjs');
@@ -93,7 +96,7 @@ test('DEF-05 有合法新审批时，旧字段不得阻断执行', async () => {
     executorConfig: { mode: 'acceptEdits', repo: 'repo', base_commit: head }
   });
   // 未设置 approved_at，且 needs_approval=0：执行器路径不应被旧逻辑阻断
-  const ap = svc.issueApproval({ task: t.id });
+  const ap = auth.issueApproval(svc, t.id);
   assert.equal(ap.ok, true, ap.error || '');
   // 关键断言：不返回 needs_approval（是否执行取决于隔离/凭据环境）
   const preview = svc.approvalPreview(t.id);
@@ -167,7 +170,10 @@ test('DEF-04 认证超时（替身返回 3）不得授权', async () => {
 });
 
 test('DEF-04 审批只走签名验签，不再用退出码认证', () => {
-  const src = execFileSync('cat', ['orchestrator/src/cli.mjs'], { encoding: 'utf8' });
-  assert.ok(src.includes('verifyApprovalSignature'), 'CLI 必须做服务端验签');
-  assert.ok(!src.includes('runMacAuth'), 'CLI 不得再用仅凭退出码的认证');
+  const cli = execFileSync('cat', ['orchestrator/src/cli.mjs'], { encoding: 'utf8' });
+  const svcSrc = execFileSync('cat', ['orchestrator/src/service.mjs'], { encoding: 'utf8' });
+  assert.ok(svcSrc.includes('verifyApprovalSignature'), '服务层必须做验签，不能只靠 CLI');
+  assert.ok(cli.includes('issueApproval'), 'CLI 必须走服务层签发边界');
+  assert.ok(cli.includes('proof:'), 'CLI 必须把签名证明交给服务层');
+  assert.ok(!cli.includes('runMacAuth'), 'CLI 不得再用仅凭退出码的认证');
 });

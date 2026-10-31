@@ -34,6 +34,15 @@ export function sha256(text) {
  * 任何一项变化都会导致摘要不同 → 旧审批自动失效（AC-03）。
  */
 export function taskDigest(task, resolved) {
+  const profile = resolved.profile ?? null;
+  const verifyProfileSha = profile
+    ? sha256(canonicalJson({
+        program: profile.program,
+        argv: profile.argv,
+        cwd: profile.cwd ?? null,
+        timeout_ms: profile.timeout_ms ?? null
+      }))
+    : null;
   return sha256(
     canonicalJson({
       task_id: task.id,
@@ -44,6 +53,7 @@ export function taskDigest(task, resolved) {
       repo: resolved.repo ?? null,
       base_commit: resolved.baseCommit ?? null,
       verify_profile_id: resolved.verifyProfileId ?? null,
+      verify_profile_sha: verifyProfileSha,
       commit: Boolean(resolved.commit),
       commit_paths: [...(resolved.commitPaths ?? [])].sort(),
       input_sha: sha256(String(task.input ?? ''))

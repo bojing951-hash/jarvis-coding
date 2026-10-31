@@ -8,10 +8,13 @@ import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
+import { installTestAuthKey } from './helpers/auth.mjs';
 
 const tmp = mkdtempSync(join(tmpdir(), 'jarvis-sec-'));
+process.env.HOME = tmp;
 process.env.JARVIS_HOME = tmp;
 process.env.JARVIS_DB = join(tmp, 'state.db');
+const auth = installTestAuthKey(tmp);
 
 const svc = await import('../src/service.mjs');
 const sec = await import('../src/security.mjs');
@@ -39,7 +42,16 @@ test('AC-01 shell 程序不能登记为校验配置', () => {
 
 test('AC-01 合法校验配置可以用 argv 形式登记', () => {
   const p = svc.createProject({ name: '合法校验', slug: 'sec-vp2' });
-  const vp = svc.createVerifyProfile({ project: p.id, name: 'npm-test', program: 'npm', argv: ['test'] });
+  const content = {
+    kind: 'verify_profile',
+    project: p.id,
+    name: 'npm-test',
+    program: 'npm',
+    argv: ['test'],
+    cwd: null,
+    timeout_ms: 300_000
+  };
+  const vp = auth.createVerifyProfile(svc, content);
   assert.equal(vp.program, 'npm');
   assert.deepEqual(JSON.parse(vp.argv), ['test']);
 });
@@ -99,8 +111,8 @@ test('AC-03 审批后修改执行参数，原审批失效', () => {
     executorConfig: { mode: 'acceptEdits', cwd: dir }
   });
 
-  const issued = svc.issueApproval({ task: t.id });
-  assert.equal(issued.ok, true);
+  const issued = auth.issueApproval(svc, t.id);
+  assert.equal(issued.ok, true, issued.error);
 
   const plan1 = svc.resolveExecutorPlan(svc.getTask(t.id), p);
   assert.equal(svc.findValidApproval(t.id, plan1.resolved.digest).valid, true);

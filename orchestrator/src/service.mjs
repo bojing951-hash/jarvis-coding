@@ -326,7 +326,7 @@ export function approveTask(ref) {
  * 执行任务：调用被指派 Agent，记录执行证据。
  * 不吞错误、不伪造结果。
  */
-export async function runTask(ref) {
+export async function runTask(ref, deps = {}) {
   const task = getTask(ref);
   const project = getProject(task.project_id);
   if (project.status === 'paused') {
@@ -349,7 +349,7 @@ export async function runTask(ref) {
     return { ok: false, blocked: 'max_attempts', error: '超过最大重试次数' };
   }
   if (task.kind === 'executor') {
-    return runExecutorTask(task, project);
+    return runExecutorTask(task, project, deps);
   }
   if (task.kind === 'audit') {
     return runAuditTask(task, project);
@@ -500,6 +500,26 @@ export function findValidApproval(taskId, digest) {
 }
 
 /**
+ * PRE-A01：某个 Execution 已经取得的审批。
+ * 只认 execution_id 精确匹配、used_at 已写入、未撤销、未过期的记录；
+ * 新 Execution 不能用 findValidApproval() 复用旧审批。
+ */
+export function findApprovalForExecution(taskId, digest, executionId) {
+  if (!executionId) return { valid: false, reason: '缺少执行标识，无法确认审批归属' };
+  const row = db()
+    .prepare(`SELECT * FROM approvals
+              WHERE task_id = ? AND digest = ? AND execution_id = ?
+                AND used_at IS NOT NULL AND revoked_at IS NULL
+              ORDER BY issued_at DESC LIMIT 1`)
+    .get(taskId, digest, executionId);
+  if (!row) return { valid: false, reason: '当前 Execution 没有取得与该任务参数匹配的审批' };
+  if (new Date(row.expires_at).getTime() < Date.now()) {
+    return { valid: false, reason: '审批已过期' };
+  }
+  return { valid: true, approval: row };
+}
+
+/**
  * 签发审批——只能由本地管理员入口调用（CLI）。
  * MCP 不暴露此能力（AC-02）。
  */
@@ -538,33 +558,132 @@ export function approvalPreview(taskRef) {
   return { task_id: task.id, digest: r.digest, reason, scope };
 }
 
-export function issueApproval({ task: taskRef, ttlHours = 24, issuedBy = 'local-operator', auth = null }) {
+/**
+ * PRE-A02/A03：验证签名证明，并返回签名字节与载荷。
+ * 不接受调用方自报的 verified/auth 字段；只认固定公钥的真实验签结果。
+ */
+function parseSignedProof(proof) {
+  if (!proof || !proof.nonce || !proof.payload || !proof.signatureB64) {
+    return { ok: false, error: '缺少可信签名证明（nonce / payload / signature）' };
+  }
+  const payload = Buffer.isBuffer(proof.payload)
+    ? proof.payload
+    : Buffer.from(String(proof.payload), 'utf8');
+  const signatureB64 = String(proof.signatureB64).trim();
+  const verified = verifyApprovalSignature({ payload, signatureB64 });
+  if (!verified.ok) return { ok: false, error: `签名校验失败：${verified.error}` };
+
+  let claims;
+  try {
+    claims = JSON.parse(payload.toString('utf8'));
+  } catch {
+    return { ok: false, error: '签名载荷不是合法 JSON' };
+  }
+  if (!claims || typeof claims !== 'object' || Array.isArray(claims)) {
+    return { ok: false, error: '签名载荷必须是 JSON 对象' };
+  }
+  if (claims.nonce !== proof.nonce) {
+    return { ok: false, error: '签名载荷 nonce 与证明不一致' };
+  }
+  return { ok: true, payload, claims };
+}
+
+/**
+ * 签发审批——只能由本地管理员入口调用（CLI）。
+ * MCP 不暴露此能力（AC-02）。
+ *
+ * PRE-A02：必须提供真实签名证明；auth=null / verified=true 等自报字段不再被接受。
+ * PRE-A03：签名载荷的 task_id / digest / nonce / expires_at 必须与当前挑战和
+ * 当前任务参数一致；验签、挑战消耗、审批写入在同一事务内完成。
+ */
+export function issueApproval({ task: taskRef, ttlHours = 24, issuedBy = 'local-operator', proof } = {}) {
+  const parsed = parseSignedProof(proof);
+  if (!parsed.ok) return { ok: false, error: parsed.error };
+
   const task = getTask(taskRef);
   const project = getProject(task.project_id);
   const plan = resolveExecutorPlan(task, project);
   if (!plan.ok) return { ok: false, error: `${plan.blocked}: ${plan.error}` };
   const { resolved } = plan;
 
+  if (parsed.claims.task_id !== task.id) {
+    return { ok: false, error: '签名载荷的任务与当前任务不一致，拒绝签发' };
+  }
+  if (parsed.claims.digest !== resolved.digest) {
+    return { ok: false, error: '签名载荷与任务当前参数摘要不一致（参数可能已变化），拒绝签发' };
+  }
+
+  const nonceRow = db().prepare('SELECT * FROM auth_nonces WHERE nonce=?').get(proof.nonce);
+  if (!nonceRow) return { ok: false, error: '审批挑战不存在或已被使用' };
+  if (nonceRow.task_id !== task.id) return { ok: false, error: '审批挑战不属于当前任务' };
+  if (nonceRow.digest !== parsed.claims.digest) return { ok: false, error: '审批挑战摘要与签名载荷不一致' };
+  if (nonceRow.used_at) return { ok: false, error: '审批挑战已被使用' };
+  if (Date.parse(nonceRow.expires_at) <= Date.now()) return { ok: false, error: '审批挑战已过期' };
+  if (parsed.claims.expires_at !== nonceRow.expires_at) {
+    return { ok: false, error: '签名载荷有效期与审批挑战不一致' };
+  }
+
   const id = newId('apv');
   const issued = now();
-  const expires = new Date(Date.now() + ttlHours * 3600_000).toISOString();
+  const expires = new Date(Date.now() + Number(ttlHours) * 3600_000).toISOString();
   const operator = operatorIdentity();
-  const scope = {
-    _operator: { method: operator.method, uid: operator.uid, host: operator.host },
-    _auth: auth ? { method: 'macos-localauth', code: auth.code } : null,
-    project: project.slug,
-    executor: task.executor,
-    mode: resolved.mode,
-    cwd: resolved.cwd,
-    verify_profile: resolved.verifyProfileId,
-    commit: resolved.commit,
-    commit_paths: resolved.commitPaths
-  };
-  db()
-    .prepare('INSERT INTO approvals (id,task_id,digest,scope,issued_by,issued_at,expires_at) VALUES (?,?,?,?,?,?,?)')
-    .run(id, task.id, resolved.digest, JSON.stringify(scope), issuedBy, issued, expires);
-  event('approval.issued', project.id, { task: task.id, scope });
-  return { ok: true, approval: { id, task: task.id, digest: resolved.digest, scope, expires_at: expires } };
+
+  db().exec('BEGIN IMMEDIATE');
+  try {
+    // 事务内重新解析当前任务，防止验签后、写入前参数发生变化。
+    const currentTask = getTask(taskRef);
+    const currentProject = getProject(currentTask.project_id);
+    const currentPlan = resolveExecutorPlan(currentTask, currentProject);
+    if (!currentPlan.ok || currentPlan.resolved.digest !== parsed.claims.digest) {
+      db().exec('ROLLBACK');
+      return { ok: false, error: '签名后任务参数发生变化，拒绝签发审批' };
+    }
+    const currentNonce = db().prepare('SELECT * FROM auth_nonces WHERE nonce=?').get(proof.nonce);
+    if (
+      !currentNonce ||
+      currentNonce.used_at ||
+      currentNonce.task_id !== currentTask.id ||
+      currentNonce.digest !== parsed.claims.digest ||
+      currentNonce.expires_at !== parsed.claims.expires_at ||
+      Date.parse(currentNonce.expires_at) <= Date.now()
+    ) {
+      db().exec('ROLLBACK');
+      return { ok: false, error: '审批挑战无效、已过期或已被使用' };
+    }
+    const consumed = db()
+      .prepare("UPDATE auth_nonces SET used_at=? WHERE nonce=? AND task_id=? AND digest=? AND used_at IS NULL AND expires_at > ?")
+      .run(now(), proof.nonce, currentTask.id, parsed.claims.digest, now());
+    if (consumed.changes !== 1) {
+      db().exec('ROLLBACK');
+      return { ok: false, error: '审批挑战已被并发使用' };
+    }
+
+    const scope = {
+      _operator: { method: operator.method, uid: operator.uid, host: operator.host },
+      _auth: { method: 'os-signature', nonce: proof.nonce },
+      project: currentProject.slug,
+      executor: currentTask.executor,
+      mode: currentPlan.resolved.mode,
+      cwd: currentPlan.resolved.cwd,
+      repo: currentPlan.resolved.repo,
+      base_commit: currentPlan.resolved.baseCommit,
+      verify_profile: currentPlan.resolved.verifyProfileId,
+      commit: currentPlan.resolved.commit,
+      commit_paths: currentPlan.resolved.commitPaths
+    };
+    db()
+      .prepare('INSERT INTO approvals (id,task_id,digest,scope,issued_by,issued_at,expires_at) VALUES (?,?,?,?,?,?,?)')
+      .run(id, currentTask.id, parsed.claims.digest, JSON.stringify(scope), issuedBy, issued, expires);
+    db().exec('COMMIT');
+    event('approval.issued', currentProject.id, { task: currentTask.id, scope });
+    return {
+      ok: true,
+      approval: { id, task: currentTask.id, digest: parsed.claims.digest, scope, expires_at: expires }
+    };
+  } catch (e) {
+    try { db().exec('ROLLBACK'); } catch {}
+    throw e;
+  }
 }
 
 export function listApprovals(taskRef) {
@@ -632,7 +751,10 @@ function writeCredentialFile(execId, proxyUrl, modelToken) {
  * 外部执行器任务（FIX1）：
  * 授权 → 隔离工作树 → 容器内执行 → 容器内校验 → 范围检查 → 提交 → 裁决 → 证据
  */
-async function runExecutorTask(task, project) {
+async function runExecutorTask(task, project, deps = {}) {
+  const executor = deps.executor ?? ex;
+  const isolation = deps.isolation ?? iso;
+
   // DEF-CI-01：并发保护必须先于环境探测。任务已在运行时，不能因为
   // Docker / 执行镜像不可用而返回 isolation_unavailable（CI 无执行镜像时
   // 会掩盖 already_running，导致同一任务并发启动的语义不稳定）。
@@ -663,7 +785,7 @@ async function runExecutorTask(task, project) {
     }
   }
 
-  const st = await iso.isolationStatus();
+  const st = await isolation.isolationStatus();
   if (!st.available) {
     recordAttempt({ task, project, phase: 'isolation', status: 'rejected', blocked: 'isolation_unavailable', reason: st.reason, plan: resolved });
     updateTask(task.id, { status: 'failed', error: `隔离不可用：${st.reason}` });
@@ -678,8 +800,10 @@ async function runExecutorTask(task, project) {
   }
 
   // FIX3-B：授权检查 + 状态抢占 + 一次性授权消耗，必须在同一事务内完成。
-  // 并发请求只有一个能同时满足三者。
+  // 并发请求只有一个能同时满足三者。FIX3-CLOSE：Execution 在同一事务内创建，
+  // 审批记录 execution_id，证明该授权归属于哪一个执行。
   let claimedApprovalId = null;
+  const execId = newId('exe');
   db().exec('BEGIN IMMEDIATE');
   try {
     if (needsApproval) {
@@ -690,15 +814,15 @@ async function runExecutorTask(task, project) {
         return { ok: false, blocked: 'needs_approval', error: `需要本地管理员审批：${recheck.reason}` };
       }
       const consume = db()
-        .prepare('UPDATE approvals SET used_at=? WHERE id=? AND used_at IS NULL AND revoked_at IS NULL')
-        .run(now(), recheck.approval.id);
+        .prepare('UPDATE approvals SET used_at=?, execution_id=? WHERE id=? AND used_at IS NULL AND revoked_at IS NULL')
+        .run(now(), execId, recheck.approval.id);
       if (consume.changes !== 1) {
         db().exec('ROLLBACK');
         recordAttempt({ task, project, phase: 'authorize', status: 'rejected', blocked: 'approval_consumed', reason: '授权已被其它执行消耗', plan: resolved });
         return { ok: false, blocked: 'approval_consumed', error: '该授权已被其它执行消耗' };
       }
       claimedApprovalId = recheck.approval.id;
-      approval = { valid: true, approval: recheck.approval };
+      approval = { valid: true, approval: { ...recheck.approval, execution_id: execId } };
     }
 
     const claim = db()
@@ -710,14 +834,27 @@ async function runExecutorTask(task, project) {
       recordAttempt({ task, project, phase: 'claim', status: 'rejected', blocked: 'already_running', reason: '状态不允许执行', plan: resolved });
       return { ok: false, blocked: 'already_running', error: '任务已在运行或状态不允许执行' };
     }
+
+    // Execution 与审批消耗、状态抢占同事务落库：任一失败都不会留下孤儿授权。
+    db()
+      .prepare('INSERT INTO executions (id,task_id,agent_id,status,model,session_key,started_at,evidence) VALUES (?,?,?,?,?,?,?,?)')
+      .run(
+        execId,
+        task.id,
+        null,
+        'running',
+        'claude-code-isolated',
+        resolved.cwd ?? '',
+        now(),
+        JSON.stringify({ phase: 'execute', blocked: null, reason: null, plan: resolved })
+      );
     db().exec('COMMIT');
   } catch (e) {
     try { db().exec('ROLLBACK'); } catch {}
     throw e;
   }
 
-
-  const execId = recordAttempt({ task, project, phase: 'execute', status: 'running', plan: resolved });
+  event('execution.running', project.id, { task: task.id, execution: execId, phase: 'execute', plan: resolved });
   const modelToken = registerModelToken(execId, task.id);
   const dest = join(JARVIS_HOME, 'worktrees', task.id);
   let credFile = null;
@@ -726,18 +863,18 @@ async function runExecutorTask(task, project) {
 
   try {
     rmSync(dest, { recursive: true, force: true });
-    const wt = await ex.createWorktree({ repo: resolved.repo, commit: resolved.baseCommit, dest });
+    const wt = await executor.createWorktree({ repo: resolved.repo, commit: resolved.baseCommit, dest });
     if (!wt.ok) {
       finalizeAttempt(task, execId, { status: 'failed', reason: `创建隔离工作树失败: ${wt.error}` });
       return { ok: false, blocked: 'worktree_failed', error: wt.error };
     }
-    const init = await ex.worktreeStatus(dest);
+    const init = await executor.worktreeStatus(dest);
     if (!init.clean) {
       finalizeAttempt(task, execId, { status: 'failed', reason: `初始工作树不干净: ${init.raw.slice(0, 200)}` });
       return { ok: false, blocked: 'dirty_worktree', error: '初始工作树不干净，拒绝自动提交' };
     }
 
-    const proxyUrl = await iso.egressProxyUrl();
+    const proxyUrl = await isolation.egressProxyUrl();
     const cred = writeCredentialFile(execId, proxyUrl, modelToken);
     if (!cred.ok) {
       finalizeAttempt(task, execId, { status: 'failed', reason: cred.error });
@@ -746,7 +883,7 @@ async function runExecutorTask(task, project) {
     credFile = cred.file;
     const containerName = `jarvis-exec-${execId}`;
     const execResId = registerResource({ executionId: execId, taskId: task.id, kind: 'claude', name: containerName });
-    const res = await iso.runClaudeIsolated({
+    const res = await isolation.runClaudeIsolated({
       modelToken,
       name: containerName,
       workdir: dest,
@@ -769,7 +906,7 @@ async function runExecutorTask(task, project) {
       db().prepare("UPDATE tasks SET status='verifying', updated_at=? WHERE id=? AND status='running'").run(now(), task.id);
       const verifyName = `jarvis-verify-${execId}`;
       const verifyResId = registerResource({ executionId: execId, taskId: task.id, kind: 'verify', name: verifyName });
-      const vr = await iso.runInWorkdir({
+      const vr = await isolation.runInWorkdir({
         name: verifyName,
         workdir: dest,
         program: resolved.profile.program,
@@ -781,32 +918,57 @@ async function runExecutorTask(task, project) {
     }
 
     // 修改范围检查
-    const changed = await ex.changedFiles(dest);
+    const changed = await executor.changedFiles(dest);
     const outside = changed.filter((f) => !resolved.commitPaths.some((p) => f === p || f.startsWith(p.replace(/\/$/, '') + '/')));
     const scopeOk = outside.length === 0;
 
+    // PRE-A01：提交阶段必须识别「当前 Execution 已取得的授权」，而不是重新
+    // 查找 used_at IS NULL 的审批。同时重新核验任务当前参数、期限与撤销状态。
+    let commitApproval = { valid: !resolved.commit, reason: resolved.commit ? '尚未检查' : '无需提交' };
     if (resolved.commit && scopeOk && !cancelledNow()) {
-      const recheck = findValidApproval(task.id, resolved.digest);
-      const gate = commitGate({ execOk: res.ok, verify, approval: recheck, commitPaths: resolved.commitPaths });
+      const currentTask = getTask(task.id);
+      const currentPlan = resolveExecutorPlan(currentTask, project);
+      const grant = findApprovalForExecution(task.id, resolved.digest, execId);
+      const sameClaim = !claimedApprovalId || grant.approval?.id === claimedApprovalId;
+      const paramsStable = currentPlan.ok && currentPlan.resolved.digest === resolved.digest;
+      commitApproval = grant.valid && sameClaim && paramsStable
+        ? grant
+        : {
+            valid: false,
+            reason: !grant.valid
+              ? grant.reason
+              : !sameClaim
+                ? '审批不属于当前 Execution'
+                : '任务参数在执行期间发生变化，原审批失效'
+          };
+      const gate = commitGate({ execOk: res.ok, verify, approval: commitApproval, commitPaths: resolved.commitPaths });
       if (gate.ok) {
-        db().prepare("UPDATE tasks SET status='committing', updated_at=? WHERE id=? AND status='running'").run(now(), task.id);
-        commit = await ex.gitCommit({ cwd: dest, message: resolved.commitMessage || `chore(executor): ${task.title}`, paths: resolved.commitPaths });
-        // 让 commit 在仓库中保持可达（工作树是 detach 的，删除后会变成孤立对象）
-        if (commit?.ok && commit.sha) {
-          const refName = `refs/heads/jarvis/${task.id}`;
-          const published = await ex.publishRef({ repo: resolved.repo, ref: refName, sha: commit.sha });
-          commit.ref = refName;
-          commit.refPublished = published.ok;
-          // 复核：能从该引用真正取回同一个 SHA
-          if (published.ok) {
-            const verifyRef = await ex.revParseRef({ repo: resolved.repo, ref: refName });
-            commit.refVerified = verifyRef === commit.sha;
-            if (!commit.refVerified) commit.refPublished = false;
-          }
-          if (!commit.refPublished) {
-            // 不丢成果：保留工作树路径写入证据，finally 不删除
-            commit.refError = published.out?.slice(0, 300) ?? 'ref publish failed';
-            evidenceRefPreserve = dest;
+        // 原子抢占 committing：取消先到则这里 changes=0，绝不开始新的提交副作用。
+        const transition = db()
+          .prepare("UPDATE tasks SET status='committing', updated_at=? WHERE id=? AND status IN ('running','verifying')")
+          .run(now(), task.id);
+        if (transition.changes !== 1) {
+          commitApproval = { valid: false, reason: '任务已取消或状态不允许提交' };
+          commit = { ok: false, skipped: true, reason: '任务已取消或状态不允许提交，未开始提交' };
+        } else {
+          commit = await executor.gitCommit({ cwd: dest, message: resolved.commitMessage || `chore(executor): ${task.title}`, paths: resolved.commitPaths });
+          // 让 commit 在仓库中保持可达（工作树是 detach 的，删除后会变成孤立对象）
+          if (commit?.ok && commit.sha) {
+            const refName = `refs/heads/jarvis/${task.id}`;
+            const published = await executor.publishRef({ repo: resolved.repo, ref: refName, sha: commit.sha });
+            commit.ref = refName;
+            commit.refPublished = published.ok;
+            // 复核：能从该引用真正取回同一个 SHA
+            if (published.ok) {
+              const verifyRef = await executor.revParseRef({ repo: resolved.repo, ref: refName });
+              commit.refVerified = verifyRef === commit.sha;
+              if (!commit.refVerified) commit.refPublished = false;
+            }
+            if (!commit.refPublished) {
+              // 不丢成果：保留工作树路径写入证据，finally 不删除
+              commit.refError = published.out?.slice(0, 300) ?? 'ref publish failed';
+              evidenceRefPreserve = dest;
+            }
           }
         }
       } else {
@@ -814,16 +976,21 @@ async function runExecutorTask(task, project) {
       }
     } else if (resolved.commit && !scopeOk) {
       commit = { ok: false, skipped: true, reason: `修改超出授权范围: ${outside.join(', ')}` };
+      commitApproval = { valid: false, reason: `修改超出授权范围: ${outside.join(', ')}` };
+    } else if (resolved.commit && cancelledNow()) {
+      commit = { ok: false, skipped: true, reason: '任务已取消，未开始提交' };
+      commitApproval = { valid: false, reason: '任务已取消，未开始提交' };
     }
 
+    const endedCancelled = Boolean(res.cancelled) || cancelledNow();
     const verdict = computeVerdict({
-      cancelled: res.cancelled,
+      cancelled: endedCancelled,
       execOk: res.ok,
       verify,
       requiresVerify: Boolean(resolved.profile) || resolved.commit,
       commit,
       requiresCommit: resolved.commit,
-      approvalValid: approval.valid,
+      approvalValid: commitApproval.valid,
       commitRefOk: resolved.commit ? commit?.refPublished !== false : undefined
     });
 
@@ -844,7 +1011,11 @@ async function runExecutorTask(task, project) {
         commit_paths: resolved.commitPaths,
         digest: resolved.digest
       },
-      authorization: { required: needsApproval, approval: approval.approval ? { id: approval.approval.id, digest: resolved.digest } : null }
+      authorization: {
+        required: needsApproval,
+        approval: approval.approval ? { id: approval.approval.id, digest: resolved.digest, execution_id: approval.approval.execution_id ?? execId } : null,
+        commit_check: { valid: commitApproval.valid, reason: commitApproval.reason ?? null }
+      }
     };
     // 授权已在事务内消耗，此处不再重复标记
 
@@ -873,7 +1044,7 @@ async function runExecutorTask(task, project) {
     if (evidenceRefPreserve) {
       event('worktree.preserved', project.id, { task: task.id, path: evidenceRefPreserve });
     } else {
-      try { await ex.removeWorktree({ repo: resolved.repo, dest }); } catch {}
+      try { await executor.removeWorktree({ repo: resolved.repo, dest }); } catch {}
     }
   }
 }
@@ -1050,7 +1221,8 @@ async function runWorkflowInner(ref) {
  * 取消任务：杀掉执行器进程组，并把状态置为 cancelled。
  * 不做「假装已取消」——无法终止时如实返回失败。
  */
-export async function cancelTask(ref) {
+export async function cancelTask(ref, deps = {}) {
+  const isolation = deps.isolation ?? iso;
   const task = getTask(ref);
   const running = db()
     .prepare("SELECT * FROM executions WHERE task_id = ? AND status = 'running' ORDER BY started_at DESC")
@@ -1059,8 +1231,43 @@ export async function cancelTask(ref) {
     return { ok: false, error: '该任务没有正在运行的执行', task: getTask(task.id) };
   }
 
-  // 先标记取消意图，避免执行侧在终止过程中把任务写成 failed（DEF-02 竞态）
-  db().prepare("UPDATE tasks SET status='cancel_requested', updated_at=? WHERE id=? AND status IN ('running','verifying','committing')").run(now(), task.id);
+  // 提交与取消的互斥：committing 由 runTask 用原子状态迁移抢占。
+  // 提交中不杀进程、不写 cancel_requested，避免 git commit 已发生却虚报 cancelled。
+  let current = getTask(task.id);
+  if (current.status === 'committing') {
+    return {
+      ok: false,
+      blocked: 'commit_in_progress',
+      error: '任务正在提交，不能安全取消；请等待提交结果并核对真实 Commit',
+      task: current
+    };
+  }
+  if (current.status !== 'cancel_requested') {
+    // 只允许在 running/verifying 标记取消；不含 committing。
+    const mark = db()
+      .prepare("UPDATE tasks SET status='cancel_requested', updated_at=? WHERE id=? AND status IN ('running','verifying')")
+      .run(now(), task.id);
+    if (mark.changes !== 1) {
+      current = getTask(task.id);
+      if (current.status === 'committing') {
+        return {
+          ok: false,
+          blocked: 'commit_in_progress',
+          error: '任务已进入提交阶段，不能安全取消；请等待提交结果并核对真实 Commit',
+          task: current
+        };
+      }
+      return {
+        ok: false,
+        blocked: current.status,
+        error: `任务状态 ${current.status} 无法标记取消`,
+        task: current
+      };
+    }
+  }
+
+  // 取消意图一旦成立，立即撤销该执行的模型令牌；不等待 runTask 进程收尾。
+  for (const exRow of running) revokeModelTokensForExecution(exRow.id);
 
   const alive = (pid) => {
     try { process.kill(pid, 0); return true; } catch { return false; }
@@ -1104,7 +1311,7 @@ export async function cancelTask(ref) {
     }
     const containerResults = [];
     for (const tname of targets) {
-      const r = await iso.killContainer(tname);
+      const r = await isolation.killContainer(tname);
       containerResults.push({ name: tname, ...r });
       db().prepare("UPDATE execution_resources SET state=?, stopped_at=? WHERE execution_id=? AND name=? AND state IN ('started','running','stopping')")
         .run(r.confirmed ? 'stopped' : 'unknown', now(), exRow.id, tname);
@@ -1282,8 +1489,11 @@ async function runAuditTask(task, project) {
 /**
  * 登记可信校验配置——只能由本地管理员入口调用（CLI）。
  * 校验命令由管理员固定，任务只能引用 id（AC-01）。
+ *
+ * PRE-A02：服务层必须验证内容挑战签名，不能靠 CLI 先验签、服务层直接写入。
+ * PRE-A03：签名内容必须与实际登记的 program / argv / cwd / timeout 完全一致。
  */
-export function createVerifyProfile({ project: projectRef, name, program, argv = [], cwd, timeoutMs = 300_000, createdBy = 'local-operator' }) {
+export function createVerifyProfile({ project: projectRef, name, program, argv = [], cwd, timeoutMs = 300_000, createdBy = 'local-operator', proof } = {}) {
   const project = getProject(projectRef);
   if (!name || !program) throw new Error('必须提供 name 与 program');
   if (!Array.isArray(argv)) throw new Error('argv 必须是数组');
@@ -1292,10 +1502,61 @@ export function createVerifyProfile({ project: projectRef, name, program, argv =
   if (shellNames.includes(program) || shellNames.includes(base)) {
     throw new Error('不允许把 shell 解释器登记为校验程序');
   }
+
+  const effectiveTimeout = timeoutMs ?? 300_000;
+  const content = {
+    kind: 'verify_profile',
+    project: projectRef,
+    name,
+    program,
+    argv,
+    cwd: cwd ?? null,
+    timeout_ms: effectiveTimeout
+  };
+  const parsed = parseSignedProof(proof);
+  if (!parsed.ok) throw new Error(parsed.error);
+  if (canonicalJson(parsed.claims.content) !== canonicalJson(content)) {
+    throw new Error('签名内容与实际登记的校验配置不一致，拒绝登记');
+  }
+  const digest = sha256(canonicalJson(content));
+  const nonceRow = db().prepare("SELECT * FROM auth_nonces WHERE nonce=? AND task_id='content'").get(proof.nonce);
+  if (!nonceRow) throw new Error('校验配置登记挑战不存在或已被使用');
+  if (nonceRow.digest !== digest) throw new Error('校验配置登记挑战摘要不匹配');
+  if (nonceRow.used_at) throw new Error('校验配置登记挑战已被使用');
+  if (Date.parse(nonceRow.expires_at) <= Date.now()) throw new Error('校验配置登记挑战已过期');
+  if (parsed.claims.expires_at !== nonceRow.expires_at) {
+    throw new Error('签名内容有效期与登记挑战不一致');
+  }
+
   const id = newId('vpr');
-  db()
-    .prepare('INSERT INTO verify_profiles (id,project_id,name,program,argv,cwd,timeout_ms,created_by,created_at) VALUES (?,?,?,?,?,?,?,?,?)')
-    .run(id, project.id, name, program, JSON.stringify(argv), cwd ?? null, timeoutMs, createdBy, now());
+  db().exec('BEGIN IMMEDIATE');
+  try {
+    const current = db().prepare("SELECT * FROM auth_nonces WHERE nonce=? AND task_id='content'").get(proof.nonce);
+    if (
+      !current ||
+      current.used_at ||
+      current.digest !== digest ||
+      current.expires_at !== parsed.claims.expires_at ||
+      Date.parse(current.expires_at) <= Date.now()
+    ) {
+      db().exec('ROLLBACK');
+      throw new Error('校验配置登记挑战无效、已过期或已被使用');
+    }
+    const consumed = db()
+      .prepare("UPDATE auth_nonces SET used_at=? WHERE nonce=? AND task_id='content' AND digest=? AND used_at IS NULL AND expires_at > ?")
+      .run(now(), proof.nonce, digest, now());
+    if (consumed.changes !== 1) {
+      db().exec('ROLLBACK');
+      throw new Error('校验配置登记挑战已被并发使用');
+    }
+    db()
+      .prepare('INSERT INTO verify_profiles (id,project_id,name,program,argv,cwd,timeout_ms,created_by,created_at) VALUES (?,?,?,?,?,?,?,?,?)')
+      .run(id, project.id, name, program, JSON.stringify(argv), cwd ?? null, effectiveTimeout, createdBy, now());
+    db().exec('COMMIT');
+  } catch (e) {
+    try { db().exec('ROLLBACK'); } catch {}
+    throw e;
+  }
   event('verify_profile.created', project.id, { name, program, argv });
   return getVerifyProfile(id);
 }
@@ -1382,6 +1643,11 @@ function writeTokens(obj) {
 export function registerModelToken(execId, taskId, ttlMs = 2 * 3600 * 1000) {
   const token = randomBytes(18).toString('base64url');
   const tokens = readTokens();
+  // 清理已经结束/取消的执行遗留令牌；执行状态以 DB 为准，不信任文件里的自述。
+  for (const [tok, meta] of Object.entries(tokens)) {
+    const execution = db().prepare('SELECT status FROM executions WHERE id=?').get(meta?.execution_id);
+    if (!execution || execution.status !== 'running') delete tokens[tok];
+  }
   tokens[token] = { execution_id: execId, task_id: taskId, expires_at: new Date(Date.now() + ttlMs).toISOString() };
   writeTokens(tokens);
   return token;
@@ -1390,8 +1656,24 @@ export function registerModelToken(execId, taskId, ttlMs = 2 * 3600 * 1000) {
 export function revokeModelToken(token) {
   if (!token) return;
   const tokens = readTokens();
+  if (!(token in tokens)) return;
   delete tokens[token];
   writeTokens(tokens);
+}
+
+/** 取消/结束时立即撤销某个 Execution 的全部模型令牌（不依赖 runTask 进程尚存）。 */
+export function revokeModelTokensForExecution(execId) {
+  if (!execId) return 0;
+  const tokens = readTokens();
+  let removed = 0;
+  for (const [tok, meta] of Object.entries(tokens)) {
+    if (meta?.execution_id === execId) {
+      delete tokens[tok];
+      removed++;
+    }
+  }
+  if (removed) writeTokens(tokens);
+  return removed;
 }
 
 /* ------------------------------ 执行资源登记 -------------------------------- */

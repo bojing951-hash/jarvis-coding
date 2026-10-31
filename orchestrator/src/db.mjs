@@ -121,7 +121,8 @@ CREATE TABLE IF NOT EXISTS approvals (
   issued_at   TEXT NOT NULL,
   expires_at  TEXT NOT NULL,
   revoked_at  TEXT,
-  used_at     TEXT
+  used_at     TEXT,
+  execution_id TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_approvals_task ON approvals(task_id, digest);
@@ -185,6 +186,11 @@ function migrate(db) {
   if (!hasColumn(db, 'tasks', 'commit_paths')) {
     db.exec("ALTER TABLE tasks ADD COLUMN commit_paths TEXT NOT NULL DEFAULT '[]'");
   }
+  // FIX3-CLOSE PRE-A01：记录审批由哪个 Execution 原子取得。
+  if (!hasColumn(db, 'approvals', 'execution_id')) {
+    db.exec('ALTER TABLE approvals ADD COLUMN execution_id TEXT');
+  }
+  db.exec('CREATE INDEX IF NOT EXISTS idx_approvals_exec ON approvals(execution_id)');
 }
 
 export function openDatabase(path) {
