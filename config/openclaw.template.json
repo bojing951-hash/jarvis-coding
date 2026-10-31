@@ -1,0 +1,144 @@
+{
+  "agents": {
+    "defaults": {
+      "authInheritance": {
+        "agentId": "main"
+      },
+      "workspace": "/Users/<you>/.openclaw/workspace",
+      "models": {
+        "zai/glm-5.3": {
+          "alias": "GLM"
+        }
+      },
+      "model": {
+        "primary": "zai/glm-5.3"
+      }
+    },
+    "entries": {
+      "jarvis": {
+        "name": "JARVIS",
+        "workspace": "/Users/<you>/.openclaw/workspace",
+        "agentDir": "/Users/<you>/.openclaw/agents/jarvis/agent",
+        "identity": {
+          "name": "JARVIS"
+        }
+      }
+    }
+  },
+  "plugins": {
+    "entries": {
+      "anthropic": {
+        "config": {
+          "sessionCatalog": {
+            "enabled": false
+          }
+        }
+      },
+      "codex": {
+        "config": {
+          "sessionCatalog": {
+            "enabled": false
+          }
+        }
+      },
+      "zai": {
+        "enabled": true
+      },
+      "feishu": {
+        "enabled": true
+      }
+    }
+  },
+  "gateway": {
+    "mode": "local",
+    "auth": {
+      "mode": "token",
+      "token": "<GENERATED_BY_ONBOARDING>"
+    },
+    "port": 18789,
+    "bind": "loopback",
+    "tailscale": {
+      "mode": "off"
+    }
+  },
+  "tools": {
+    "profile": "messaging",
+    "alsoAllow": [
+      "group:fs",
+      "group:memory"
+    ],
+    "fs": {
+      "workspaceOnly": true
+    },
+    "exec": {
+      "mode": "deny"
+    },
+    "codeMode": false
+  },
+  "auth": {
+    "profiles": {
+      "zai:default": {
+        "provider": "zai",
+        "mode": "api_key"
+      }
+    }
+  },
+  "models": {
+    "mode": "merge",
+    "providers": {
+      "zai": {
+        "baseUrl": "https://open.bigmodel.cn/api/coding/paas/v4",
+        "api": "openai-completions",
+        "models": []
+      }
+    }
+  },
+  "channels": {
+    "feishu": {
+      "domain": "feishu",
+      "connectionMode": "websocket",
+      "dmPolicy": "allowlist",
+      "groupPolicy": "disabled",
+      "allowBots": false,
+      "requireMention": true,
+      "accounts": {
+        "default": {
+          "name": "JARVIS",
+          "appId": "cli_xxxxxxxxxxxxxxxx",
+          "appSecret": {
+            "source": "store",
+            "provider": "default",
+            "id": "FEISHU_APP_SECRET"
+          }
+        }
+      },
+      "enabled": true,
+      "tools": {
+        "doc": false,
+        "wiki": false,
+        "drive": false,
+        "perm": false,
+        "bitable": false,
+        "scopes": false,
+        "chat": true
+      },
+      "allowFrom": [
+        "ou_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+      ],
+      "streaming": {
+        "mode": "off"
+      }
+    }
+  },
+  "memory": {
+    "search": {
+      "provider": "none",
+      "enabled": true
+    }
+  },
+  "commands": {
+    "ownerAllowFrom": [
+      "feishu:ou_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+    ]
+  }
+}

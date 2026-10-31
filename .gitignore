@@ -1,0 +1,28 @@
+# 凭据：任何真实密钥都不许进仓库
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+secrets.json
+openclaw.json
+openclaw.json.bak*
+*-credentials*
+
+# OpenClaw 运行时状态
+agents/*/sessions/
+**/*.sqlite
+**/*.sqlite-*
+state/
+sessions/
+memory/
+logs/
+media/
+service-env/
+.private/
+tmp/
+
+# 系统与编辑器
+.DS_Store
+*.swp
+node_modules/
