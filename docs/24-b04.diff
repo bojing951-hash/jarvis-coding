@@ -1,0 +1,1101 @@
+diff --git a/docs/contracts/p0-sec-01-b04-qa-v1.0.md b/docs/contracts/p0-sec-01-b04-qa-v1.0.md
+new file mode 100644
+index 0000000..06ddfdd
+--- /dev/null
++++ b/docs/contracts/p0-sec-01-b04-qa-v1.0.md
+@@ -0,0 +1,360 @@
++# JARVIS-P0-SEC-01-B04-QA-v1.0
++
++B04 开发前冻结补充验收契约
++
++契约编号：JARVIS-P0-SEC-01-B04-QA-v1.0  
++制定日期：2026-11-01  
++制定主体：Agent 1  
++开发主体：Agent 3  
++独立验收：Agent 2  
++状态：开发前标准已确定｜待 G0 GitHub 归档冻结
++
++本契约不修改既有正式验收标准。
++
++继承：
++
++- P0 原冻结 22 AC / 10 E2E / 15 EV。
++- B01-QA-01～07。
++- B02-QA-01～10。
++- B03-QA-01～09。
++
++新增 B04-QA-01～08。
++
++---
++
++## B04-QA-01｜Docker Event 原始信息完整性
++
++**前置：**
++
++能够从真实 Docker CLI 获取结构化容器事件。
++
++**测试动作：**
++
++执行一次真实测试容器生命周期，采集原始事件。
++
++**预期：**
++
++每条必需事件必须包含：
++
++- Type。
++- Action。
++- Actor.ID。
++- 容器名称。
++- 可信时间戳。
++
++原始信息不得在验证之前被降维为事件动作集合。
++
++不得在采集过程中丢失会影响身份、顺序或时间判断的重复事件。
++
++**FAIL：**
++
++只采集 Action，或未保存容器 ID、时间信息却宣称证据完整。
++
++**证据：**
++
++原始 Docker JSON Lines、采集命令、Docker 版本、执行退出码、原始日志文件及 SHA-256。
++
++---
++
++## B04-QA-02｜真实容器身份绑定
++
++**前置：**
++
++存在 Execution、Resource 和真实容器 ID。
++
++**测试动作：**
++
++使用正常事件、错误 ID、不同容器混合事件和错误容器名称，调用实际共用验证器。
++
++**预期：**
++
++所有必需事件必须属于同一个目标 Container ID。
++
++该 ID 必须与本次实际观察的容器 ID 一致。
++
++容器名称必须与 Resource 及 Execution ID 对应。
++
++不同容器的事件不能拼接成单次合法生命周期。
++
++**FAIL：**
++
++任意非空 Container ID 即可通过，或混合不同容器的四个事件仍然 PASS。
++
++**证据：**
++
++真实 ID 映射、共用验证器输出、负向测试原始输入与失败原因。
++
++---
++
++## B04-QA-03｜生命周期顺序与时间
++
++**前置：**
++
++具有结构化且包含可信时间戳的 Docker 事件。
++
++**测试动作：**
++
++测试：
++
++- 正常 create/start/die/destroy。
++- 完全倒序。
++- 部分倒序。
++- 时间戳逆序。
++- 时间戳缺失。
++- 非法时间戳。
++- 重复事件。
++- 不同生命周期拼接。
++- 无法确认时钟关系。
++
++**预期：**
++
++正常单次生命周期通过。
++
++错误顺序、无效时间或无法证明属于同一生命周期的输入必须拒绝。
++
++其他无关 Docker 事件可以存在，但不能被用于制造虚假的完整事件链。
++
++**FAIL：**
++
++倒序事件、时间逆序或无效时间仍被判定 PASS。
++
++**证据：**
++
++结构化事件、时间比较结果、共用验证器 failures。
++
++---
++
++## B04-QA-04｜取消时间与物理生命周期绑定
++
++**前置：**
++
++真实启动/取消竞态测试运行中。
++
++**测试动作：**
++
++记录：
++
++- 取消请求。
++- 启动屏障释放。
++- Docker create/start。
++- Docker die/destroy。
++- 取消成功确认。
++- 最终物理状态查询。
++
++**预期：**
++
++必须证明：
++
++1. 事件属于本次 Execution。
++2. 目标容器确实启动过。
++3. 容器可信停止不晚于取消成功确认。
++4. 最终容器清理状态真实可确认。
++5. 不存在取消确认后的迟到执行副作用。
++
++容器停止和容器销毁必须分别判断。
++
++时钟无法可靠比较时，不得产生无依据的成功结论。
++
++**FAIL：**
++
++取消成功早于容器停止，或者无法核实时间关系仍判定 PASS。
++
++**证据：**
++
++时间线、事件记录、取消返回时间、容器状态、SQLite 状态及 Git 前后状态。
++
++---
++
++## B04-QA-05｜共用验证器反向测试
++
++**前置：**
++
++实际 evaluateDockerRaceEvidence() 可被测试调用。
++
++**测试动作：**
++
++注入以下异常：
++
++- 事件完全倒序。
++- 必需事件 ID 不一致。
++- 混合不同容器的事件。
++- 事件名称与目标 Resource 不一致。
++- 时间戳缺失。
++- 时间戳逆序。
++- die 晚于取消确认。
++- 缺少必要事件。
++- 事件查询失败。
++- 原始 JSON 解析失败。
++- Docker ps/inspect 失败。
++- 最终 Docker 仍 running。
++- SQLite 状态不一致。
++- Git HEAD 变化。
++
++**预期：**
++
++每个不满足必要证明条件的输入都必须返回明确 FAIL。
++
++测试使用的判定函数必须与真实 Docker 验证脚本相同。
++
++**FAIL：**
++
++任意异常输入仍产生 validation.ok=true。
++
++**证据：**
++
++测试输入、实际共用函数、完整断言、测试结果及 failures。
++
++---
++
++## B04-QA-06｜旧失败与新通过
++
++**前置：**
++
++固定旧版：
++
++`0a1828069f1dfdf913d0a5f917cb9ba910a90f69`
++
++以及 B04 新固定版本。
++
++**测试动作：**
++
++分别验证：
++
++1. 正常生命周期。
++2. 完全倒序事件。
++3. 无关联 Container ID。
++4. 混合不同容器事件。
++5. 时间信息缺失。
++6. 取消确认与 die 时间关系错误。
++
++**预期：**
++
++旧版能暴露已知假阳性。
++
++新版使用相同验收语义正确拒绝。
++
++正常合法证据新版必须继续通过。
++
++对于事件数据结构升级，应提供新旧测试语义映射及原始证据。
++
++不能用旧版不支持新数据格式作为修复成立的证明。
++
++**FAIL：**
++
++无法区分新旧已知失败模式，或通过放宽断言制造成功。
++
++**证据：**
++
++两个固定 Commit、测试代码 Diff、独立运行记录。
++
++---
++
++## B04-QA-07｜真实 Docker 与完整回归
++
++**前置：**
++
++B04 G0 已冻结，代码修复完成。
++
++**测试动作：**
++
++执行：
++
++- B04 专项测试。
++- B03-QA-01～09。
++- B02-QA-01～10。
++- B01-QA-01～07。
++- 全部现有安全测试。
++- Node24 GitHub CI。
++- 原契约和全部补充契约完整性检查。
++- 真实 Docker 竞态测试。
++- 真实 SIGTERM/SIGKILL 测试。
++
++**预期：**
++
++全部适用的必需测试通过。
++
++原有断言没有弱化。
++
++CI 对应固定目标 Commit。
++
++真实 Docker 证据包含完整事件身份、顺序与时间。
++
++SKIP 不得冒充 PASS。
++
++**FAIL：**
++
++测试失败、契约变化、CI SHA 不匹配、真实证据缺失却宣称全部通过，或出现新的阻断性回归。
++
++**证据：**
++
++GitHub CI、测试统计、原始 Docker 日志、契约哈希及 Diff。
++
++---
++
++## B04-QA-08｜正式 P0 验收继承与证据边界
++
++**前置：**
++
++B04 代码及证据已完成交付。
++
++**测试动作：**
++
++完整核对：
++
++- 22 AC。
++- 10 E2E。
++- 15 EV。
++- B01 七项。
++- B02 十项。
++- B03 九项。
++- B04 八项。
++
++**预期：**
++
++每项均有：
++
++- 固定版本。
++- 状态。
++- 测试动作。
++- 实际结果。
++- 证据来源。
++- 证据等级。
++- 尚缺事项。
++
++必须区分：
++
++A. GitHub 源码。  
++B. GitHub CI。  
++C. 独立故障注入。  
++D. SQLite/Git 集成。  
++E. 真实 Docker。  
++F. 真实 Mac/SE/Claude/GLM。  
++G. 真实 OpenClaw/MCP/Workflow。
++
++不得将开发方真实环境报告自动视为 Agent 2 独立复现。
++
++**FAIL：**
++
++遗漏任何必须继承的验收范围，或将必要的 WAITING 错误宣布为 PASS。
++
++**证据：**
++
++完整验收矩阵、原始证据索引、环境限制与最终裁决记录。
++
++---
++
++## 最终裁决规则
++
++B04 专项 FAIL：任何确定性阻断缺陷成立。
++
++B04 专项 OPEN/WAITING：未发现确定性缺陷，但缺少必要独立证据。
++
++B04 专项 PASS：八项补充验收全部满足且证据充分，没有未解决的相关阻断缺陷。
++
++B04 专项 PASS 不代表 P0-SEC-01 整体 PASS。
++
++P0 完整通过仍必须满足原 22 AC、10 E2E、15 EV 和适用补充契约。
++
++封版、合并 main 以及风险接受权属于用户。
++
++本契约一经 G0 提交冻结，不得开发后调整。
+diff --git a/orchestrator/scripts/b03-docker-evidence.mjs b/orchestrator/scripts/b03-docker-evidence.mjs
+index ad38964..5762092 100644
+--- a/orchestrator/scripts/b03-docker-evidence.mjs
++++ b/orchestrator/scripts/b03-docker-evidence.mjs
+@@ -1,8 +1,15 @@
+ /**
+- * B03-QA-04/05：真实 Docker 竞态证据的共用判定器。
++ * B04-QA：真实 Docker 生命周期证据的共用判定器。
+  * 脚本与反向测试必须使用同一函数，不能各复制一份最终布尔表达式。
++ *
++ * events 是结构化事件：
++ *   { type, action, actorId, actorName, timeNano, raw }
++ * timeNano 以字符串保存，避免超过 Number.MAX_SAFE_INTEGER 的精度损失。
+  */
+ 
++const REQUIRED = ['create', 'start', 'die', 'destroy'];
++const HEX64 = /^[0-9a-f]{64}$/i;
++
+ export function isTrustedGoneInspect(result, containerName) {
+   if (!result || result.ok === true) return false;
+   if (result.abnormal === true || result.signal) return false;
+@@ -12,6 +19,33 @@ export function isTrustedGoneInspect(result, containerName) {
+   return new RegExp(`(?:No such object|No such container):\\s*${escaped}(?:\\s|$)`, 'i').test(text);
+ }
+ 
++/** Docker JSON Lines → 结构化事件；timeNano 从原始行提取以保留完整数字。 */
++export function parseDockerEventLine(line) {
++  const raw = String(line ?? '').trim();
++  if (!raw) throw new Error('empty event line');
++  let obj;
++  try {
++    obj = JSON.parse(raw);
++  } catch (e) {
++    throw new Error(`invalid Docker event JSON: ${e.message}`);
++  }
++  const timeMatch = raw.match(/"timeNano"\s*:\s*"?(\d+)"?/);
++  const timeNano = timeMatch ? timeMatch[1] : (typeof obj.timeNano === 'string' ? obj.timeNano : null);
++  const type = obj.Type ?? obj.type ?? null;
++  const action = obj.Action ?? obj.status ?? null;
++  const actorId = obj.Actor?.ID ?? obj.Actor?.Id ?? null;
++  const actorName = obj.Actor?.Attributes?.name ?? obj.Actor?.Attributes?.Name ?? null;
++  return { type, action, actorId, actorName, timeNano, raw };
++}
++
++function eventTime(ev) {
++  if (!ev || typeof ev.timeNano !== 'string' || !/^\d+$/.test(ev.timeNano)) return null;
++  const n = BigInt(ev.timeNano);
++  return n > 0n ? n : null;
++}
++
++const ms = (timeNano) => timeNano / 1_000_000n;
++
+ export function evaluateDockerRaceEvidence(e) {
+   const failures = [];
+   const require = (condition, message) => {
+@@ -24,15 +58,101 @@ export function evaluateDockerRaceEvidence(e) {
+   require(e?.executionStatus === 'cancelled', `execution status is ${e?.executionStatus}`);
+   require(['stopped', 'abandoned'].includes(e?.resourceState), `resource state is ${e?.resourceState}`);
+   require(Boolean(e?.executionId), 'missing executionId');
++  require(e?.resourceName === `jarvis-exec-${e?.executionId}`, 'resource name does not match executionId');
+   require(e?.containerName === `jarvis-exec-${e?.executionId}`, 'container name does not match executionId');
+-  require(Boolean(e?.containerId), 'missing containerId');
++  require(typeof e?.containerId === 'string' && HEX64.test(e.containerId), 'containerId is not a full Docker ID');
+   require(e?.sawContainerRunning === true, 'container was never observed running');
+   require(Array.isArray(e?.observedStates) && e.observedStates.includes('running'), 'observedStates missing running');
+-  require(e?.eventsOk === true, `docker events query failed: ${e?.eventsError || 'unknown'}`);
++
++  require(e?.eventsOk === true, `docker events stream failed: ${e?.eventsError || 'unknown'}`);
++  require(Array.isArray(e?.eventsParseErrors) && e.eventsParseErrors.length === 0, 'raw Docker events contain parse errors');
++  require(typeof e?.eventsRaw === 'string' && e.eventsRaw.trim().length > 0, 'raw Docker events are empty');
++  require(Array.isArray(e?.events) && e.events.length > 0, 'no parsed Docker events');
++
++  const events = Array.isArray(e?.events) ? e.events : [];
++  if (typeof e?.eventsRaw === 'string') {
++    const parsedRaw = [];
++    let rawError = null;
++    for (const line of e.eventsRaw.split('\n')) {
++      if (!line.trim()) continue;
++      try { parsedRaw.push(parseDockerEventLine(line)); } catch (err) { rawError = err.message; }
++    }
++    require(rawError === null, `raw Docker events parse error: ${rawError}`);
++    require(parsedRaw.length === events.length, `raw Docker events count ${parsedRaw.length} != parsed ${events.length}`);
++  }
++  const target = events.filter(
++    (ev) => ev.type === 'container' && ev.actorId === e.containerId && ev.actorName === e.containerName
++  );
++  const requiredAnywhere = events.filter((ev) => REQUIRED.includes(ev.action));
++  const foreignRequired = requiredAnywhere.filter(
++    (ev) => !(ev.type === 'container' && ev.actorId === e.containerId && ev.actorName === e.containerName)
++  );
++  require(foreignRequired.length === 0, `required events from another container: ${JSON.stringify(foreignRequired)}`);
++
++  const required = target.filter((ev) => REQUIRED.includes(ev.action));
++  for (const action of REQUIRED) {
++    const count = required.filter((ev) => ev.action === action).length;
++    require(count === 1, `required event count ${action}=${count}`);
++  }
++
++  const sequence = required.map((ev) => ev.action);
+   require(
+-    Array.isArray(e?.events) && ['create', 'start', 'die', 'destroy'].every((a) => e.events.includes(a)),
+-    `docker events incomplete: ${JSON.stringify(e?.events)}`
++    JSON.stringify(sequence) === JSON.stringify(REQUIRED),
++    `lifecycle order is ${JSON.stringify(sequence)}`
+   );
++
++  const byAction = Object.fromEntries(required.map((ev) => [ev.action, ev]));
++  const times = {};
++  for (const action of REQUIRED) {
++    const ev = byAction[action];
++    const t = eventTime(ev);
++    times[action] = t;
++    require(t !== null, `missing or invalid timeNano for ${action}`);
++  }
++
++  if (REQUIRED.every((a) => times[a] !== null)) {
++    require(times.create <= times.start, 'timestamp create > start');
++    require(times.start <= times.die, 'timestamp start > die');
++    require(times.die <= times.destroy, 'timestamp die > destroy');
++  }
++
++  const startIdx = target.findIndex((ev) => ev.action === 'create');
++  const destroyIdx = target.findIndex((ev) => ev.action === 'destroy');
++  require(startIdx >= 0 && destroyIdx >= 0 && destroyIdx >= startIdx, 'target lifecycle indexes invalid');
++  if (destroyIdx >= 0) {
++    require(
++      target.slice(destroyIdx + 1).length === 0,
++      `target container has events after destroy: ${JSON.stringify(target.slice(destroyIdx + 1))}`
++    );
++  }
++
++  const timelineFields = ['startedAt', 'barrierAt', 'cancelRequestedAt', 'releaseAt', 'cancelResolvedAt', 'finalStateAt'];
++  for (const field of timelineFields) {
++    require(Number.isFinite(e?.[field]), `missing timeline field ${field}`);
++  }
++  if (timelineFields.every((field) => Number.isFinite(e?.[field]))) {
++    require(e.barrierAt >= e.startedAt, 'barrier before test start');
++    require(e.cancelRequestedAt >= e.barrierAt, 'cancel requested before barrier');
++    require(e.releaseAt >= e.cancelRequestedAt, 'release before cancel request');
++    require(e.cancelResolvedAt >= e.releaseAt, 'cancel resolved before release');
++    require(e.finalStateAt >= e.cancelResolvedAt, 'final state query before cancel resolution');
++
++    if (REQUIRED.every((a) => times[a] !== null)) {
++      const createMs = ms(times.create);
++      const startMs = ms(times.start);
++      const dieMs = ms(times.die);
++      const destroyMs = ms(times.destroy);
++
++      require(createMs >= BigInt(e.releaseAt), 'create event before barrier release');
++      require(startMs >= BigInt(e.releaseAt), 'start event before barrier release');
++      require(createMs >= BigInt(e.startedAt), 'create event before test start');
++      require(dieMs <= BigInt(e.cancelResolvedAt), 'die event after cancel confirmation');
++      require(destroyMs <= BigInt(e.finalStateAt), 'destroy event after final state query');
++      require(createMs <= BigInt(e.finalStateAt), 'create event after final state query');
++      require(startMs <= BigInt(e.finalStateAt), 'start event after final state query');
++    }
++  }
++
+   require(e?.ps?.ok === true, 'docker ps command failed');
+   require((e?.ps?.stdout || '').trim() === '', 'target container still appears in docker ps -a');
+   require(Boolean(e?.inspectAfter), 'missing final docker inspect');
+diff --git a/orchestrator/scripts/verify-b01-docker-race.mjs b/orchestrator/scripts/verify-b01-docker-race.mjs
+index 68245c3..18a86b6 100644
+--- a/orchestrator/scripts/verify-b01-docker-race.mjs
++++ b/orchestrator/scripts/verify-b01-docker-race.mjs
+@@ -12,8 +12,9 @@
+ import { chmodSync, existsSync, mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
+ import { homedir, tmpdir } from 'node:os';
+ import { join } from 'node:path';
+-import { execFileSync, spawnSync } from 'node:child_process';
+-import { evaluateDockerRaceEvidence, isTrustedGoneInspect } from './b03-docker-evidence.mjs';
++import { execFileSync, spawn, spawnSync } from 'node:child_process';
++import { createHash } from 'node:crypto';
++import { evaluateDockerRaceEvidence, isTrustedGoneInspect, parseDockerEventLine } from './b03-docker-evidence.mjs';
+ 
+ const REAL_HOME = homedir();
+ const ROOT = mkdtempSync(join(tmpdir(), 'jarvis-b02-docker-'));
+@@ -116,7 +117,81 @@ let releaseWritten = false;
+ let sawContainerRunning = false;
+ const observedStates = [];
+ const startedAt = Date.now();
++let barrierAt = null;
++let cancelRequestedAt = null;
+ let releaseAt = null;
++let cancelResolvedAt = null;
++let finalStateAt = null;
++
++const eventsRawLines = [];
++const events = [];
++const eventsParseErrors = [];
++let eventsProcess = null;
++let eventsStarted = false;
++let eventsStopping = false;
++let eventsSpawnError = null;
++let eventsStreamError = null;
++
++const recordEventLine = (line) => {
++  const raw = String(line ?? '').trim();
++  if (!raw) return;
++  eventsRawLines.push(raw);
++  try {
++    events.push(parseDockerEventLine(raw));
++  } catch (e) {
++    eventsParseErrors.push(e.message);
++  }
++};
++
++const startEventCollector = async () => {
++  eventsProcess = spawn(DOCKER, ['events', '--filter', 'type=container', '--format', '{{json .}}'], {
++    env: dockerEnv,
++    stdio: ['ignore', 'pipe', 'pipe']
++  });
++  eventsStarted = true;
++  eventsProcess.stdout.setEncoding('utf8');
++  eventsProcess.stderr.setEncoding('utf8');
++  let buffer = '';
++  eventsProcess.stdout.on('data', (chunk) => {
++    buffer += chunk;
++    let idx;
++    while ((idx = buffer.indexOf('\n')) >= 0) {
++      recordEventLine(buffer.slice(0, idx));
++      buffer = buffer.slice(idx + 1);
++    }
++  });
++  eventsProcess.stderr.on('data', (chunk) => {
++    if (!eventsStopping) eventsStreamError = String(chunk).slice(0, 400);
++  });
++  eventsProcess.on('error', (e) => { eventsSpawnError = e.message; });
++  eventsProcess.on('exit', (code, signal) => {
++    if (!eventsStopping && (code !== 0 || signal)) {
++      eventsStreamError = `docker events exited code=${code} signal=${signal}`;
++    }
++  });
++  // 给事件监听器一个启动机会，再释放 docker run 屏障。
++  await new Promise((r) => setTimeout(r, 200));
++};
++
++const stopEventCollector = async () => {
++  if (!eventsProcess) return;
++  eventsStopping = true;
++  try { eventsProcess.kill('SIGTERM'); } catch {}
++  await new Promise((resolve) => {
++    let done = false;
++    const finish = () => { if (!done) { done = true; resolve(); } };
++    eventsProcess.once('exit', finish);
++    setTimeout(finish, 2000);
++  });
++};
++
++const waitForTargetDestroy = async (timeoutMs = 4000) => {
++  const deadline = Date.now() + timeoutMs;
++  while (Date.now() < deadline) {
++    if (containerId && events.some((e) => e.action === 'destroy' && e.actorId === containerId)) return;
++    await new Promise((r) => setTimeout(r, 20));
++  }
++};
+ 
+ const cleanup = () => {
+   if (!containerName) return;
+@@ -124,12 +199,14 @@ const cleanup = () => {
+     execFileSync(DOCKER, ['rm', '-f', containerName], { stdio: 'ignore', env: dockerEnv, timeout: 30_000 });
+   } catch {}
+ };
+-process.on('exit', cleanup);
++process.on('exit', () => { cleanup(); try { eventsProcess?.kill('SIGKILL'); } catch {} });
+ 
+ try {
++  await startEventCollector();
+   const running = svc.runTask(task.id);
+   running.catch((e) => { runFailure = e; });
+   await waitForFile(ENTERED, 'docker-run-entered', () => runFailure);
++  barrierAt = Date.now();
+ 
+   // 以真实 SQLite 为准：Execution ID、容器名、资源行。
+   executionRow = svc.db().prepare("SELECT * FROM executions WHERE task_id=? AND status='running' ORDER BY started_at DESC").get(task.id);
+@@ -142,6 +219,7 @@ try {
+     throw new Error(`resource name mismatch: ${resourceRow.name} != ${containerName}`);
+   }
+ 
++  cancelRequestedAt = Date.now();
+   const cancelling = svc.cancelTask(task.id);
+   cancelling.then((r) => { cancel = r; cancelResolvedBeforeRelease = !releaseWritten; });
+   for (let i = 0; i < 1000; i++) {
+@@ -174,8 +252,10 @@ try {
+   releaseAt = Date.now();
+   writeFileSync(RELEASE, 'go');
+   cancel = await cancelling;
++  cancelResolvedAt = Date.now();
+   result = await running;
+   await pollContainer;
++  await waitForTargetDestroy();
+ } finally {
+   if (!releaseWritten) {
+     releaseWritten = true;
+@@ -190,9 +270,6 @@ const taskAfter = svc.getTask(task.id);
+ const headAfter = gitHead(repo);
+ let ps = null;
+ let inspectAfter = null;
+-let events = [];
+-let eventsOk = false;
+-let eventsError = null;
+ if (containerName) {
+   const psRun = spawnSync(DOCKER, ['ps', '-a', '--filter', `name=${containerName}`, '--format', '{{.Names}} {{.Status}}'], {
+     encoding: 'utf8',
+@@ -223,31 +300,32 @@ if (containerName) {
+     abnormal: Boolean(inspectRun.error || inspectRun.signal || inspectRun.status === null)
+   };
+   inspectAfter.trustedGone = isTrustedGoneInspect(inspectAfter, containerName);
+-
+-  const eventsRun = spawnSync(
+-    DOCKER,
+-    [
+-      'events',
+-      '--since', String(Math.floor(startedAt / 1000) - 1),
+-      '--until', String(Math.floor(Date.now() / 1000)),
+-      '--filter', `container=${containerName}`,
+-      '--format', '{{.Action}}'
+-    ],
+-    { encoding: 'utf8', env: dockerEnv, timeout: 15_000 }
+-  );
+-  eventsOk = eventsRun.status === 0;
+-  eventsError = eventsRun.error?.message ?? (eventsRun.stderr || '').trim() ?? null;
+-  const actions = (eventsRun.stdout || '')
+-    .split('\n')
+-    .map((x) => x.trim())
+-    .filter((x) => ['create', 'start', 'die', 'destroy'].includes(x));
+-  events = [...new Set(actions)];
+ }
+ 
++await stopEventCollector();
++finalStateAt = Date.now();
++
++const eventsRaw = eventsRawLines.join('\n');
++const eventsRawFile = eventsRaw + (eventsRaw ? '\n' : '');
++const eventsRawPath = join(ROOT, 'docker-events.jsonl');
++writeFileSync(eventsRawPath, eventsRawFile);
++const eventsRawSha256 = createHash('sha256').update(eventsRawFile).digest('hex');
++const eventsError = eventsSpawnError || eventsStreamError || (eventsParseErrors.length ? eventsParseErrors.join('; ') : null);
++const eventsOk =
++  eventsStarted &&
++  !eventsSpawnError &&
++  !eventsStreamError &&
++  eventsParseErrors.length === 0 &&
++  eventsRawLines.length > 0;
++
+ const evidence = {
+   testRoot: ROOT,
+   startedAt,
++  barrierAt,
++  cancelRequestedAt,
+   releaseAt,
++  cancelResolvedAt,
++  finalStateAt,
+   task: task.id,
+   executionId,
+   executionIdSource: 'sqlite executions.status=running at docker barrier',
+@@ -269,6 +347,10 @@ const evidence = {
+   ps,
+   containerPs: ps?.stdout ?? '',
+   events,
++  eventsRaw,
++  eventsRawPath,
++  eventsRawSha256,
++  eventsParseErrors,
+   eventsOk,
+   eventsError,
+   gitHeadBefore: headBefore,
+diff --git a/orchestrator/test/b03-validator.test.mjs b/orchestrator/test/b03-validator.test.mjs
+index e0c8bf9..ac452d8 100644
+--- a/orchestrator/test/b03-validator.test.mjs
++++ b/orchestrator/test/b03-validator.test.mjs
+@@ -1,106 +1,149 @@
+ /**
+- * B03-QA-05：真实 Docker 验证器的反向测试。
+- * 直接调用 verify-b01-docker-race.mjs 使用的同一判定函数，不复制最终布尔表达式。
++ * B03-QA-05 / B04-QA-05：真实 Docker 证据验证器的反向测试。
++ * 直接调用 verify-b01-docker-race.mjs 使用的同一判定函数。
+  */
+ import { test } from 'node:test';
+ import assert from 'node:assert/strict';
+-import { evaluateDockerRaceEvidence, isTrustedGoneInspect } from '../scripts/b03-docker-evidence.mjs';
++import { evaluateDockerRaceEvidence, parseDockerEventLine } from '../scripts/b03-docker-evidence.mjs';
+ 
+-const base = () => ({
+-  cancelResolvedBeforeRelease: false,
+-  cancelOk: true,
+-  taskStatus: 'cancelled',
+-  executionStatus: 'cancelled',
+-  resourceState: 'stopped',
+-  executionId: 'exe_b03',
+-  containerName: 'jarvis-exec-exe_b03',
+-  containerId: 'container-id',
+-  sawContainerRunning: true,
+-  observedStates: ['created', 'running'],
+-  events: ['create', 'start', 'die', 'destroy'],
+-  eventsOk: true,
+-  eventsError: '',
+-  ps: { ok: true, status: 0, stdout: '', stderr: '', error: null, signal: null },
+-  inspectAfter: {
+-    ok: false,
+-    status: 1,
+-    stdout: '',
+-    stderr: 'Error: No such object: jarvis-exec-exe_b03',
+-    error: null,
+-    signal: null,
+-    abnormal: false,
+-    trustedGone: true
+-  },
+-  gitHeadBefore: 'aaa',
+-  gitHeadAfter: 'aaa'
++const ID = 'a'.repeat(64);
++const NAME = 'jarvis-exec-exe_b03';
++const BASE = 1_700_000_000_000;
++const ns = (offsetMs) => String((BigInt(BASE) + BigInt(offsetMs)) * 1_000_000n);
++
++const event = (action, offsetMs, over = {}) => ({
++  type: 'container',
++  action,
++  actorId: ID,
++  actorName: NAME,
++  timeNano: ns(offsetMs),
++  raw: '',
++  ...over
++});
++
++const rawEvent = (e) => JSON.stringify({
++  Type: e.type,
++  Action: e.action,
++  Actor: { ID: e.actorId, Attributes: { name: e.actorName } },
++  timeNano: e.timeNano
+ });
+ 
+-test('B03-QA-05 完整真实 Docker 证据应通过', () => {
++const syncRaw = (e) => {
++  e.eventsRaw = e.events.map(rawEvent).join('\n');
++  return e;
++};
++
++const base = () => {
++  const events = [
++    event('create', 400),
++    event('start', 500),
++    event('die', 600),
++    event('destroy', 700)
++  ];
++  return syncRaw({
++    cancelResolvedBeforeRelease: false,
++    cancelOk: true,
++    taskStatus: 'cancelled',
++    executionStatus: 'cancelled',
++    resourceState: 'stopped',
++    executionId: 'exe_b03',
++    resourceName: NAME,
++    containerName: NAME,
++    containerId: ID,
++    sawContainerRunning: true,
++    observedStates: ['created', 'running'],
++    eventsOk: true,
++    eventsParseErrors: [],
++    events,
++    eventsRaw: '',
++    startedAt: BASE,
++    barrierAt: BASE + 100,
++    cancelRequestedAt: BASE + 200,
++    releaseAt: BASE + 300,
++    cancelResolvedAt: BASE + 800,
++    finalStateAt: BASE + 900,
++    ps: { ok: true, status: 0, stdout: '', stderr: '', error: null, signal: null },
++    inspectAfter: {
++      ok: false,
++      status: 1,
++      stdout: '',
++      stderr: `Error: No such object: ${NAME}`,
++      error: null,
++      signal: null,
++      abnormal: false,
++      trustedGone: true
++    },
++    gitHeadBefore: 'aaa',
++    gitHeadAfter: 'aaa'
++  });
++};
++
++test('B03-QA-05 完整结构化生命周期应通过', () => {
+   const r = evaluateDockerRaceEvidence(base());
+   assert.equal(r.ok, true, JSON.stringify(r.failures));
+ });
+ 
+ const mutations = [
+   ['docker ps 非零退出', (e) => { e.ps.ok = false; e.ps.status = 1; e.ps.stderr = 'ps failed'; }],
+-  ['docker ps 仍有目标容器', (e) => { e.ps.stdout = 'jarvis-exec-exe_b03 Up'; }],
++  ['docker ps 仍有目标容器', (e) => { e.ps.stdout = `${NAME} Up`; }],
+   ['最终 inspect running', (e) => { e.inspectAfter = { ok: true, status: 0, stdout: 'running', stderr: '', trustedGone: false, abnormal: false }; }],
+-  ['最终 inspect 异常无法确认', (e) => { e.inspectAfter = { ok: false, status: null, stdout: '', stderr: 'timeout', trustedGone: false, abnormal: true }; }],
+-  ['缺少 create 事件', (e) => { e.events = ['start', 'die', 'destroy']; }],
+-  ['缺少 destroy 事件', (e) => { e.events = ['create', 'start', 'die']; }],
+-  ['events 查询失败但部分输出含全部动作', (e) => { e.eventsOk = false; e.eventsError = 'ETIMEDOUT'; }],
+-  ['容器名与 Execution 不一致', (e) => { e.containerName = 'jarvis-exec-other'; }],
+-  ['缺少 Execution ID', (e) => { e.executionId = null; }],
+-  ['缺少容器 ID', (e) => { e.containerId = ''; }],
+-  ['Task cancelled 但 Docker 仍运行', (e) => { e.ps.stdout = 'jarvis-exec-exe_b03 Up 10 seconds'; }],
+-  ['Git HEAD 未经授权变化', (e) => { e.gitHeadAfter = 'bbb'; }],
++  ['最终 inspect 异常', (e) => { e.inspectAfter = { ok: false, status: null, stdout: '', stderr: 'timeout', trustedGone: false, abnormal: true }; }],
++  ['缺少 create', (e) => { e.events = e.events.filter((x) => x.action !== 'create'); }],
++  ['缺少 destroy', (e) => { e.events = e.events.filter((x) => x.action !== 'destroy'); }],
++  ['events 查询失败', (e) => { e.eventsOk = false; e.eventsError = 'ETIMEDOUT'; }],
++  ['events 解析错误', (e) => { e.eventsParseErrors = ['bad json']; }],
++  ['资源名不匹配', (e) => { e.resourceName = 'jarvis-exec-other'; }],
++  ['容器名不匹配', (e) => { e.containerName = 'jarvis-exec-other'; }],
++  ['Execution ID 缺失', (e) => { e.executionId = null; }],
++  ['Container ID 缺失', (e) => { e.containerId = ''; }],
++  ['Task cancelled 但 ps 仍运行', (e) => { e.ps.stdout = `${NAME} Up`; }],
++  ['Git HEAD 变化', (e) => { e.gitHeadAfter = 'bbb'; }],
+   ['取消提前确认', (e) => { e.cancelResolvedBeforeRelease = true; }],
+   ['cancelTask 未成功', (e) => { e.cancelOk = false; }],
+-  ['资源状态未确认', (e) => { e.resourceState = 'unknown'; }],
+-  ['未观察到容器运行', (e) => { e.sawContainerRunning = false; }]
++  ['资源未确认', (e) => { e.resourceState = 'unknown'; }],
++  ['未观察运行', (e) => { e.sawContainerRunning = false; }],
++  ['完全倒序事件', (e) => { e.events.reverse(); }],
++  ['create/start 顺序错误', (e) => { const c = e.events.find((x) => x.action === 'create'); const s = e.events.find((x) => x.action === 'start'); [c.action, s.action] = [s.action, c.action]; }],
++  ['die/destroy 顺序错误', (e) => { const d = e.events.find((x) => x.action === 'die'); const z = e.events.find((x) => x.action === 'destroy'); [d.action, z.action] = [z.action, d.action]; }],
++  ['事件使用其他 Container ID', (e) => { e.events.find((x) => x.action === 'start').actorId = 'b'.repeat(64); }],
++  ['混合其他容器事件', (e) => { e.events.push(event('start', 550, { actorId: 'b'.repeat(64) })); }],
++  ['事件名与 Resource 不一致', (e) => { e.events.find((x) => x.action === 'die').actorName = 'other'; }],
++  ['事件缺失 Actor.ID', (e) => { e.events.find((x) => x.action === 'start').actorId = null; }],
++  ['事件缺失 timeNano', (e) => { e.events.find((x) => x.action === 'start').timeNano = null; }],
++  ['事件非法 timeNano', (e) => { e.events.find((x) => x.action === 'start').timeNano = 'not-a-number'; }],
++  ['时间戳逆序', (e) => { e.events.find((x) => x.action === 'start').timeNano = ns(300); }],
++  ['die 晚于取消确认', (e) => { e.events.find((x) => x.action === 'die').timeNano = ns(850); }],
++  ['destroy 晚于最终状态查询', (e) => { e.events.find((x) => x.action === 'destroy').timeNano = ns(950); }],
++  ['create 早于屏障释放', (e) => { e.events.find((x) => x.action === 'create').timeNano = ns(200); }],
++  ['重复 create', (e) => { e.events.push(event('create', 450)); }],
++  ['destroy 后仍有目标事件', (e) => { e.events.push(event('start', 750)); }],
++  ['timeline 缺失', (e) => { delete e.finalStateAt; }],
++  ['raw JSONL 数量不匹配', (e) => { e.eventsRaw = rawEvent(e.events[0]); }],
++  ['raw JSONL 解析失败', (e) => { e.eventsRaw = 'not json'; }]
+ ];
+ 
+ for (const [name, mutate] of mutations) {
+-  test(`B03-QA-05 反向：${name} 必须 FAIL`, () => {
++  test(`B04-QA-05 反向：${name} 必须 FAIL`, () => {
+     const e = base();
+     mutate(e);
++    if (name !== 'raw JSONL 数量不匹配' && name !== 'raw JSONL 解析失败') syncRaw(e);
+     const r = evaluateDockerRaceEvidence(e);
+     assert.equal(r.ok, false, `${name} 不应通过`);
+     assert.ok(r.failures.length > 0);
+   });
+ }
+ 
+-test('B03-QA-01 isTrustedGoneInspect：正常非零 No such 目标匹配才可信', () => {
+-  const ok = isTrustedGoneInspect({
+-    ok: false,
+-    status: 1,
+-    stdout: '',
+-    stderr: 'Error: No such object: jarvis-exec-exe_b03',
+-    abnormal: false,
+-    signal: null
+-  }, 'jarvis-exec-exe_b03');
+-  assert.equal(ok, true);
+-});
+-
+-test('B03-QA-01 isTrustedGoneInspect：异常结束即使是 No such 也不可信', () => {
+-  const ok = isTrustedGoneInspect({
+-    ok: false,
+-    status: null,
+-    stdout: '',
+-    stderr: 'Error: No such object: jarvis-exec-exe_b03',
+-    abnormal: true,
+-    signal: 'SIGTERM'
+-  }, 'jarvis-exec-exe_b03');
+-  assert.equal(ok, false);
++test('B04-QA-01 timeNano 超过 Number.MAX_SAFE_INTEGER 仍精确保留', () => {
++  const raw = '{"Type":"container","Action":"die","Actor":{"ID":"' + ID + '","Attributes":{"name":"' + NAME + '"}},"timeNano":"1700000000123456789"}';
++  const ev = parseDockerEventLine(raw);
++  assert.equal(ev.timeNano, '1700000000123456789');
++  assert.equal(BigInt(ev.timeNano), 1_700_000_000_123_456_789n);
+ });
+ 
+-test('B03-QA-01 isTrustedGoneInspect：错误文本目标不匹配不可信', () => {
+-  const ok = isTrustedGoneInspect({
+-    ok: false,
+-    status: 1,
+-    stdout: '',
+-    stderr: 'Error: No such object: another-container',
+-    abnormal: false,
+-    signal: null
+-  }, 'jarvis-exec-exe_b03');
+-  assert.equal(ok, false);
++test('B04-QA-01 原始 JSONL 与结构化事件不一致不得通过', () => {
++  const e = base();
++  e.eventsRaw = rawEvent(e.events[0]);
++  const r = evaluateDockerRaceEvidence(e);
++  assert.equal(r.ok, false);
++  assert.ok(r.failures.some((x) => /raw Docker events count/.test(x)));
+ });
+diff --git a/orchestrator/test/b04-events.test.mjs b/orchestrator/test/b04-events.test.mjs
+new file mode 100644
+index 0000000..ea2334f
+--- /dev/null
++++ b/orchestrator/test/b04-events.test.mjs
+@@ -0,0 +1,132 @@
++/**
++ * B04-QA-01～05：结构化 Docker 事件的身份、顺序、时间与原始 JSONL。
++ * 直接调用实际共用验证器。
++ */
++import { test } from 'node:test';
++import assert from 'node:assert/strict';
++import { evaluateDockerRaceEvidence, parseDockerEventLine } from '../scripts/b03-docker-evidence.mjs';
++
++const ID = 'c'.repeat(64);
++const NAME = 'jarvis-exec-exe_b04';
++const BASE = 1_700_000_000_000;
++const ns = (offset) => String((BigInt(BASE) + BigInt(offset)) * 1_000_000n);
++const raw = (e) => JSON.stringify({
++  Type: e.type,
++  Action: e.action,
++  Actor: { ID: e.actorId, Attributes: { name: e.actorName } },
++  timeNano: e.timeNano
++});
++const ev = (action, offset, over = {}) => ({
++  type: 'container', action, actorId: ID, actorName: NAME, timeNano: ns(offset), ...over
++});
++const base = () => {
++  const events = [ev('create', 400), ev('start', 500), ev('die', 600), ev('destroy', 700)];
++  return {
++    cancelResolvedBeforeRelease: false,
++    cancelOk: true,
++    taskStatus: 'cancelled',
++    executionStatus: 'cancelled',
++    resourceState: 'stopped',
++    executionId: 'exe_b04',
++    resourceName: NAME,
++    containerName: NAME,
++    containerId: ID,
++    sawContainerRunning: true,
++    observedStates: ['created', 'running'],
++    eventsOk: true,
++    eventsParseErrors: [],
++    events,
++    eventsRaw: events.map(raw).join('\n'),
++    startedAt: BASE,
++    barrierAt: BASE + 100,
++    cancelRequestedAt: BASE + 200,
++    releaseAt: BASE + 300,
++    cancelResolvedAt: BASE + 800,
++    finalStateAt: BASE + 900,
++    ps: { ok: true, status: 0, stdout: '', stderr: '' },
++    inspectAfter: { ok: false, status: 1, stdout: '', stderr: `No such object: ${NAME}`, trustedGone: true, abnormal: false },
++    gitHeadBefore: 'a',
++    gitHeadAfter: 'a'
++  };
++};
++const sync = (e) => { e.eventsRaw = e.events.map(raw).join('\n'); return e; };
++
++test('B04-QA-01 timeNano 完整保留', () => {
++  const e = parseDockerEventLine('{"Type":"container","Action":"die","Actor":{"ID":"' + ID + '","Attributes":{"name":"' + NAME + '"}},"timeNano":"1700000000123456789"}');
++  assert.equal(e.timeNano, '1700000000123456789');
++  assert.equal(BigInt(e.timeNano), 1700000000123456789n);
++});
++
++test('B04-QA-02 正常同容器生命周期通过', () => {
++  const r = evaluateDockerRaceEvidence(base());
++  assert.equal(r.ok, true, JSON.stringify(r.failures));
++});
++
++test('B04-QA-02 混合其他容器事件失败', () => {
++  const e = base();
++  e.events.push(ev('start', 550, { actorId: 'd'.repeat(64) }));
++  sync(e);
++  assert.equal(evaluateDockerRaceEvidence(e).ok, false);
++});
++
++test('B04-QA-02 容器 ID 与资源不一致失败', () => {
++  const e = base();
++  e.events.find((x) => x.action === 'start').actorId = 'd'.repeat(64);
++  sync(e);
++  assert.equal(evaluateDockerRaceEvidence(e).ok, false);
++});
++
++test('B04-QA-03 完全倒序事件失败', () => {
++  const e = base();
++  e.events.reverse();
++  sync(e);
++  assert.equal(evaluateDockerRaceEvidence(e).ok, false);
++});
++
++test('B04-QA-03 缺少 timeNano 失败', () => {
++  const e = base();
++  e.events.find((x) => x.action === 'die').timeNano = null;
++  sync(e);
++  assert.equal(evaluateDockerRaceEvidence(e).ok, false);
++});
++
++test('B04-QA-03 时间戳逆序失败', () => {
++  const e = base();
++  e.events.find((x) => x.action === 'start').timeNano = ns(300);
++  sync(e);
++  assert.equal(evaluateDockerRaceEvidence(e).ok, false);
++});
++
++test('B04-QA-04 die 晚于取消确认失败', () => {
++  const e = base();
++  e.events.find((x) => x.action === 'die').timeNano = ns(850);
++  sync(e);
++  assert.equal(evaluateDockerRaceEvidence(e).ok, false);
++});
++
++test('B04-QA-04 create 早于屏障释放失败', () => {
++  const e = base();
++  e.events.find((x) => x.action === 'create').timeNano = ns(200);
++  sync(e);
++  assert.equal(evaluateDockerRaceEvidence(e).ok, false);
++});
++
++test('B04-QA-04 destroy 后仍有目标事件失败', () => {
++  const e = base();
++  e.events.push(ev('start', 750));
++  sync(e);
++  assert.equal(evaluateDockerRaceEvidence(e).ok, false);
++});
++
++test('B04-QA-05 原始 JSONL 解析失败 FAIL', () => {
++  const e = base();
++  e.eventsRaw = 'not json';
++  assert.equal(evaluateDockerRaceEvidence(e).ok, false);
++});
++
++test('B04-QA-05 events 查询失败 FAIL', () => {
++  const e = base();
++  e.eventsOk = false;
++  e.eventsError = 'ETIMEDOUT';
++  assert.equal(evaluateDockerRaceEvidence(e).ok, false);
++});
