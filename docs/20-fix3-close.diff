@@ -1,0 +1,2138 @@
+diff --git a/orchestrator/darwin/approval-signer.swift b/orchestrator/darwin/approval-signer.swift
+index e09b262..6d0be40 100644
+--- a/orchestrator/darwin/approval-signer.swift
++++ b/orchestrator/darwin/approval-signer.swift
+@@ -1,102 +1,159 @@
+-// JARVIS 审批签名器（FIX3-A）
+-// 私钥存放在登录钥匙串，访问控制要求「用户在场」（Touch ID / 密码），不可导出。
++// JARVIS 审批签名器（FIX3-CLOSE / B 方案）
++//
++// 私钥由 Secure Enclave 持有，不进入进程内存、不可导出；
++// 持久化的是 427-byte 的 wrapped key blob（不是原始私钥）。
++// 每次签名由 LocalAuthentication .userPresence 要求用户在场。
++//
+ // 用法：
+-//   jarvis-auth keygen                 生成密钥对，输出 DER(SPKI) 公钥的 base64
+-//   jarvis-auth sign <payload-file>    用私钥签名文件内容的 SHA-256，输出 DER 签名 base64
+-//   jarvis-auth pubkey                 输出公钥 base64
++//   jarvis-auth keygen [--dir <dir>] [--force]
++//   jarvis-auth sign <payload-file> [reason] [--key <blob>]
++//   jarvis-auth pubkey [--key <blob>] [--pub <pubkey.der>]
++//
++// 默认目录：$HOME/.openclaw/jarvis/auth
++// 默认文件：approval.sekey (0600), pubkey.der (SPKI DER)
+ import Foundation
++import CryptoKit
+ import Security
+ import LocalAuthentication
+ 
+-let tag = "com.jarvis.approval.signing".data(using: .utf8)!
++let spkiPrefix = Data([
++    0x30, 0x59, 0x30, 0x13, 0x06, 0x07, 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x02, 0x01,
++    0x06, 0x08, 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x03, 0x01, 0x07, 0x03, 0x42, 0x00, 0x04
++])
+ 
+-func fail(_ msg: String) -> Never {
+-    FileHandle.standardError.write((msg + "\n").data(using: .utf8)!)
+-    exit(1)
++func fail(_ message: String, code: Int32 = 1) -> Never {
++    FileHandle.standardError.write((message + "\n").data(using: .utf8)!)
++    exit(code)
+ }
+ 
+-func base64(_ d: Data) -> String { d.base64EncodedString() }
++func homeDirectory() -> String {
++    ProcessInfo.processInfo.environment["HOME"] ?? NSHomeDirectory()
++}
+ 
+-// P-256 SPKI 前缀
+-let spkiPrefix = Data([
+-    0x30, 0x59, 0x30, 0x13, 0x06, 0x07, 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x02, 0x01,
+-    0x06, 0x08, 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x03, 0x01, 0x07, 0x03, 0x42, 0x00
+-])
++func defaultAuthDirectory() -> String {
++    (homeDirectory() as NSString).appendingPathComponent(".openclaw/jarvis/auth")
++}
+ 
+-func loadPrivateKey(prompt: String) -> SecKey? {
+-    let ctx = LAContext()
+-    ctx.localizedReason = prompt
+-    let q: [String: Any] = [
+-        kSecClass as String: kSecClassKey,
+-        kSecAttrApplicationTag as String: tag,
+-        kSecAttrKeyType as String: kSecAttrKeyTypeECSECPrimeRandom,
+-        kSecReturnRef as String: true,
+-        kSecUseAuthenticationContext as String: ctx,
+-        kSecMatchLimit as String: kSecMatchLimitOne
+-    ]
+-    var item: CFTypeRef?
+-    let st = SecItemCopyMatching(q as CFDictionary, &item)
+-    if st != errSecSuccess { return nil }
+-    return (item as! SecKey)
++func ensureDirectory(_ path: String) throws {
++    try FileManager.default.createDirectory(
++        at: URL(fileURLWithPath: path),
++        withIntermediateDirectories: true,
++        attributes: [.posixPermissions: 0o700]
++    )
+ }
+ 
+-func publicKeyB64(_ key: SecKey) -> String? {
+-    guard let pub = SecKeyCopyPublicKey(key),
+-          let ext = SecKeyCopyExternalRepresentation(pub, nil) as Data? else { return nil }
+-    return base64(spkiPrefix + ext)
++func writePrivateFile(_ data: Data, to path: String) throws {
++    try ensureDirectory((path as NSString).deletingLastPathComponent)
++    try data.write(to: URL(fileURLWithPath: path), options: [.atomic])
++    try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: path)
+ }
+ 
+-let args = CommandLine.arguments
+-guard args.count >= 2 else { fail("用法: jarvis-auth keygen|sign <file>|pubkey") }
++func writePublicFile(_ data: Data, to path: String) throws {
++    try ensureDirectory((path as NSString).deletingLastPathComponent)
++    try data.write(to: URL(fileURLWithPath: path), options: [.atomic])
++    try FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: path)
++}
++
++func requirePrivateFilePermissions(_ path: String) {
++    guard let attrs = try? FileManager.default.attributesOfItem(atPath: path),
++          let number = attrs[.posixPermissions] as? NSNumber else {
++        fail("无法读取密钥文件权限: \(path)")
++    }
++    if number.intValue & 0o077 != 0 {
++        fail("密钥文件权限过宽（必须为 0600）: \(path)", code: 2)
++    }
++}
++
++func publicKeySPKI(_ key: SecureEnclave.P256.Signing.PrivateKey) -> Data {
++    spkiPrefix + key.publicKey.rawRepresentation
++}
+ 
+-switch args[1] {
++func makeAccessControl() -> SecAccessControl {
++    var error: Unmanaged<CFError>?
++    guard let access = SecAccessControlCreateWithFlags(
++        nil,
++        kSecAttrAccessibleWhenUnlockedThisDeviceOnly,
++        [.userPresence, .privateKeyUsage],
++        &error
++    ) else {
++        fail("无法创建访问控制: \(String(describing: error?.takeRetainedValue()))")
++    }
++    return access
++}
++
++var args = Array(CommandLine.arguments.dropFirst())
++guard let command = args.first else {
++    fail("usage: jarvis-auth keygen|sign|pubkey")
++}
++args.removeFirst()
++
++func takeOption(_ name: String) -> String? {
++    guard let index = args.firstIndex(of: name), index + 1 < args.count else { return nil }
++    let value = args[index + 1]
++    args.removeSubrange(index...(index + 1))
++    return value
++}
++
++let explicitDirectory = takeOption("--dir")
++let explicitKey = takeOption("--key")
++let explicitPub = takeOption("--pub")
++let force = args.contains("--force")
++args.removeAll { $0 == "--force" }
++
++let directory = explicitDirectory ?? defaultAuthDirectory()
++let keyPath = explicitKey ?? (directory as NSString).appendingPathComponent("approval.sekey")
++let keyDirectory = (keyPath as NSString).deletingLastPathComponent
++let pubPath = explicitPub ?? (keyDirectory as NSString).appendingPathComponent("pubkey.der")
++
++switch command {
+ case "keygen":
+-    var err: Unmanaged<CFError>?
+-    guard let ac = SecAccessControlCreateWithFlags(
+-        nil, kSecAttrAccessibleWhenUnlockedThisDeviceOnly, .userPresence, &err
+-    ) else { fail("无法创建访问控制") }
+-
+-    let priv: [String: Any] = [
+-        kSecAttrIsPermanent as String: true,
+-        kSecAttrApplicationTag as String: tag,
+-        kSecAttrAccessControl as String: ac
+-    ]
+-    let attrs: [String: Any] = [
+-        kSecAttrKeyType as String: kSecAttrKeyTypeECSECPrimeRandom,
+-        kSecAttrKeySizeInBits as String: 256,
+-        kSecPrivateKeyAttrs as String: priv
+-    ]
+-    guard let key = SecKeyCreateRandomKey(attrs as CFDictionary, &err) else {
+-        fail("生成密钥失败: \(err?.takeRetainedValue() as Error? as Any)")
++    guard SecureEnclave.isAvailable else {
++        fail("当前机器不支持 Secure Enclave，拒绝生成普通软件密钥")
++    }
++    if FileManager.default.fileExists(atPath: keyPath) && !force {
++        fail("密钥已存在，拒绝覆盖: \(keyPath)（如确认轮换，使用 --force）")
++    }
++    do {
++        let key = try SecureEnclave.P256.Signing.PrivateKey(accessControl: makeAccessControl())
++        try writePrivateFile(key.dataRepresentation, to: keyPath)
++        let spki = publicKeySPKI(key)
++        try writePublicFile(spki, to: pubPath)
++        print(spki.base64EncodedString())
++    } catch {
++        fail("生成 Secure Enclave 密钥失败: \(error)")
+     }
+-    guard let pub = publicKeyB64(key) else { fail("导出公钥失败") }
+-    print(pub)
+ 
+ case "sign":
+-    guard args.count >= 3 else { fail("缺少 payload 文件") }
+-    let path = args[2]
+-    guard let data = FileManager.default.contents(atPath: path) else { fail("无法读取 payload") }
+-    let prompt = args.count >= 4 ? args[3] : "JARVIS 需要你确认一次高风险操作"
+-    guard let key = loadPrivateKey(prompt: prompt) else { fail("无法加载签名密钥（可能需要用户在场认证）") }
+-    var err: Unmanaged<CFError>?
+-    guard let sig = SecKeyCreateSignature(key, .ecdsaSignatureMessageX962SHA256, data as CFData, &err) else {
+-        fail("签名失败: \(err?.takeRetainedValue() as Error? as Any)")
++    guard let payloadPath = args.first else { fail("缺少 payload 文件") }
++    let reason = args.count > 1 ? args[1] : "JARVIS 需要你确认一次高风险操作"
++    requirePrivateFilePermissions(keyPath)
++    guard let blob = try? Data(contentsOf: URL(fileURLWithPath: keyPath)) else {
++        fail("无法读取 Secure Enclave 密钥 blob: \(keyPath)")
++    }
++    guard let payload = try? Data(contentsOf: URL(fileURLWithPath: payloadPath)) else {
++        fail("无法读取 payload: \(payloadPath)")
++    }
++    let context = LAContext()
++    context.localizedReason = reason
++    context.localizedCancelTitle = "拒绝"
++    context.localizedFallbackTitle = "使用密码"
++    do {
++        let key = try SecureEnclave.P256.Signing.PrivateKey(
++            dataRepresentation: blob,
++            authenticationContext: context
++        )
++        let signature = try key.signature(for: payload)
++        print(signature.derRepresentation.base64EncodedString())
++    } catch {
++        fail("签名失败（用户拒绝或认证不可用）: \(error)")
+     }
+-    print(base64(sig as Data))
+ 
+ case "pubkey":
+-    let q: [String: Any] = [
+-        kSecClass as String: kSecClassKey,
+-        kSecAttrApplicationTag as String: tag,
+-        kSecAttrKeyType as String: kSecAttrKeyTypeECSECPrimeRandom,
+-        kSecReturnRef as String: true,
+-        kSecMatchLimit as String: kSecMatchLimitOne
+-    ]
+-    var item: CFTypeRef?
+-    guard SecItemCopyMatching(q as CFDictionary, &item) == errSecSuccess else { fail("未找到密钥") }
+-    guard let pub = publicKeyB64(item as! SecKey) else { fail("导出公钥失败") }
+-    print(pub)
++    guard let der = try? Data(contentsOf: URL(fileURLWithPath: pubPath)) else {
++        fail("无法读取公钥文件: \(pubPath)（请先运行 keygen）")
++    }
++    print(der.base64EncodedString())
+ 
+ default:
+-    fail("未知子命令: \(args[1])")
++    fail("未知命令: \(command)")
+ }
+diff --git a/orchestrator/darwin/build-auth-signer.sh b/orchestrator/darwin/build-auth-signer.sh
+new file mode 100755
+index 0000000..1d54d5d
+--- /dev/null
++++ b/orchestrator/darwin/build-auth-signer.sh
+@@ -0,0 +1,12 @@
++#!/bin/sh
++# 构建/安装 JARVIS Secure Enclave 审批签名器。
++# 用法：orchestrator/darwin/build-auth-signer.sh [输出路径]
++# 默认安装到 ~/.openclaw/jarvis/bin/jarvis-auth
++set -eu
++
++DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
++OUT=${1:-"$HOME/.openclaw/jarvis/bin/jarvis-auth"}
++mkdir -p "$(dirname -- "$OUT")"
++swiftc -O "$DIR/approval-signer.swift" -o "$OUT"
++chmod 0755 "$OUT"
++echo "built: $OUT"
+diff --git a/orchestrator/scripts/verify-real-claude-e2e.mjs b/orchestrator/scripts/verify-real-claude-e2e.mjs
+new file mode 100644
+index 0000000..17b8607
+--- /dev/null
++++ b/orchestrator/scripts/verify-real-claude-e2e.mjs
+@@ -0,0 +1,165 @@
++#!/usr/bin/env node
++/**
++ * 真实 Docker + Claude Code + GLM 代理 + 真实 Secure Enclave 审批 的合法写入 E2E。
++ *
++ * 这是 AC-12 / E2E-03 的真实证据尝试；不使用模型替身。
++ * - 临时 HOME/JARVIS_HOME/仓库，不触碰生产仓库或 main
++ * - 临时 egress proxy 容器挂载临时 token 文件与生产 GLM key（只读）
++ * - 需要用户完成一次 Touch ID / 系统密码
++ *
++ * 用法：
++ *   JARVIS_E2E_HOME=/tmp/jarvis-real-e2e/home \
++ *   JARVIS_E2E_KEY_DIR=$HOME/.openclaw/jarvis/auth \
++ *   node orchestrator/scripts/verify-real-claude-e2e.mjs
++ */
++import { copyFileSync, chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
++import { homedir } from 'node:os';
++import { join } from 'node:path';
++import { execFileSync } from 'node:child_process';
++
++const REAL_HOME = homedir();
++const HOME_DIR = process.env.JARVIS_E2E_HOME || '/tmp/jarvis-real-e2e/home';
++const KEY_DIR = process.env.JARVIS_E2E_KEY_DIR || join(REAL_HOME, '.openclaw/jarvis/auth');
++const SIGNER = process.env.JARVIS_AUTH_SIGNER || join(REAL_HOME, '.openclaw/jarvis/bin/jarvis-auth');
++const DOCKER = process.env.JARVIS_DOCKER_BIN || '/Applications/Docker.app/Contents/Resources/bin/docker';
++const PROXY_IMAGE = process.env.JARVIS_PROXY_IMAGE || 'jarvis-egress-proxy:1';
++const EXECUTOR_IMAGE = process.env.JARVIS_EXECUTOR_IMAGE || 'jarvis-executor:2.1.104';
++const NETWORK = process.env.JARVIS_EXECUTOR_NETWORK || 'jarvis-internal';
++const GLM_KEY = process.env.JARVIS_GLM_KEY_FILE || join(REAL_HOME, '.openclaw/jarvis/proxy/glm.key');
++const PROXY_NAME = `jarvis-proxy-real-e2e-${Date.now().toString(36)}`;
++
++// HOME 被切到临时目录后，Docker CLI 会丢失 Docker Desktop context；显式固定 socket。
++process.env.DOCKER_HOST = process.env.DOCKER_HOST || `unix://${join(REAL_HOME, '.docker/run/docker.sock')}`;
++process.env.HOME = HOME_DIR;
++process.env.JARVIS_HOME = join(HOME_DIR, 'jarvis');
++process.env.JARVIS_DB = join(process.env.JARVIS_HOME, 'state.db');
++process.env.JARVIS_AUTH_SIGNER = SIGNER;
++process.env.JARVIS_PROXY_CONTAINER = PROXY_NAME;
++process.env.JARVIS_EXECUTOR_IMAGE = EXECUTOR_IMAGE;
++process.env.JARVIS_EXECUTOR_NETWORK = NETWORK;
++
++const authDir = join(HOME_DIR, '.openclaw/jarvis/auth');
++const runDir = join(process.env.JARVIS_HOME, 'run');
++const proxyDir = join(process.env.JARVIS_HOME, 'proxy');
++mkdirSync(authDir, { recursive: true });
++mkdirSync(runDir, { recursive: true });
++mkdirSync(proxyDir, { recursive: true });
++mkdirSync(join(HOME_DIR, '.claude'), { recursive: true });
++for (const [file, mode] of [['approval.sekey', 0o600], ['pubkey.der', 0o644]]) {
++  const src = join(KEY_DIR, file);
++  if (!existsSync(src)) throw new Error(`missing SE key file: ${src}`);
++  const dst = join(authDir, file);
++  copyFileSync(src, dst);
++  chmodSync(dst, mode);
++}
++writeFileSync(join(HOME_DIR, '.claude/settings.json'), JSON.stringify({
++  env: { ANTHROPIC_MODEL: process.env.JARVIS_E2E_MODEL || 'glm-5.3' }
++}));
++
++const tokenFile = join(proxyDir, 'active-tokens.json');
++writeFileSync(tokenFile, '{}', { mode: 0o600 });
++const proxyCmd = [
++  'run', '-d', '--rm', '--name', PROXY_NAME,
++  '--network', 'bridge',
++  '-v', `${tokenFile}:/run/secrets/model-tokens.json:ro`,
++  '-v', `${GLM_KEY}:/run/secrets/glm.key:ro`,
++  PROXY_IMAGE
++];
++execFileSync(DOCKER, proxyCmd, { encoding: 'utf8' });
++execFileSync(DOCKER, ['network', 'connect', NETWORK, PROXY_NAME], { encoding: 'utf8' });
++
++const cleanup = () => {
++  try { execFileSync(DOCKER, ['rm', '-f', PROXY_NAME], { stdio: 'ignore' }); } catch {}
++};
++process.on('exit', cleanup);
++
++const svc = await import('../src/service.mjs');
++const sec = await import('../src/security.mjs');
++
++try {
++  const project = svc.createProject({ name: 'Real Claude E2E', slug: `real-claude-${Date.now().toString(36)}` });
++  const repo = join(project.dir, 'repo');
++  mkdirSync(repo, { recursive: true });
++  const git = (...args) => execFileSync('git', ['-C', repo, ...args], { encoding: 'utf8' });
++  try { git('init', '-q'); } catch {}
++  writeFileSync(join(repo, 'README.md'), '# real claude e2e\n');
++  git('add', '-A');
++  git('-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-q', '-m', 'init');
++  const base = git('rev-parse', 'HEAD').trim();
++
++  const vpId = `vpr_real_${Date.now().toString(36)}`;
++  const verifyArgv = [
++    '-e',
++    'const fs=require("fs");const s=fs.readFileSync("feature.txt","utf8").trim();if(s!=="HELLO_FROM_JARVIS"){console.error("BAD:"+s);process.exit(1)};console.log("FEATURE_OK")'
++  ];
++  svc.db()
++    .prepare('INSERT INTO verify_profiles (id,project_id,name,program,argv,cwd,timeout_ms,created_by,created_at) VALUES (?,?,?,?,?,?,?,?,?)')
++    .run(vpId, project.id, 'feature-ok', 'node', JSON.stringify(verifyArgv), null, 300_000, 'e2e', new Date().toISOString());
++
++  const task = svc.createTask({
++    project: project.id,
++    title: '真实 Claude Code 合法写入',
++    input: 'Create a file named feature.txt in the current working directory. It must contain exactly one line: HELLO_FROM_JARVIS. Do not create or modify any other file.',
++    kind: 'executor',
++    executor: 'claude-code',
++    executorConfig: {
++      mode: 'acceptEdits',
++      repo: 'repo',
++      base_commit: base,
++      commit: true,
++      commit_paths: ['feature.txt'],
++      verify_profile_id: vpId,
++      timeout_ms: 600_000
++    }
++  });
++
++  const challenge = svc.createAuthChallenge(task.id);
++  const payloadPath = join(runDir, 'real-claude-payload.json');
++  writeFileSync(payloadPath, challenge.payload, { mode: 0o600 });
++  const signatureB64 = execFileSync(
++    SIGNER,
++    ['sign', payloadPath, challenge.reason.slice(0, 500)],
++    { encoding: 'utf8', timeout: 180_000 }
++  ).trim();
++  const verified = sec.verifyApprovalSignature({ payload: challenge.payload, signatureB64 });
++  if (!verified.ok) throw new Error(`signature verification failed: ${verified.error}`);
++  const issued = svc.issueApproval({
++    task: task.id,
++    proof: { nonce: challenge.nonce, payload: challenge.payload, signatureB64 }
++  });
++  if (!issued.ok) throw new Error(`approval issuance failed: ${issued.error}`);
++
++  const result = await svc.runTask(task.id);
++  const latest = svc.getTask(task.id);
++  const approval = svc.db().prepare('SELECT * FROM approvals WHERE task_id=?').get(task.id);
++  const execution = svc.db().prepare('SELECT * FROM executions WHERE id=?').get(result.execution);
++  let refSha = null;
++  try {
++    refSha = execFileSync('git', ['-C', repo, 'rev-parse', `refs/heads/jarvis/${task.id}`], { encoding: 'utf8' }).trim();
++  } catch {}
++  const changed = result.evidence?.worktree?.changed ?? [];
++
++  const evidence = {
++    task: task.id,
++    approvalId: approval?.id,
++    approvalExecutionId: approval?.execution_id,
++    executionId: result.execution,
++    executionStatus: execution?.status,
++    taskStatus: latest.status,
++    commitSha: result.commit?.sha ?? null,
++    ref: result.commit?.ref ?? null,
++    refVerified: result.commit?.refVerified ?? false,
++    refMatchesCommit: Boolean(refSha && refSha === result.commit?.sha),
++    verdict: result.verdict?.status ?? null,
++    reasons: result.verdict?.reasons ?? [],
++    changed,
++    verify: result.verify ?? null,
++    executorText: (result.text ?? '').slice(0, 500)
++  };
++  console.log(JSON.stringify(evidence, null, 2));
++  if (latest.status !== 'done' || result.verdict?.status !== 'done' || !result.commit?.sha || !result.commit?.refVerified) {
++    process.exit(1);
++  }
++} finally {
++  cleanup();
++}
+diff --git a/orchestrator/scripts/verify-se-approval-e2e.mjs b/orchestrator/scripts/verify-se-approval-e2e.mjs
+new file mode 100644
+index 0000000..9d30f97
+--- /dev/null
++++ b/orchestrator/scripts/verify-se-approval-e2e.mjs
+@@ -0,0 +1,151 @@
++#!/usr/bin/env node
++/**
++ * 真实 macOS Secure Enclave 审批 + 合法 Git 写入 E2E。
++ *
++ * 需要：
++ *   - 已构建的 jarvis-auth（默认 /tmp/jarvis-auth-build/jarvis-auth）
++ *   - 已生成的 approval.sekey + pubkey.der（默认 /tmp/jarvis-auth-e2e/home）
++ *   - 用户本人完成 Touch ID / 系统密码
++ *
++ * 说明：Docker/Claude Code 容器在本脚本中用受控替身完成文件修改，
++ * Git commit / ref 验证 / Task 状态是真实的。真实容器的隔离由
++ * docker-fault / FIX3-D 测试和本机 Docker 证据单独覆盖。
++ *
++ * 用法：
++ *   JARVIS_E2E_HOME=/tmp/jarvis-auth-e2e/home \
++ *   JARVIS_AUTH_SIGNER=/tmp/jarvis-auth-build/jarvis-auth \
++ *   node orchestrator/scripts/verify-se-approval-e2e.mjs
++ */
++import { mkdirSync, writeFileSync } from 'node:fs';
++import { join } from 'node:path';
++import { execFileSync } from 'node:child_process';
++
++const HOME_DIR = process.env.JARVIS_E2E_HOME || '/tmp/jarvis-auth-e2e/home';
++const SIGNER = process.env.JARVIS_AUTH_SIGNER || '/tmp/jarvis-auth-build/jarvis-auth';
++process.env.HOME = HOME_DIR;
++process.env.JARVIS_HOME = join(HOME_DIR, 'jarvis');
++process.env.JARVIS_DB = join(process.env.JARVIS_HOME, 'state.db');
++process.env.JARVIS_AUTH_SIGNER = SIGNER;
++
++const svc = await import('../src/service.mjs');
++const sec = await import('../src/security.mjs');
++
++const repo = join(HOME_DIR, 'e2e-repo');
++mkdirSync(repo, { recursive: true });
++mkdirSync(join(HOME_DIR, '.claude'), { recursive: true });
++writeFileSync(join(HOME_DIR, '.claude/settings.json'), JSON.stringify({ env: { ANTHROPIC_MODEL: 'test-model' } }));
++const git = (...args) => execFileSync('git', ['-C', repo, ...args], { encoding: 'utf8' });
++try { git('init', '-q'); } catch {}
++writeFileSync(join(repo, 'a.txt'), 'base\n');
++git('add', '-A');
++git('-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-q', '-m', 'init');
++const head = git('rev-parse', 'HEAD').trim();
++
++const project = svc.createProject({ name: 'SE legal E2E', slug: `se-legal-${Date.now().toString(36)}` });
++const workRepo = join(project.dir, 'repo');
++mkdirSync(workRepo, { recursive: true });
++const wg = (...args) => execFileSync('git', ['-C', workRepo, ...args], { encoding: 'utf8' });
++try { wg('init', '-q'); } catch {}
++writeFileSync(join(workRepo, 'a.txt'), 'base\n');
++wg('add', '-A');
++wg('-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-q', '-m', 'init');
++const base = wg('rev-parse', 'HEAD').trim();
++
++// 校验配置属于可信登记数据；本脚本直接落库作为测试准备，登记边界由
++// createVerifyProfile 的签名测试单独覆盖。
++const vpId = `vpr_e2e_${Date.now().toString(36)}`;
++svc.db()
++  .prepare('INSERT INTO verify_profiles (id,project_id,name,program,argv,cwd,timeout_ms,created_by,created_at) VALUES (?,?,?,?,?,?,?,?,?)')
++  .run(vpId, project.id, 'node-ok', process.execPath, '[]', null, 300_000, 'e2e', new Date().toISOString());
++
++const task = svc.createTask({
++  project: project.id,
++  title: 'SE 真实审批 + 合法提交',
++  input: '写入 feature.txt 并提交',
++  kind: 'executor',
++  executor: 'claude-code',
++  executorConfig: {
++    mode: 'acceptEdits',
++    repo: 'repo',
++    base_commit: base,
++    commit: true,
++    commit_paths: ['feature.txt'],
++    verify_profile_id: vpId
++  }
++});
++
++const challenge = svc.createAuthChallenge(task.id);
++const payloadPath = join(process.env.JARVIS_HOME, 'run', 'se-legal-payload.json');
++mkdirSync(join(process.env.JARVIS_HOME, 'run'), { recursive: true });
++writeFileSync(payloadPath, challenge.payload, { mode: 0o600 });
++
++const signatureB64 = execFileSync(
++  SIGNER,
++  ['sign', payloadPath, challenge.reason.slice(0, 500)],
++  { encoding: 'utf8', timeout: 180_000 }
++).trim();
++const verified = sec.verifyApprovalSignature({ payload: challenge.payload, signatureB64 });
++if (!verified.ok) {
++  console.error(`signature verification failed: ${verified.error}`);
++  process.exit(1);
++}
++const issued = svc.issueApproval({
++  task: task.id,
++  proof: { nonce: challenge.nonce, payload: challenge.payload, signatureB64 }
++});
++if (!issued.ok) {
++  console.error(`approval issuance failed: ${issued.error}`);
++  process.exit(1);
++}
++
++const fakeIsolation = {
++  isolationStatus: async () => ({ available: true, backend: 'fake-e2e', image: 'fake-e2e', network: 'fake-e2e', networkInternal: true }),
++  egressProxyUrl: async () => 'http://127.0.0.1:9',
++  runClaudeIsolated: async ({ workdir }) => {
++    writeFileSync(join(workdir, 'feature.txt'), 'generated by controlled executor\n');
++    return { ok: true, exitCode: 0, text: 'controlled executor ok', isolated: true, network: 'fake-e2e', image: 'fake-e2e', raw: '' };
++  },
++  runInWorkdir: async () => ({ ok: true, exitCode: 0, output: 'verify ok' })
++};
++
++const result = await svc.runTask(task.id, { isolation: fakeIsolation });
++const latest = svc.getTask(task.id);
++const approval = svc.db().prepare('SELECT * FROM approvals WHERE task_id=?').get(task.id);
++const execution = svc.db().prepare('SELECT * FROM executions WHERE id=?').get(result.execution);
++const refSha = execFileSync('git', ['-C', workRepo, 'rev-parse', `refs/heads/jarvis/${task.id}`], { encoding: 'utf8' }).trim();
++
++const evidence = {
++  task: task.id,
++  approvalId: approval?.id,
++  approvalExecutionId: approval?.execution_id,
++  executionId: result.execution,
++  executionStatus: execution?.status,
++  taskStatus: latest.status,
++  commitSha: result.commit?.sha ?? null,
++  ref: result.commit?.ref ?? null,
++  refVerified: result.commit?.refVerified ?? false,
++  refMatchesCommit: refSha === result.commit?.sha,
++  verdict: result.verdict?.status ?? null,
++  reasons: result.verdict?.reasons ?? [],
++  tokenFileEmpty: ['proxy/active-tokens.json'].every((p) => {
++    try {
++      const raw = execFileSync('cat', [join(process.env.JARVIS_HOME, p)], { encoding: 'utf8' });
++      return raw.trim() === '{}';
++    } catch {
++      return true;
++    }
++  })
++};
++console.log(JSON.stringify(evidence, null, 2));
++
++if (
++  latest.status !== 'done' ||
++  result.verdict?.status !== 'done' ||
++  !result.commit?.sha ||
++  !result.commit?.refVerified ||
++  refSha !== result.commit.sha ||
++  approval?.execution_id !== result.execution ||
++  execution?.status !== 'ok'
++) {
++  process.exit(1);
++}
+diff --git a/orchestrator/src/cli.mjs b/orchestrator/src/cli.mjs
+index bdbf79d..778a18f 100644
+--- a/orchestrator/src/cli.mjs
++++ b/orchestrator/src/cli.mjs
+@@ -5,7 +5,7 @@
+  */
+ import * as svc from './service.mjs';
+ import * as oc from './oc.mjs';
+-import { verifyApprovalSignature, signWithOsKey } from './security.mjs';
++import { signWithOsKey } from './security.mjs';
+ import { hostname } from 'node:os';
+ 
+ const argv = process.argv.slice(2);
+@@ -219,57 +219,57 @@ async function main() {
+ 
+       /* 管理员入口（本地可信）：签名审批 + 校验配置登记 */
+       case 'verify-profile:add': {
++        const timeoutMs = opt.timeout ? Number(opt.timeout) : 300_000;
+         const content = {
+           kind: 'verify_profile',
+           project: require_('project'),
+           name: require_('name'),
+           program: require_('program'),
+           argv: opt.argv ? JSON.parse(opt.argv) : [],
+-          cwd: opt.cwd ?? null
++          cwd: opt.cwd ?? null,
++          timeout_ms: timeoutMs
+         };
+         const challenge = svc.createContentChallenge(content);
+         const signed = await signWithOsKey({ payload: challenge.payload, reason: `登记可信校验配置 ${content.name}` });
+         if (!signed.ok) fail(`无法获得可信用户签名（${signed.error}），拒绝登记`);
+-        const verified = verifyApprovalSignature({ payload: challenge.payload, signatureB64: signed.signature });
+-        if (!verified.ok) fail(`签名校验失败：${verified.error}`);
+-        if (!svc.consumeContentChallenge(challenge.nonce, challenge.digest)) fail('挑战无效或已被使用');
+         print(svc.createVerifyProfile({
+           project: content.project,
+           name: content.name,
+           program: content.program,
+           argv: content.argv,
+           cwd: content.cwd ?? undefined,
+-          timeoutMs: opt.timeout ? Number(opt.timeout) : undefined
++          timeoutMs,
++          proof: {
++            nonce: challenge.nonce,
++            payload: challenge.payload,
++            signatureB64: signed.signature
++          }
+         }));
+         break;
+       }
+       case 'approve:': {
+-        // FIX3-A：一次性挑战 + OS 密钥签名 + 服务端独立验签
++        // FIX3-CLOSE：一次性挑战 + OS 密钥签名；服务层强制验签并原子消耗挑战。
+         const taskRef = require_('task');
+         const challenge = svc.createAuthChallenge(taskRef);
+         const signed = await signWithOsKey({
+           payload: challenge.payload,
+-          reason: challenge.reason.slice(0, 180)
++          reason: challenge.reason.slice(0, 500)
+         });
+         if (!signed.ok) {
+           fail(`无法获得可信用户签名（${signed.error}）。高风险授权保持拒绝。`);
+         }
+-        const verified = verifyApprovalSignature({
+-          payload: challenge.payload,
+-          signatureB64: signed.signature
+-        });
+-        if (!verified.ok) {
+-          fail(`审批签名校验失败：${verified.error}`);
+-        }
+-        if (!svc.consumeAuthChallenge(challenge.nonce, challenge.task_id, challenge.digest)) {
+-          fail('审批挑战无效或已被使用');
+-        }
+-        print(svc.issueApproval({
++        const issued = svc.issueApproval({
+           task: taskRef,
+           ttlHours: opt.ttl ? Number(opt.ttl) : 24,
+           issuedBy: `os-signature:uid=${process.getuid?.() ?? 'unknown'}@${hostname()}`,
+-          auth: { method: 'os-signature', nonce: challenge.nonce }
+-        }));
++          proof: {
++            nonce: challenge.nonce,
++            payload: challenge.payload,
++            signatureB64: signed.signature
++          }
++        });
++        if (!issued.ok) fail(`审批签发失败：${issued.error}`);
++        print(issued);
+         break;
+       }
+       case 'approval:list':
+diff --git a/orchestrator/src/db.mjs b/orchestrator/src/db.mjs
+index 82c2b7d..89a52e1 100644
+--- a/orchestrator/src/db.mjs
++++ b/orchestrator/src/db.mjs
+@@ -121,7 +121,8 @@ CREATE TABLE IF NOT EXISTS approvals (
+   issued_at   TEXT NOT NULL,
+   expires_at  TEXT NOT NULL,
+   revoked_at  TEXT,
+-  used_at     TEXT
++  used_at     TEXT,
++  execution_id TEXT
+ );
+ 
+ CREATE INDEX IF NOT EXISTS idx_approvals_task ON approvals(task_id, digest);
+@@ -185,6 +186,11 @@ function migrate(db) {
+   if (!hasColumn(db, 'tasks', 'commit_paths')) {
+     db.exec("ALTER TABLE tasks ADD COLUMN commit_paths TEXT NOT NULL DEFAULT '[]'");
+   }
++  // FIX3-CLOSE PRE-A01：记录审批由哪个 Execution 原子取得。
++  if (!hasColumn(db, 'approvals', 'execution_id')) {
++    db.exec('ALTER TABLE approvals ADD COLUMN execution_id TEXT');
++  }
++  db.exec('CREATE INDEX IF NOT EXISTS idx_approvals_exec ON approvals(execution_id)');
+ }
+ 
+ export function openDatabase(path) {
+diff --git a/orchestrator/src/security.mjs b/orchestrator/src/security.mjs
+index 7e9b9ce..6cf8811 100644
+--- a/orchestrator/src/security.mjs
++++ b/orchestrator/src/security.mjs
+@@ -34,6 +34,15 @@ export function sha256(text) {
+  * 任何一项变化都会导致摘要不同 → 旧审批自动失效（AC-03）。
+  */
+ export function taskDigest(task, resolved) {
++  const profile = resolved.profile ?? null;
++  const verifyProfileSha = profile
++    ? sha256(canonicalJson({
++        program: profile.program,
++        argv: profile.argv,
++        cwd: profile.cwd ?? null,
++        timeout_ms: profile.timeout_ms ?? null
++      }))
++    : null;
+   return sha256(
+     canonicalJson({
+       task_id: task.id,
+@@ -44,6 +53,7 @@ export function taskDigest(task, resolved) {
+       repo: resolved.repo ?? null,
+       base_commit: resolved.baseCommit ?? null,
+       verify_profile_id: resolved.verifyProfileId ?? null,
++      verify_profile_sha: verifyProfileSha,
+       commit: Boolean(resolved.commit),
+       commit_paths: [...(resolved.commitPaths ?? [])].sort(),
+       input_sha: sha256(String(task.input ?? ''))
+diff --git a/orchestrator/src/service.mjs b/orchestrator/src/service.mjs
+index 948384f..dd26b35 100644
+--- a/orchestrator/src/service.mjs
++++ b/orchestrator/src/service.mjs
+@@ -326,7 +326,7 @@ export function approveTask(ref) {
+  * 执行任务：调用被指派 Agent，记录执行证据。
+  * 不吞错误、不伪造结果。
+  */
+-export async function runTask(ref) {
++export async function runTask(ref, deps = {}) {
+   const task = getTask(ref);
+   const project = getProject(task.project_id);
+   if (project.status === 'paused') {
+@@ -349,7 +349,7 @@ export async function runTask(ref) {
+     return { ok: false, blocked: 'max_attempts', error: '超过最大重试次数' };
+   }
+   if (task.kind === 'executor') {
+-    return runExecutorTask(task, project);
++    return runExecutorTask(task, project, deps);
+   }
+   if (task.kind === 'audit') {
+     return runAuditTask(task, project);
+@@ -499,6 +499,26 @@ export function findValidApproval(taskId, digest) {
+   return { valid: true, approval: row };
+ }
+ 
++/**
++ * PRE-A01：某个 Execution 已经取得的审批。
++ * 只认 execution_id 精确匹配、used_at 已写入、未撤销、未过期的记录；
++ * 新 Execution 不能用 findValidApproval() 复用旧审批。
++ */
++export function findApprovalForExecution(taskId, digest, executionId) {
++  if (!executionId) return { valid: false, reason: '缺少执行标识，无法确认审批归属' };
++  const row = db()
++    .prepare(`SELECT * FROM approvals
++              WHERE task_id = ? AND digest = ? AND execution_id = ?
++                AND used_at IS NOT NULL AND revoked_at IS NULL
++              ORDER BY issued_at DESC LIMIT 1`)
++    .get(taskId, digest, executionId);
++  if (!row) return { valid: false, reason: '当前 Execution 没有取得与该任务参数匹配的审批' };
++  if (new Date(row.expires_at).getTime() < Date.now()) {
++    return { valid: false, reason: '审批已过期' };
++  }
++  return { valid: true, approval: row };
++}
++
+ /**
+  * 签发审批——只能由本地管理员入口调用（CLI）。
+  * MCP 不暴露此能力（AC-02）。
+@@ -538,33 +558,132 @@ export function approvalPreview(taskRef) {
+   return { task_id: task.id, digest: r.digest, reason, scope };
+ }
+ 
+-export function issueApproval({ task: taskRef, ttlHours = 24, issuedBy = 'local-operator', auth = null }) {
++/**
++ * PRE-A02/A03：验证签名证明，并返回签名字节与载荷。
++ * 不接受调用方自报的 verified/auth 字段；只认固定公钥的真实验签结果。
++ */
++function parseSignedProof(proof) {
++  if (!proof || !proof.nonce || !proof.payload || !proof.signatureB64) {
++    return { ok: false, error: '缺少可信签名证明（nonce / payload / signature）' };
++  }
++  const payload = Buffer.isBuffer(proof.payload)
++    ? proof.payload
++    : Buffer.from(String(proof.payload), 'utf8');
++  const signatureB64 = String(proof.signatureB64).trim();
++  const verified = verifyApprovalSignature({ payload, signatureB64 });
++  if (!verified.ok) return { ok: false, error: `签名校验失败：${verified.error}` };
++
++  let claims;
++  try {
++    claims = JSON.parse(payload.toString('utf8'));
++  } catch {
++    return { ok: false, error: '签名载荷不是合法 JSON' };
++  }
++  if (!claims || typeof claims !== 'object' || Array.isArray(claims)) {
++    return { ok: false, error: '签名载荷必须是 JSON 对象' };
++  }
++  if (claims.nonce !== proof.nonce) {
++    return { ok: false, error: '签名载荷 nonce 与证明不一致' };
++  }
++  return { ok: true, payload, claims };
++}
++
++/**
++ * 签发审批——只能由本地管理员入口调用（CLI）。
++ * MCP 不暴露此能力（AC-02）。
++ *
++ * PRE-A02：必须提供真实签名证明；auth=null / verified=true 等自报字段不再被接受。
++ * PRE-A03：签名载荷的 task_id / digest / nonce / expires_at 必须与当前挑战和
++ * 当前任务参数一致；验签、挑战消耗、审批写入在同一事务内完成。
++ */
++export function issueApproval({ task: taskRef, ttlHours = 24, issuedBy = 'local-operator', proof } = {}) {
++  const parsed = parseSignedProof(proof);
++  if (!parsed.ok) return { ok: false, error: parsed.error };
++
+   const task = getTask(taskRef);
+   const project = getProject(task.project_id);
+   const plan = resolveExecutorPlan(task, project);
+   if (!plan.ok) return { ok: false, error: `${plan.blocked}: ${plan.error}` };
+   const { resolved } = plan;
+ 
++  if (parsed.claims.task_id !== task.id) {
++    return { ok: false, error: '签名载荷的任务与当前任务不一致，拒绝签发' };
++  }
++  if (parsed.claims.digest !== resolved.digest) {
++    return { ok: false, error: '签名载荷与任务当前参数摘要不一致（参数可能已变化），拒绝签发' };
++  }
++
++  const nonceRow = db().prepare('SELECT * FROM auth_nonces WHERE nonce=?').get(proof.nonce);
++  if (!nonceRow) return { ok: false, error: '审批挑战不存在或已被使用' };
++  if (nonceRow.task_id !== task.id) return { ok: false, error: '审批挑战不属于当前任务' };
++  if (nonceRow.digest !== parsed.claims.digest) return { ok: false, error: '审批挑战摘要与签名载荷不一致' };
++  if (nonceRow.used_at) return { ok: false, error: '审批挑战已被使用' };
++  if (Date.parse(nonceRow.expires_at) <= Date.now()) return { ok: false, error: '审批挑战已过期' };
++  if (parsed.claims.expires_at !== nonceRow.expires_at) {
++    return { ok: false, error: '签名载荷有效期与审批挑战不一致' };
++  }
++
+   const id = newId('apv');
+   const issued = now();
+-  const expires = new Date(Date.now() + ttlHours * 3600_000).toISOString();
++  const expires = new Date(Date.now() + Number(ttlHours) * 3600_000).toISOString();
+   const operator = operatorIdentity();
+-  const scope = {
+-    _operator: { method: operator.method, uid: operator.uid, host: operator.host },
+-    _auth: auth ? { method: 'macos-localauth', code: auth.code } : null,
+-    project: project.slug,
+-    executor: task.executor,
+-    mode: resolved.mode,
+-    cwd: resolved.cwd,
+-    verify_profile: resolved.verifyProfileId,
+-    commit: resolved.commit,
+-    commit_paths: resolved.commitPaths
+-  };
+-  db()
+-    .prepare('INSERT INTO approvals (id,task_id,digest,scope,issued_by,issued_at,expires_at) VALUES (?,?,?,?,?,?,?)')
+-    .run(id, task.id, resolved.digest, JSON.stringify(scope), issuedBy, issued, expires);
+-  event('approval.issued', project.id, { task: task.id, scope });
+-  return { ok: true, approval: { id, task: task.id, digest: resolved.digest, scope, expires_at: expires } };
++
++  db().exec('BEGIN IMMEDIATE');
++  try {
++    // 事务内重新解析当前任务，防止验签后、写入前参数发生变化。
++    const currentTask = getTask(taskRef);
++    const currentProject = getProject(currentTask.project_id);
++    const currentPlan = resolveExecutorPlan(currentTask, currentProject);
++    if (!currentPlan.ok || currentPlan.resolved.digest !== parsed.claims.digest) {
++      db().exec('ROLLBACK');
++      return { ok: false, error: '签名后任务参数发生变化，拒绝签发审批' };
++    }
++    const currentNonce = db().prepare('SELECT * FROM auth_nonces WHERE nonce=?').get(proof.nonce);
++    if (
++      !currentNonce ||
++      currentNonce.used_at ||
++      currentNonce.task_id !== currentTask.id ||
++      currentNonce.digest !== parsed.claims.digest ||
++      currentNonce.expires_at !== parsed.claims.expires_at ||
++      Date.parse(currentNonce.expires_at) <= Date.now()
++    ) {
++      db().exec('ROLLBACK');
++      return { ok: false, error: '审批挑战无效、已过期或已被使用' };
++    }
++    const consumed = db()
++      .prepare("UPDATE auth_nonces SET used_at=? WHERE nonce=? AND task_id=? AND digest=? AND used_at IS NULL AND expires_at > ?")
++      .run(now(), proof.nonce, currentTask.id, parsed.claims.digest, now());
++    if (consumed.changes !== 1) {
++      db().exec('ROLLBACK');
++      return { ok: false, error: '审批挑战已被并发使用' };
++    }
++
++    const scope = {
++      _operator: { method: operator.method, uid: operator.uid, host: operator.host },
++      _auth: { method: 'os-signature', nonce: proof.nonce },
++      project: currentProject.slug,
++      executor: currentTask.executor,
++      mode: currentPlan.resolved.mode,
++      cwd: currentPlan.resolved.cwd,
++      repo: currentPlan.resolved.repo,
++      base_commit: currentPlan.resolved.baseCommit,
++      verify_profile: currentPlan.resolved.verifyProfileId,
++      commit: currentPlan.resolved.commit,
++      commit_paths: currentPlan.resolved.commitPaths
++    };
++    db()
++      .prepare('INSERT INTO approvals (id,task_id,digest,scope,issued_by,issued_at,expires_at) VALUES (?,?,?,?,?,?,?)')
++      .run(id, currentTask.id, parsed.claims.digest, JSON.stringify(scope), issuedBy, issued, expires);
++    db().exec('COMMIT');
++    event('approval.issued', currentProject.id, { task: currentTask.id, scope });
++    return {
++      ok: true,
++      approval: { id, task: currentTask.id, digest: parsed.claims.digest, scope, expires_at: expires }
++    };
++  } catch (e) {
++    try { db().exec('ROLLBACK'); } catch {}
++    throw e;
++  }
+ }
+ 
+ export function listApprovals(taskRef) {
+@@ -632,7 +751,10 @@ function writeCredentialFile(execId, proxyUrl, modelToken) {
+  * 外部执行器任务（FIX1）：
+  * 授权 → 隔离工作树 → 容器内执行 → 容器内校验 → 范围检查 → 提交 → 裁决 → 证据
+  */
+-async function runExecutorTask(task, project) {
++async function runExecutorTask(task, project, deps = {}) {
++  const executor = deps.executor ?? ex;
++  const isolation = deps.isolation ?? iso;
++
+   // DEF-CI-01：并发保护必须先于环境探测。任务已在运行时，不能因为
+   // Docker / 执行镜像不可用而返回 isolation_unavailable（CI 无执行镜像时
+   // 会掩盖 already_running，导致同一任务并发启动的语义不稳定）。
+@@ -663,7 +785,7 @@ async function runExecutorTask(task, project) {
+     }
+   }
+ 
+-  const st = await iso.isolationStatus();
++  const st = await isolation.isolationStatus();
+   if (!st.available) {
+     recordAttempt({ task, project, phase: 'isolation', status: 'rejected', blocked: 'isolation_unavailable', reason: st.reason, plan: resolved });
+     updateTask(task.id, { status: 'failed', error: `隔离不可用：${st.reason}` });
+@@ -678,8 +800,10 @@ async function runExecutorTask(task, project) {
+   }
+ 
+   // FIX3-B：授权检查 + 状态抢占 + 一次性授权消耗，必须在同一事务内完成。
+-  // 并发请求只有一个能同时满足三者。
++  // 并发请求只有一个能同时满足三者。FIX3-CLOSE：Execution 在同一事务内创建，
++  // 审批记录 execution_id，证明该授权归属于哪一个执行。
+   let claimedApprovalId = null;
++  const execId = newId('exe');
+   db().exec('BEGIN IMMEDIATE');
+   try {
+     if (needsApproval) {
+@@ -690,15 +814,15 @@ async function runExecutorTask(task, project) {
+         return { ok: false, blocked: 'needs_approval', error: `需要本地管理员审批：${recheck.reason}` };
+       }
+       const consume = db()
+-        .prepare('UPDATE approvals SET used_at=? WHERE id=? AND used_at IS NULL AND revoked_at IS NULL')
+-        .run(now(), recheck.approval.id);
++        .prepare('UPDATE approvals SET used_at=?, execution_id=? WHERE id=? AND used_at IS NULL AND revoked_at IS NULL')
++        .run(now(), execId, recheck.approval.id);
+       if (consume.changes !== 1) {
+         db().exec('ROLLBACK');
+         recordAttempt({ task, project, phase: 'authorize', status: 'rejected', blocked: 'approval_consumed', reason: '授权已被其它执行消耗', plan: resolved });
+         return { ok: false, blocked: 'approval_consumed', error: '该授权已被其它执行消耗' };
+       }
+       claimedApprovalId = recheck.approval.id;
+-      approval = { valid: true, approval: recheck.approval };
++      approval = { valid: true, approval: { ...recheck.approval, execution_id: execId } };
+     }
+ 
+     const claim = db()
+@@ -710,14 +834,27 @@ async function runExecutorTask(task, project) {
+       recordAttempt({ task, project, phase: 'claim', status: 'rejected', blocked: 'already_running', reason: '状态不允许执行', plan: resolved });
+       return { ok: false, blocked: 'already_running', error: '任务已在运行或状态不允许执行' };
+     }
++
++    // Execution 与审批消耗、状态抢占同事务落库：任一失败都不会留下孤儿授权。
++    db()
++      .prepare('INSERT INTO executions (id,task_id,agent_id,status,model,session_key,started_at,evidence) VALUES (?,?,?,?,?,?,?,?)')
++      .run(
++        execId,
++        task.id,
++        null,
++        'running',
++        'claude-code-isolated',
++        resolved.cwd ?? '',
++        now(),
++        JSON.stringify({ phase: 'execute', blocked: null, reason: null, plan: resolved })
++      );
+     db().exec('COMMIT');
+   } catch (e) {
+     try { db().exec('ROLLBACK'); } catch {}
+     throw e;
+   }
+ 
+-
+-  const execId = recordAttempt({ task, project, phase: 'execute', status: 'running', plan: resolved });
++  event('execution.running', project.id, { task: task.id, execution: execId, phase: 'execute', plan: resolved });
+   const modelToken = registerModelToken(execId, task.id);
+   const dest = join(JARVIS_HOME, 'worktrees', task.id);
+   let credFile = null;
+@@ -726,18 +863,18 @@ async function runExecutorTask(task, project) {
+ 
+   try {
+     rmSync(dest, { recursive: true, force: true });
+-    const wt = await ex.createWorktree({ repo: resolved.repo, commit: resolved.baseCommit, dest });
++    const wt = await executor.createWorktree({ repo: resolved.repo, commit: resolved.baseCommit, dest });
+     if (!wt.ok) {
+       finalizeAttempt(task, execId, { status: 'failed', reason: `创建隔离工作树失败: ${wt.error}` });
+       return { ok: false, blocked: 'worktree_failed', error: wt.error };
+     }
+-    const init = await ex.worktreeStatus(dest);
++    const init = await executor.worktreeStatus(dest);
+     if (!init.clean) {
+       finalizeAttempt(task, execId, { status: 'failed', reason: `初始工作树不干净: ${init.raw.slice(0, 200)}` });
+       return { ok: false, blocked: 'dirty_worktree', error: '初始工作树不干净，拒绝自动提交' };
+     }
+ 
+-    const proxyUrl = await iso.egressProxyUrl();
++    const proxyUrl = await isolation.egressProxyUrl();
+     const cred = writeCredentialFile(execId, proxyUrl, modelToken);
+     if (!cred.ok) {
+       finalizeAttempt(task, execId, { status: 'failed', reason: cred.error });
+@@ -746,7 +883,7 @@ async function runExecutorTask(task, project) {
+     credFile = cred.file;
+     const containerName = `jarvis-exec-${execId}`;
+     const execResId = registerResource({ executionId: execId, taskId: task.id, kind: 'claude', name: containerName });
+-    const res = await iso.runClaudeIsolated({
++    const res = await isolation.runClaudeIsolated({
+       modelToken,
+       name: containerName,
+       workdir: dest,
+@@ -769,7 +906,7 @@ async function runExecutorTask(task, project) {
+       db().prepare("UPDATE tasks SET status='verifying', updated_at=? WHERE id=? AND status='running'").run(now(), task.id);
+       const verifyName = `jarvis-verify-${execId}`;
+       const verifyResId = registerResource({ executionId: execId, taskId: task.id, kind: 'verify', name: verifyName });
+-      const vr = await iso.runInWorkdir({
++      const vr = await isolation.runInWorkdir({
+         name: verifyName,
+         workdir: dest,
+         program: resolved.profile.program,
+@@ -781,32 +918,57 @@ async function runExecutorTask(task, project) {
+     }
+ 
+     // 修改范围检查
+-    const changed = await ex.changedFiles(dest);
++    const changed = await executor.changedFiles(dest);
+     const outside = changed.filter((f) => !resolved.commitPaths.some((p) => f === p || f.startsWith(p.replace(/\/$/, '') + '/')));
+     const scopeOk = outside.length === 0;
+ 
++    // PRE-A01：提交阶段必须识别「当前 Execution 已取得的授权」，而不是重新
++    // 查找 used_at IS NULL 的审批。同时重新核验任务当前参数、期限与撤销状态。
++    let commitApproval = { valid: !resolved.commit, reason: resolved.commit ? '尚未检查' : '无需提交' };
+     if (resolved.commit && scopeOk && !cancelledNow()) {
+-      const recheck = findValidApproval(task.id, resolved.digest);
+-      const gate = commitGate({ execOk: res.ok, verify, approval: recheck, commitPaths: resolved.commitPaths });
++      const currentTask = getTask(task.id);
++      const currentPlan = resolveExecutorPlan(currentTask, project);
++      const grant = findApprovalForExecution(task.id, resolved.digest, execId);
++      const sameClaim = !claimedApprovalId || grant.approval?.id === claimedApprovalId;
++      const paramsStable = currentPlan.ok && currentPlan.resolved.digest === resolved.digest;
++      commitApproval = grant.valid && sameClaim && paramsStable
++        ? grant
++        : {
++            valid: false,
++            reason: !grant.valid
++              ? grant.reason
++              : !sameClaim
++                ? '审批不属于当前 Execution'
++                : '任务参数在执行期间发生变化，原审批失效'
++          };
++      const gate = commitGate({ execOk: res.ok, verify, approval: commitApproval, commitPaths: resolved.commitPaths });
+       if (gate.ok) {
+-        db().prepare("UPDATE tasks SET status='committing', updated_at=? WHERE id=? AND status='running'").run(now(), task.id);
+-        commit = await ex.gitCommit({ cwd: dest, message: resolved.commitMessage || `chore(executor): ${task.title}`, paths: resolved.commitPaths });
+-        // 让 commit 在仓库中保持可达（工作树是 detach 的，删除后会变成孤立对象）
+-        if (commit?.ok && commit.sha) {
+-          const refName = `refs/heads/jarvis/${task.id}`;
+-          const published = await ex.publishRef({ repo: resolved.repo, ref: refName, sha: commit.sha });
+-          commit.ref = refName;
+-          commit.refPublished = published.ok;
+-          // 复核：能从该引用真正取回同一个 SHA
+-          if (published.ok) {
+-            const verifyRef = await ex.revParseRef({ repo: resolved.repo, ref: refName });
+-            commit.refVerified = verifyRef === commit.sha;
+-            if (!commit.refVerified) commit.refPublished = false;
+-          }
+-          if (!commit.refPublished) {
+-            // 不丢成果：保留工作树路径写入证据，finally 不删除
+-            commit.refError = published.out?.slice(0, 300) ?? 'ref publish failed';
+-            evidenceRefPreserve = dest;
++        // 原子抢占 committing：取消先到则这里 changes=0，绝不开始新的提交副作用。
++        const transition = db()
++          .prepare("UPDATE tasks SET status='committing', updated_at=? WHERE id=? AND status IN ('running','verifying')")
++          .run(now(), task.id);
++        if (transition.changes !== 1) {
++          commitApproval = { valid: false, reason: '任务已取消或状态不允许提交' };
++          commit = { ok: false, skipped: true, reason: '任务已取消或状态不允许提交，未开始提交' };
++        } else {
++          commit = await executor.gitCommit({ cwd: dest, message: resolved.commitMessage || `chore(executor): ${task.title}`, paths: resolved.commitPaths });
++          // 让 commit 在仓库中保持可达（工作树是 detach 的，删除后会变成孤立对象）
++          if (commit?.ok && commit.sha) {
++            const refName = `refs/heads/jarvis/${task.id}`;
++            const published = await executor.publishRef({ repo: resolved.repo, ref: refName, sha: commit.sha });
++            commit.ref = refName;
++            commit.refPublished = published.ok;
++            // 复核：能从该引用真正取回同一个 SHA
++            if (published.ok) {
++              const verifyRef = await executor.revParseRef({ repo: resolved.repo, ref: refName });
++              commit.refVerified = verifyRef === commit.sha;
++              if (!commit.refVerified) commit.refPublished = false;
++            }
++            if (!commit.refPublished) {
++              // 不丢成果：保留工作树路径写入证据，finally 不删除
++              commit.refError = published.out?.slice(0, 300) ?? 'ref publish failed';
++              evidenceRefPreserve = dest;
++            }
+           }
+         }
+       } else {
+@@ -814,16 +976,21 @@ async function runExecutorTask(task, project) {
+       }
+     } else if (resolved.commit && !scopeOk) {
+       commit = { ok: false, skipped: true, reason: `修改超出授权范围: ${outside.join(', ')}` };
++      commitApproval = { valid: false, reason: `修改超出授权范围: ${outside.join(', ')}` };
++    } else if (resolved.commit && cancelledNow()) {
++      commit = { ok: false, skipped: true, reason: '任务已取消，未开始提交' };
++      commitApproval = { valid: false, reason: '任务已取消，未开始提交' };
+     }
+ 
++    const endedCancelled = Boolean(res.cancelled) || cancelledNow();
+     const verdict = computeVerdict({
+-      cancelled: res.cancelled,
++      cancelled: endedCancelled,
+       execOk: res.ok,
+       verify,
+       requiresVerify: Boolean(resolved.profile) || resolved.commit,
+       commit,
+       requiresCommit: resolved.commit,
+-      approvalValid: approval.valid,
++      approvalValid: commitApproval.valid,
+       commitRefOk: resolved.commit ? commit?.refPublished !== false : undefined
+     });
+ 
+@@ -844,7 +1011,11 @@ async function runExecutorTask(task, project) {
+         commit_paths: resolved.commitPaths,
+         digest: resolved.digest
+       },
+-      authorization: { required: needsApproval, approval: approval.approval ? { id: approval.approval.id, digest: resolved.digest } : null }
++      authorization: {
++        required: needsApproval,
++        approval: approval.approval ? { id: approval.approval.id, digest: resolved.digest, execution_id: approval.approval.execution_id ?? execId } : null,
++        commit_check: { valid: commitApproval.valid, reason: commitApproval.reason ?? null }
++      }
+     };
+     // 授权已在事务内消耗，此处不再重复标记
+ 
+@@ -873,7 +1044,7 @@ async function runExecutorTask(task, project) {
+     if (evidenceRefPreserve) {
+       event('worktree.preserved', project.id, { task: task.id, path: evidenceRefPreserve });
+     } else {
+-      try { await ex.removeWorktree({ repo: resolved.repo, dest }); } catch {}
++      try { await executor.removeWorktree({ repo: resolved.repo, dest }); } catch {}
+     }
+   }
+ }
+@@ -1050,7 +1221,8 @@ async function runWorkflowInner(ref) {
+  * 取消任务：杀掉执行器进程组，并把状态置为 cancelled。
+  * 不做「假装已取消」——无法终止时如实返回失败。
+  */
+-export async function cancelTask(ref) {
++export async function cancelTask(ref, deps = {}) {
++  const isolation = deps.isolation ?? iso;
+   const task = getTask(ref);
+   const running = db()
+     .prepare("SELECT * FROM executions WHERE task_id = ? AND status = 'running' ORDER BY started_at DESC")
+@@ -1059,8 +1231,43 @@ export async function cancelTask(ref) {
+     return { ok: false, error: '该任务没有正在运行的执行', task: getTask(task.id) };
+   }
+ 
+-  // 先标记取消意图，避免执行侧在终止过程中把任务写成 failed（DEF-02 竞态）
+-  db().prepare("UPDATE tasks SET status='cancel_requested', updated_at=? WHERE id=? AND status IN ('running','verifying','committing')").run(now(), task.id);
++  // 提交与取消的互斥：committing 由 runTask 用原子状态迁移抢占。
++  // 提交中不杀进程、不写 cancel_requested，避免 git commit 已发生却虚报 cancelled。
++  let current = getTask(task.id);
++  if (current.status === 'committing') {
++    return {
++      ok: false,
++      blocked: 'commit_in_progress',
++      error: '任务正在提交，不能安全取消；请等待提交结果并核对真实 Commit',
++      task: current
++    };
++  }
++  if (current.status !== 'cancel_requested') {
++    // 只允许在 running/verifying 标记取消；不含 committing。
++    const mark = db()
++      .prepare("UPDATE tasks SET status='cancel_requested', updated_at=? WHERE id=? AND status IN ('running','verifying')")
++      .run(now(), task.id);
++    if (mark.changes !== 1) {
++      current = getTask(task.id);
++      if (current.status === 'committing') {
++        return {
++          ok: false,
++          blocked: 'commit_in_progress',
++          error: '任务已进入提交阶段，不能安全取消；请等待提交结果并核对真实 Commit',
++          task: current
++        };
++      }
++      return {
++        ok: false,
++        blocked: current.status,
++        error: `任务状态 ${current.status} 无法标记取消`,
++        task: current
++      };
++    }
++  }
++
++  // 取消意图一旦成立，立即撤销该执行的模型令牌；不等待 runTask 进程收尾。
++  for (const exRow of running) revokeModelTokensForExecution(exRow.id);
+ 
+   const alive = (pid) => {
+     try { process.kill(pid, 0); return true; } catch { return false; }
+@@ -1104,7 +1311,7 @@ export async function cancelTask(ref) {
+     }
+     const containerResults = [];
+     for (const tname of targets) {
+-      const r = await iso.killContainer(tname);
++      const r = await isolation.killContainer(tname);
+       containerResults.push({ name: tname, ...r });
+       db().prepare("UPDATE execution_resources SET state=?, stopped_at=? WHERE execution_id=? AND name=? AND state IN ('started','running','stopping')")
+         .run(r.confirmed ? 'stopped' : 'unknown', now(), exRow.id, tname);
+@@ -1282,8 +1489,11 @@ async function runAuditTask(task, project) {
+ /**
+  * 登记可信校验配置——只能由本地管理员入口调用（CLI）。
+  * 校验命令由管理员固定，任务只能引用 id（AC-01）。
++ *
++ * PRE-A02：服务层必须验证内容挑战签名，不能靠 CLI 先验签、服务层直接写入。
++ * PRE-A03：签名内容必须与实际登记的 program / argv / cwd / timeout 完全一致。
+  */
+-export function createVerifyProfile({ project: projectRef, name, program, argv = [], cwd, timeoutMs = 300_000, createdBy = 'local-operator' }) {
++export function createVerifyProfile({ project: projectRef, name, program, argv = [], cwd, timeoutMs = 300_000, createdBy = 'local-operator', proof } = {}) {
+   const project = getProject(projectRef);
+   if (!name || !program) throw new Error('必须提供 name 与 program');
+   if (!Array.isArray(argv)) throw new Error('argv 必须是数组');
+@@ -1292,10 +1502,61 @@ export function createVerifyProfile({ project: projectRef, name, program, argv =
+   if (shellNames.includes(program) || shellNames.includes(base)) {
+     throw new Error('不允许把 shell 解释器登记为校验程序');
+   }
++
++  const effectiveTimeout = timeoutMs ?? 300_000;
++  const content = {
++    kind: 'verify_profile',
++    project: projectRef,
++    name,
++    program,
++    argv,
++    cwd: cwd ?? null,
++    timeout_ms: effectiveTimeout
++  };
++  const parsed = parseSignedProof(proof);
++  if (!parsed.ok) throw new Error(parsed.error);
++  if (canonicalJson(parsed.claims.content) !== canonicalJson(content)) {
++    throw new Error('签名内容与实际登记的校验配置不一致，拒绝登记');
++  }
++  const digest = sha256(canonicalJson(content));
++  const nonceRow = db().prepare("SELECT * FROM auth_nonces WHERE nonce=? AND task_id='content'").get(proof.nonce);
++  if (!nonceRow) throw new Error('校验配置登记挑战不存在或已被使用');
++  if (nonceRow.digest !== digest) throw new Error('校验配置登记挑战摘要不匹配');
++  if (nonceRow.used_at) throw new Error('校验配置登记挑战已被使用');
++  if (Date.parse(nonceRow.expires_at) <= Date.now()) throw new Error('校验配置登记挑战已过期');
++  if (parsed.claims.expires_at !== nonceRow.expires_at) {
++    throw new Error('签名内容有效期与登记挑战不一致');
++  }
++
+   const id = newId('vpr');
+-  db()
+-    .prepare('INSERT INTO verify_profiles (id,project_id,name,program,argv,cwd,timeout_ms,created_by,created_at) VALUES (?,?,?,?,?,?,?,?,?)')
+-    .run(id, project.id, name, program, JSON.stringify(argv), cwd ?? null, timeoutMs, createdBy, now());
++  db().exec('BEGIN IMMEDIATE');
++  try {
++    const current = db().prepare("SELECT * FROM auth_nonces WHERE nonce=? AND task_id='content'").get(proof.nonce);
++    if (
++      !current ||
++      current.used_at ||
++      current.digest !== digest ||
++      current.expires_at !== parsed.claims.expires_at ||
++      Date.parse(current.expires_at) <= Date.now()
++    ) {
++      db().exec('ROLLBACK');
++      throw new Error('校验配置登记挑战无效、已过期或已被使用');
++    }
++    const consumed = db()
++      .prepare("UPDATE auth_nonces SET used_at=? WHERE nonce=? AND task_id='content' AND digest=? AND used_at IS NULL AND expires_at > ?")
++      .run(now(), proof.nonce, digest, now());
++    if (consumed.changes !== 1) {
++      db().exec('ROLLBACK');
++      throw new Error('校验配置登记挑战已被并发使用');
++    }
++    db()
++      .prepare('INSERT INTO verify_profiles (id,project_id,name,program,argv,cwd,timeout_ms,created_by,created_at) VALUES (?,?,?,?,?,?,?,?,?)')
++      .run(id, project.id, name, program, JSON.stringify(argv), cwd ?? null, effectiveTimeout, createdBy, now());
++    db().exec('COMMIT');
++  } catch (e) {
++    try { db().exec('ROLLBACK'); } catch {}
++    throw e;
++  }
+   event('verify_profile.created', project.id, { name, program, argv });
+   return getVerifyProfile(id);
+ }
+@@ -1382,6 +1643,11 @@ function writeTokens(obj) {
+ export function registerModelToken(execId, taskId, ttlMs = 2 * 3600 * 1000) {
+   const token = randomBytes(18).toString('base64url');
+   const tokens = readTokens();
++  // 清理已经结束/取消的执行遗留令牌；执行状态以 DB 为准，不信任文件里的自述。
++  for (const [tok, meta] of Object.entries(tokens)) {
++    const execution = db().prepare('SELECT status FROM executions WHERE id=?').get(meta?.execution_id);
++    if (!execution || execution.status !== 'running') delete tokens[tok];
++  }
+   tokens[token] = { execution_id: execId, task_id: taskId, expires_at: new Date(Date.now() + ttlMs).toISOString() };
+   writeTokens(tokens);
+   return token;
+@@ -1390,10 +1656,26 @@ export function registerModelToken(execId, taskId, ttlMs = 2 * 3600 * 1000) {
+ export function revokeModelToken(token) {
+   if (!token) return;
+   const tokens = readTokens();
++  if (!(token in tokens)) return;
+   delete tokens[token];
+   writeTokens(tokens);
+ }
+ 
++/** 取消/结束时立即撤销某个 Execution 的全部模型令牌（不依赖 runTask 进程尚存）。 */
++export function revokeModelTokensForExecution(execId) {
++  if (!execId) return 0;
++  const tokens = readTokens();
++  let removed = 0;
++  for (const [tok, meta] of Object.entries(tokens)) {
++    if (meta?.execution_id === execId) {
++      delete tokens[tok];
++      removed++;
++    }
++  }
++  if (removed) writeTokens(tokens);
++  return removed;
++}
++
+ /* ------------------------------ 执行资源登记 -------------------------------- */
+ 
+ function registerResource({ executionId, taskId, kind, name }) {
+diff --git a/orchestrator/test/docker-isolation.test.mjs b/orchestrator/test/docker-isolation.test.mjs
+new file mode 100644
+index 0000000..7b91cd8
+--- /dev/null
++++ b/orchestrator/test/docker-isolation.test.mjs
+@@ -0,0 +1,46 @@
++/**
++ * 真实 Docker 验证/审计隔离测试。
++ * CI 无执行器镜像时显式 skip；本机真实 Docker 必须执行。
++ */
++import { test } from 'node:test';
++import assert from 'node:assert/strict';
++import { mkdtempSync } from 'node:fs';
++import { tmpdir } from 'node:os';
++import { join } from 'node:path';
++import { execFileSync } from 'node:child_process';
++
++const DOCKER = process.env.JARVIS_DOCKER_BIN || '/Applications/Docker.app/Contents/Resources/bin/docker';
++const IMAGE = process.env.JARVIS_EXECUTOR_IMAGE || 'jarvis-executor:2.1.104';
++
++let hasImage = false;
++try {
++  execFileSync(DOCKER, ['image', 'inspect', IMAGE], { stdio: 'ignore', timeout: 20_000 });
++  hasImage = true;
++} catch {}
++
++const iso = await import('../src/isolation.mjs');
++
++test('Docker 验证容器实际执行并返回结果', { skip: hasImage ? false : '执行器镜像不存在（CI 环境）' }, async () => {
++  const dir = mkdtempSync(join(tmpdir(), 'jarvis-verify-'));
++  const r = await iso.runInWorkdir({
++    workdir: dir,
++    program: 'node',
++    args: ['-e', 'console.log("VERIFY_OK")'],
++    image: IMAGE
++  });
++  assert.equal(r.exitCode, 0, r.output);
++  assert.match(r.output, /VERIFY_OK/);
++});
++
++test('Docker 审计/验证只读挂载阻止写入', { skip: hasImage ? false : '执行器镜像不存在（CI 环境）' }, async () => {
++  const dir = mkdtempSync(join(tmpdir(), 'jarvis-ro-'));
++  const r = await iso.runInWorkdir({
++    workdir: dir,
++    program: 'node',
++    args: ['-e', 'require("fs").writeFileSync("/work/should-fail.txt","x")'],
++    image: IMAGE,
++    readOnly: true
++  });
++  assert.notEqual(r.exitCode, 0, '只读挂载下写入必须失败');
++  assert.match(r.output, /EROFS|permission|read-only|EACCES/i);
++});
+diff --git a/orchestrator/test/fix1.test.mjs b/orchestrator/test/fix1.test.mjs
+index 769718e..bfa9924 100644
+--- a/orchestrator/test/fix1.test.mjs
++++ b/orchestrator/test/fix1.test.mjs
+@@ -6,10 +6,13 @@ import assert from 'node:assert/strict';
+ import { mkdtempSync } from 'node:fs';
+ import { tmpdir } from 'node:os';
+ import { join } from 'node:path';
++import { installTestAuthKey } from './helpers/auth.mjs';
+ 
+ const tmp = mkdtempSync(join(tmpdir(), 'jarvis-fix1-'));
++process.env.HOME = tmp;
+ process.env.JARVIS_HOME = tmp;
+ process.env.JARVIS_DB = join(tmp, 'state.db');
++const auth = installTestAuthKey(tmp);
+ 
+ const svc = await import('../src/service.mjs');
+ const sec = await import('../src/security.mjs');
+@@ -82,7 +85,7 @@ test('写模式缺少工作树规格被拒绝（DEF-07）', async () => {
+     executor: 'claude-code',
+     executorConfig: { mode: 'acceptEdits' }
+   });
+-  const ap = svc.issueApproval({ task: t.id });
++  const ap = auth.issueApproval(svc, t.id);
+   assert.equal(ap.ok, true, ap.error || '');
+   const r = await svc.runTask(t.id);
+   assert.equal(r.ok, false);
+diff --git a/orchestrator/test/fix2.test.mjs b/orchestrator/test/fix2.test.mjs
+index b2d6bee..b8944f4 100644
+--- a/orchestrator/test/fix2.test.mjs
++++ b/orchestrator/test/fix2.test.mjs
+@@ -8,10 +8,13 @@ import { mkdtempSync, mkdirSync, writeFileSync, rmSync, chmodSync } from 'node:f
+ import { tmpdir } from 'node:os';
+ import { join } from 'node:path';
+ import { execFileSync } from 'node:child_process';
++import { installTestAuthKey } from './helpers/auth.mjs';
+ 
+ const tmp = mkdtempSync(join(tmpdir(), 'jarvis-fix2-'));
++process.env.HOME = tmp;
+ process.env.JARVIS_HOME = tmp;
+ process.env.JARVIS_DB = join(tmp, 'state.db');
++const auth = installTestAuthKey(tmp);
+ 
+ const svc = await import('../src/service.mjs');
+ const sec = await import('../src/security.mjs');
+@@ -93,7 +96,7 @@ test('DEF-05 有合法新审批时，旧字段不得阻断执行', async () => {
+     executorConfig: { mode: 'acceptEdits', repo: 'repo', base_commit: head }
+   });
+   // 未设置 approved_at，且 needs_approval=0：执行器路径不应被旧逻辑阻断
+-  const ap = svc.issueApproval({ task: t.id });
++  const ap = auth.issueApproval(svc, t.id);
+   assert.equal(ap.ok, true, ap.error || '');
+   // 关键断言：不返回 needs_approval（是否执行取决于隔离/凭据环境）
+   const preview = svc.approvalPreview(t.id);
+@@ -167,7 +170,10 @@ test('DEF-04 认证超时（替身返回 3）不得授权', async () => {
+ });
+ 
+ test('DEF-04 审批只走签名验签，不再用退出码认证', () => {
+-  const src = execFileSync('cat', ['orchestrator/src/cli.mjs'], { encoding: 'utf8' });
+-  assert.ok(src.includes('verifyApprovalSignature'), 'CLI 必须做服务端验签');
+-  assert.ok(!src.includes('runMacAuth'), 'CLI 不得再用仅凭退出码的认证');
++  const cli = execFileSync('cat', ['orchestrator/src/cli.mjs'], { encoding: 'utf8' });
++  const svcSrc = execFileSync('cat', ['orchestrator/src/service.mjs'], { encoding: 'utf8' });
++  assert.ok(svcSrc.includes('verifyApprovalSignature'), '服务层必须做验签，不能只靠 CLI');
++  assert.ok(cli.includes('issueApproval'), 'CLI 必须走服务层签发边界');
++  assert.ok(cli.includes('proof:'), 'CLI 必须把签名证明交给服务层');
++  assert.ok(!cli.includes('runMacAuth'), 'CLI 不得再用仅凭退出码的认证');
+ });
+diff --git a/orchestrator/test/fix3-close.test.mjs b/orchestrator/test/fix3-close.test.mjs
+new file mode 100644
+index 0000000..03f8803
+--- /dev/null
++++ b/orchestrator/test/fix3-close.test.mjs
+@@ -0,0 +1,418 @@
++/**
++ * FIX3-CLOSE 预审缺陷回归（PRE-A01 / PRE-A02 / PRE-A03）。
++ *
++ * 这些测试使用真实的 SQLite、git、审批挑战与签名，只把 Docker/Claude Code
++ * 替换为受控隔离替身，以便在无模型调用的情况下跑完整合法执行链。
++ */
++import { test } from 'node:test';
++import assert from 'node:assert/strict';
++import { mkdtempSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
++import { tmpdir } from 'node:os';
++import { join } from 'node:path';
++import { execFileSync } from 'node:child_process';
++import { generateKeyPairSync, createSign } from 'node:crypto';
++
++const tmp = mkdtempSync(join(tmpdir(), 'jarvis-close-'));
++process.env.HOME = tmp;
++process.env.JARVIS_HOME = join(tmp, 'jarvis');
++process.env.JARVIS_DB = join(tmp, 'state.db');
++mkdirSync(join(tmp, '.openclaw/jarvis/auth'), { recursive: true });
++mkdirSync(join(tmp, '.claude'), { recursive: true });
++writeFileSync(join(tmp, '.claude/settings.json'), JSON.stringify({ env: { ANTHROPIC_MODEL: 'test-model' } }));
++
++const { privateKey, publicKey } = generateKeyPairSync('ec', { namedCurve: 'prime256v1' });
++writeFileSync(join(tmp, '.openclaw/jarvis/auth/pubkey.der'), publicKey.export({ type: 'spki', format: 'der' }));
++
++const svc = await import('../src/service.mjs');
++const sec = await import('../src/security.mjs');
++const ex = await import('../src/executor.mjs');
++
++const gitRepo = (dir) => {
++  mkdirSync(dir, { recursive: true });
++  const g = (...a) => execFileSync('git', ['-C', dir, ...a], { encoding: 'utf8' });
++  g('init', '-q');
++  writeFileSync(join(dir, 'a.txt'), 'x\n');
++  g('add', '-A');
++  g('-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-q', '-m', 'init');
++  return g('rev-parse', 'HEAD').trim();
++};
++
++const fakeIsolation = {
++  isolationStatus: async () => ({ available: true, backend: 'fake', image: 'fake-image', network: 'fake-net', networkInternal: true }),
++  egressProxyUrl: async () => 'http://127.0.0.1:9',
++  runClaudeIsolated: async ({ workdir }) => {
++    writeFileSync(join(workdir, 'feature.txt'), 'generated by fake executor\n');
++    return { ok: true, exitCode: 0, text: 'done', isolated: true, network: 'fake-net', image: 'fake-image', raw: '' };
++  },
++  runInWorkdir: async () => ({ ok: true, exitCode: 0, output: 'verify ok' }),
++  killContainer: async (name) => ({ ok: true, confirmed: true, name })
++};
++
++function projectWithRepo(label) {
++  const p = svc.createProject({ name: label, slug: `${label}-${Date.now().toString(36)}` });
++  const head = gitRepo(join(p.dir, 'repo'));
++  return { p, head };
++}
++
++function seedVerifyProfile(project, { program = process.execPath, argv = [] } = {}) {
++  const id = `vpr_${Math.random().toString(36).slice(2, 10)}`;
++  svc.db()
++    .prepare('INSERT INTO verify_profiles (id,project_id,name,program,argv,cwd,timeout_ms,created_by,created_at) VALUES (?,?,?,?,?,?,?,?,?)')
++    .run(id, project.id, `verify-${id}`, program, JSON.stringify(argv), null, 300_000, 'test', new Date().toISOString());
++  return id;
++}
++
++function seedTask({ project, head, verifyProfileId, mode = 'acceptEdits', commit = true, commitPaths = ['feature.txt'] }) {
++  return svc.createTask({
++    project: project.id,
++    title: '合法写入任务',
++    input: 'write feature.txt',
++    kind: 'executor',
++    executor: 'claude-code',
++    executorConfig: {
++      mode,
++      repo: 'repo',
++      base_commit: head,
++      commit,
++      commit_paths: commitPaths,
++      verify_profile_id: verifyProfileId
++    }
++  });
++}
++
++function signChallenge(challenge) {
++  const signer = createSign('sha256');
++  signer.update(challenge.payload);
++  return {
++    nonce: challenge.nonce,
++    payload: challenge.payload,
++    signatureB64: signer.sign(privateKey).toString('base64')
++  };
++}
++
++/* ------------------------------- PRE-A01 --------------------------------- */
++
++test('PRE-A01 同一 Execution 消耗审批后仍可完成合法提交', async () => {
++  const { p, head } = projectWithRepo('a01');
++  const vp = seedVerifyProfile(p);
++  const t = seedTask({ project: p, head, verifyProfileId: vp });
++  const challenge = svc.createAuthChallenge(t.id);
++  const proof = signChallenge(challenge);
++  const issued = svc.issueApproval({ task: t.id, proof });
++  assert.equal(issued.ok, true, JSON.stringify(issued));
++
++  const r = await svc.runTask(t.id, { isolation: fakeIsolation });
++  assert.equal(
++    r.ok,
++    true,
++    JSON.stringify({ blocked: r.blocked, commit: r.commit, verdict: r.verdict, task: svc.getTask(t.id).status })
++  );
++  const done = svc.getTask(t.id);
++  assert.equal(done.status, 'done');
++  assert.ok(r.commit?.sha, '必须记录真实 commit SHA');
++  assert.equal(r.commit.refVerified, true, '必须能从 ref 取回同一 SHA');
++  assert.equal(r.task.status, 'done');
++
++  const approval = svc.db().prepare('SELECT * FROM approvals WHERE task_id=?').get(t.id);
++  assert.ok(approval.used_at, '审批必须已消耗');
++  assert.equal(approval.execution_id, r.execution, '审批必须记录取得它的 Execution');
++  assert.equal(svc.findValidApproval(t.id, approval.digest).valid, false, '已消耗审批不得再给新执行使用');
++  const tokenFile = join(process.env.JARVIS_HOME, 'proxy', 'active-tokens.json');
++  assert.deepEqual(JSON.parse(readFileSync(tokenFile, 'utf8')), {}, '执行结束后模型令牌必须撤销');
++});
++
++/* ------------------------------- PRE-A02 --------------------------------- */
++
++test('PRE-A02 直接调用 issueApproval 无签名证明必须拒绝', () => {
++  const { p, head } = projectWithRepo('a02');
++  const vp = seedVerifyProfile(p);
++  const t = seedTask({ project: p, head, verifyProfileId: vp });
++  const before = svc.db().prepare('SELECT COUNT(*) AS n FROM approvals WHERE task_id=?').get(t.id).n;
++
++  const noProof = svc.issueApproval({ task: t.id, auth: null });
++  assert.equal(noProof.ok, false, 'auth=null 不得签发审批');
++
++  const forged = svc.issueApproval({
++    task: t.id,
++    proof: { nonce: 'forged', payload: Buffer.from('{"task_id":"x"}'), signatureB64: 'ZmFrZQ==' }
++  });
++  assert.equal(forged.ok, false, '伪造证明不得签发审批');
++
++  const after = svc.db().prepare('SELECT COUNT(*) AS n FROM approvals WHERE task_id=?').get(t.id).n;
++  assert.equal(after, before, '失败签发不得写入审批');
++});
++
++test('PRE-A02 直接登记可信校验配置无签名证明必须拒绝', () => {
++  const { p } = projectWithRepo('a02b');
++  assert.throws(
++    () => svc.createVerifyProfile({ project: p.id, name: 'no-proof', program: process.execPath, argv: [] }),
++    /签名|授权|证明|proof/
++  );
++});
++
++/* ------------------------------- PRE-A03 --------------------------------- */
++
++test('PRE-A03 签名后修改任务参数必须拒绝签发', () => {
++  const { p, head } = projectWithRepo('a03');
++  const vp = seedVerifyProfile(p);
++  const t = seedTask({ project: p, head, verifyProfileId: vp, mode: 'plan', commit: false });
++  const challenge = svc.createAuthChallenge(t.id);
++  const proof = signChallenge(challenge);
++
++  // 认证过程中修改会影响授权范围的参数
++  svc.updateTask(t.id, {
++    executor_config: JSON.stringify({ mode: 'acceptEdits', repo: 'repo', base_commit: head, commit: true, commit_paths: ['feature.txt'], verify_profile_id: vp })
++  });
++
++  const r = svc.issueApproval({ task: t.id, proof });
++  assert.equal(r.ok, false, '签名载荷与任务当前参数不一致时必须拒绝');
++  const n = svc.db().prepare('SELECT COUNT(*) AS n FROM approvals WHERE task_id=?').get(t.id).n;
++  assert.equal(n, 0, '不得写入审批');
++});
++
++test('PRE-A03 校验配置内容变化必须使原审批失效', () => {
++  const { p, head } = projectWithRepo('a03b');
++  const vp = seedVerifyProfile(p, { argv: [] });
++  const t = seedTask({ project: p, head, verifyProfileId: vp });
++  const challenge = svc.createAuthChallenge(t.id);
++  const proof = signChallenge(challenge);
++
++  svc.db().prepare('UPDATE verify_profiles SET argv=? WHERE id=?').run(JSON.stringify(['-e', 'process.exit(0)']), vp);
++
++  const r = svc.issueApproval({ task: t.id, proof });
++  assert.equal(r.ok, false, '校验配置内容变化后，原签名不得继续签发');
++  assert.equal(svc.db().prepare('SELECT COUNT(*) AS n FROM approvals WHERE task_id=?').get(t.id).n, 0);
++});
++
++
++const headOf = (repo) => execFileSync('git', ['-C', repo, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
++
++function approvedTask(label, overrides = {}) {
++  const { p, head } = projectWithRepo(label);
++  const vp = seedVerifyProfile(p);
++  const t = seedTask({ project: p, head, verifyProfileId: vp, ...overrides });
++  const challenge = svc.createAuthChallenge(t.id);
++  const issued = svc.issueApproval({ task: t.id, proof: signChallenge(challenge) });
++  assert.equal(issued.ok, true, issued.error);
++  return { p, t, repo: join(p.dir, 'repo') };
++}
++
++/* -------------------- PRE-A01：提交阶段复核/不可复用 -------------------- */
++
++test('PRE-A01 提交前任务参数漂移必须拒绝提交', async () => {
++  const { t, repo } = approvedTask('a01-drift');
++  const before = headOf(repo);
++  const driftIso = {
++    ...fakeIsolation,
++    runClaudeIsolated: async ({ workdir }) => {
++      writeFileSync(join(workdir, 'feature.txt'), 'x\n');
++      svc.updateTask(t.id, {
++        executor_config: JSON.stringify({
++          mode: 'acceptEdits',
++          repo: 'repo',
++          base_commit: svc.getTask(t.id).executor_config ? JSON.parse(svc.getTask(t.id).executor_config).base_commit : null,
++          commit: true,
++          commit_paths: ['feature.txt', 'other.txt'],
++          verify_profile_id: svc.getTask(t.id).verify_profile_id
++        })
++      });
++      return { ok: true, exitCode: 0, text: 'done', isolated: true, network: 'fake-net', image: 'fake-image', raw: '' };
++    }
++  };
++  const r = await svc.runTask(t.id, { isolation: driftIso });
++  assert.equal(r.ok, false);
++  assert.equal(r.commit?.skipped, true);
++  assert.match(r.commit?.reason ?? '', /参数|审批/);
++  assert.equal(headOf(repo), before, '参数漂移后不得产生新 commit');
++  assert.equal(svc.getTask(t.id).status, 'failed');
++});
++
++test('PRE-A01 审批在执行期间被撤销必须拒绝提交', async () => {
++  const { t, repo } = approvedTask('a01-revoke');
++  const before = headOf(repo);
++  const revokeIso = {
++    ...fakeIsolation,
++    runClaudeIsolated: async ({ workdir }) => {
++      writeFileSync(join(workdir, 'feature.txt'), 'x\n');
++      svc.db().prepare('UPDATE approvals SET revoked_at=? WHERE task_id=?').run(new Date().toISOString(), t.id);
++      return { ok: true, exitCode: 0, text: 'done', isolated: true, network: 'fake-net', image: 'fake-image', raw: '' };
++    }
++  };
++  const r = await svc.runTask(t.id, { isolation: revokeIso });
++  assert.equal(r.ok, false);
++  assert.equal(r.commit?.skipped, true);
++  assert.match(r.commit?.reason ?? '', /审批|Execution/);
++  assert.equal(headOf(repo), before, '撤销审批后不得产生新 commit');
++  assert.equal(svc.getTask(t.id).status, 'failed');
++});
++
++test('PRE-A01 已消耗审批不得被新执行复用', async () => {
++  const { t, repo } = approvedTask('a01-reuse');
++  const before = headOf(repo);
++  const first = await svc.runTask(t.id, { isolation: fakeIsolation });
++  assert.equal(first.ok, true, JSON.stringify(first));
++  const approval = svc.db().prepare('SELECT * FROM approvals WHERE task_id=?').get(t.id);
++  assert.equal(svc.findValidApproval(t.id, approval.digest).valid, false);
++
++  // 模拟重试入口：任务回到 retry_pending，但旧审批仍归第一次执行所有
++  svc.updateTask(t.id, { status: 'retry_pending' });
++  const again = await svc.runTask(t.id, { isolation: fakeIsolation });
++  assert.equal(again.ok, false);
++  assert.equal(again.blocked, 'needs_approval');
++  const runningAfter = svc.db().prepare("SELECT COUNT(*) AS n FROM executions WHERE task_id=? AND status='running'").get(t.id).n;
++  assert.equal(runningAfter, 0, '旧审批不得启动新的执行');
++  assert.equal(headOf(repo), before, '重试不得改变仓库 HEAD');
++  const refSha = execFileSync('git', ['-C', repo, 'rev-parse', `refs/heads/jarvis/${t.id}`], { encoding: 'utf8' }).trim();
++  assert.equal(refSha, first.commit.sha, '第一次执行的 Ref 仍应指向真实 Commit');
++});
++
++/* -------------------------- 取消 / 提交竞态 ---------------------------- */
++
++test('取消在提交前成立：不得开始 Git Commit', async () => {
++  const { t, repo } = approvedTask('cancel-before');
++  const before = headOf(repo);
++  let releaseRun;
++  let markStarted;
++  const started = new Promise((r) => { markStarted = r; });
++  const hold = new Promise((r) => { releaseRun = r; });
++  const gatedIso = {
++    ...fakeIsolation,
++    runClaudeIsolated: async ({ workdir }) => {
++      writeFileSync(join(workdir, 'feature.txt'), 'x\n');
++      markStarted();
++      await hold;
++      return { ok: true, exitCode: 0, text: 'done', isolated: true, network: 'fake-net', image: 'fake-image', raw: '' };
++    }
++  };
++  let commitCalled = false;
++  const spyExecutor = {
++    ...ex,
++    gitCommit: async (args) => { commitCalled = true; return ex.gitCommit(args); }
++  };
++  const running = svc.runTask(t.id, { isolation: gatedIso, executor: spyExecutor });
++  await started;
++  const cancelled = await svc.cancelTask(t.id, { isolation: gatedIso });
++  assert.equal(cancelled.ok, true, JSON.stringify(cancelled));
++  releaseRun();
++  const r = await running;
++  assert.equal(r.ok, false);
++  assert.equal(r.blocked, 'cancelled');
++  assert.equal(commitCalled, false, '取消成立后不得调用 gitCommit');
++  assert.equal(headOf(repo), before, '取消后仓库 HEAD 不得变化');
++  assert.equal(svc.getTask(t.id).status, 'cancelled');
++  const tokenFile = join(process.env.JARVIS_HOME, 'proxy', 'active-tokens.json');
++  assert.deepEqual(JSON.parse(readFileSync(tokenFile, 'utf8')), {}, '取消后模型令牌必须撤销');
++});
++
++test('提交中取消：不得立即虚报 cancelled，提交完成后必须记录真实 Commit/Ref', async () => {
++  const { t } = approvedTask('cancel-during');
++  let releaseCommit;
++  let markCommitStarted;
++  const commitStarted = new Promise((r) => { markCommitStarted = r; });
++  const commitHold = new Promise((r) => { releaseCommit = r; });
++  const spyExecutor = {
++    ...ex,
++    gitCommit: async (args) => {
++      markCommitStarted();
++      await commitHold;
++      return ex.gitCommit(args);
++    }
++  };
++  const running = svc.runTask(t.id, { isolation: fakeIsolation, executor: spyExecutor });
++  await commitStarted;
++  assert.equal(svc.getTask(t.id).status, 'committing');
++
++  const cancelled = await svc.cancelTask(t.id, { isolation: fakeIsolation });
++  assert.equal(cancelled.ok, false);
++  assert.equal(cancelled.blocked, 'commit_in_progress');
++  assert.equal(svc.getTask(t.id).status, 'committing', '提交中取消不得改写为 cancelled');
++
++  releaseCommit();
++  const r = await running;
++  assert.equal(r.ok, true, JSON.stringify({ verdict: r.verdict, commit: r.commit }));
++  assert.ok(r.commit?.sha);
++  assert.equal(r.commit.refVerified, true);
++  assert.equal(svc.getTask(t.id).status, 'done');
++  const after = await svc.cancelTask(t.id, { isolation: fakeIsolation });
++  assert.equal(after.ok, false, '提交完成后不能再虚报取消');
++  assert.equal(svc.getTask(t.id).status, 'done');
++});
++
++test('提交子进程异常：留下未确认状态，不虚报成功', async () => {
++  const { t, repo } = approvedTask('commit-crash');
++  const before = headOf(repo);
++  const crashExecutor = {
++    ...ex,
++    gitCommit: async () => { throw new Error('simulated git commit crash'); }
++  };
++  await assert.rejects(
++    () => svc.runTask(t.id, { isolation: fakeIsolation, executor: crashExecutor }),
++    /simulated git commit crash/
++  );
++  assert.equal(headOf(repo), before, '异常时不得产生无法解释的提交');
++  assert.equal(svc.getTask(t.id).status, 'committing', '异常后必须是未确认状态');
++  const execRow = svc.db().prepare("SELECT * FROM executions WHERE task_id=? AND status='running'").get(t.id);
++  assert.ok(execRow, '执行记录应保持 running，等待人工核查');
++});
++
++
++test('执行容器凭据文件不包含原始 GLM Key', async () => {
++  const { t } = approvedTask('cred-file');
++  let captured = null;
++  const iso = {
++    ...fakeIsolation,
++    runClaudeIsolated: async ({ workdir, credentialsFile }) => {
++      captured = { credentialsFile, body: readFileSync(credentialsFile, 'utf8') };
++      writeFileSync(join(workdir, 'feature.txt'), 'x\n');
++      return { ok: true, exitCode: 0, text: 'done', isolated: true, network: 'fake-net', image: 'fake-image', raw: '' };
++    }
++  };
++  const old = process.env.GLM_API_KEY;
++  process.env.GLM_API_KEY = 'sk-raw-secret-should-not-appear';
++  try {
++    const r = await svc.runTask(t.id, { isolation: iso });
++    assert.equal(r.ok, true, JSON.stringify(r));
++  } finally {
++    if (old === undefined) delete process.env.GLM_API_KEY;
++    else process.env.GLM_API_KEY = old;
++  }
++  assert.ok(captured?.credentialsFile, '必须生成容器凭据文件');
++  assert.ok(!captured.body.includes('sk-raw-secret-should-not-appear'), '原始 GLM Key 不得进入容器凭据');
++  assert.match(captured.body, /proxy-managed-placeholder/);
++  assert.match(captured.body, /\/api\/anthropic\/s\//);
++});
++
++
++/* -------------------- AC-13 / AC-14：Commit 门禁 ---------------------- */
++
++test('AC-13 校验失败不得产生 Commit', async () => {
++  const { t, repo } = approvedTask('ac13');
++  const before = headOf(repo);
++  const failVerifyIso = {
++    ...fakeIsolation,
++    runInWorkdir: async () => ({ ok: false, exitCode: 1, output: 'TEST_FAILED' })
++  };
++  const r = await svc.runTask(t.id, { isolation: failVerifyIso });
++  assert.equal(r.ok, false);
++  assert.equal(r.commit?.skipped, true);
++  assert.match(r.commit?.reason ?? '', /校验失败/);
++  assert.equal(r.verify?.exitCode, 1);
++  assert.equal(headOf(repo), before, '校验失败不得产生新 commit');
++  assert.equal(svc.getTask(t.id).status, 'failed');
++});
++
++test('AC-14 缺少可信校验不得产生 Commit', async () => {
++  const { p, head } = projectWithRepo('ac14');
++  const t = seedTask({ project: p, head, verifyProfileId: null });
++  const challenge = svc.createAuthChallenge(t.id);
++  const issued = svc.issueApproval({ task: t.id, proof: signChallenge(challenge) });
++  assert.equal(issued.ok, true, issued.error);
++  const repo = join(p.dir, 'repo');
++  const before = headOf(repo);
++  const r = await svc.runTask(t.id, { isolation: fakeIsolation });
++  assert.equal(r.ok, false);
++  assert.equal(r.commit?.skipped, true);
++  assert.match(r.commit?.reason ?? '', /缺少必需校验/);
++  assert.equal(headOf(repo), before, '缺少校验不得产生新 commit');
++  assert.equal(svc.getTask(t.id).status, 'failed');
++});
+diff --git a/orchestrator/test/helpers/auth.mjs b/orchestrator/test/helpers/auth.mjs
+new file mode 100644
+index 0000000..8771ff8
+--- /dev/null
++++ b/orchestrator/test/helpers/auth.mjs
+@@ -0,0 +1,50 @@
++/**
++ * 测试用审批签名器：在临时 HOME 下生成 P-256 密钥并安装 SPKI 公钥。
++ *
++ * 仅用于测试准备。生产信任根固定在 ~/.openclaw/jarvis/auth/pubkey.der，
++ * 不允许通过环境变量替换。
++ */
++import { mkdirSync, writeFileSync } from 'node:fs';
++import { join } from 'node:path';
++import { generateKeyPairSync, createSign } from 'node:crypto';
++
++export function installTestAuthKey(home) {
++  const dir = join(home, '.openclaw/jarvis/auth');
++  mkdirSync(dir, { recursive: true });
++  const { privateKey, publicKey } = generateKeyPairSync('ec', { namedCurve: 'prime256v1' });
++  writeFileSync(join(dir, 'pubkey.der'), publicKey.export({ type: 'spki', format: 'der' }));
++
++  const sign = (payload) => {
++    const signer = createSign('sha256');
++    signer.update(payload);
++    return signer.sign(privateKey).toString('base64');
++  };
++
++  const proofFor = (challenge) => ({
++    nonce: challenge.nonce,
++    payload: challenge.payload,
++    signatureB64: sign(challenge.payload)
++  });
++
++  return {
++    sign,
++    proofFor,
++    issueApproval(svc, task, extra = {}) {
++      const challenge = svc.createAuthChallenge(task);
++      return svc.issueApproval({ task, ...extra, proof: proofFor(challenge) });
++    },
++    createVerifyProfile(svc, content, extra = {}) {
++      const challenge = svc.createContentChallenge(content);
++      return svc.createVerifyProfile({
++        project: content.project,
++        name: content.name,
++        program: content.program,
++        argv: content.argv,
++        cwd: content.cwd,
++        timeoutMs: content.timeout_ms,
++        ...extra,
++        proof: proofFor(challenge)
++      });
++    }
++  };
++}
+diff --git a/orchestrator/test/proxy-token.test.mjs b/orchestrator/test/proxy-token.test.mjs
+new file mode 100644
+index 0000000..b281451
+--- /dev/null
++++ b/orchestrator/test/proxy-token.test.mjs
+@@ -0,0 +1,124 @@
++/**
++ * 模型代理令牌生命周期与代理拒绝路径。
++ * 不依赖 Docker：代理是独立 Node 进程，用临时端口和临时密钥文件启动。
++ */
++import { test } from 'node:test';
++import assert from 'node:assert/strict';
++import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
++import { tmpdir } from 'node:os';
++import { join } from 'node:path';
++import { spawn } from 'node:child_process';
++import { createServer } from 'node:net';
++
++const tmp = mkdtempSync(join(tmpdir(), 'jarvis-proxy-'));
++process.env.HOME = tmp;
++process.env.JARVIS_HOME = tmp;
++process.env.JARVIS_DB = join(tmp, 'state.db');
++
++const svc = await import('../src/service.mjs');
++
++const tokenFile = join(tmp, 'proxy', 'active-tokens.json');
++const readTokens = () => JSON.parse(readFileSync(tokenFile, 'utf8'));
++const future = () => new Date(Date.now() + 60_000).toISOString();
++const past = () => new Date(Date.now() - 60_000).toISOString();
++
++function seedExecution(id, taskId) {
++  svc.db()
++    .prepare('INSERT INTO executions (id,task_id,status,started_at) VALUES (?,?,?,?)')
++    .run(id, taskId, 'running', new Date().toISOString());
++}
++
++test('模型令牌：按 Execution 撤销，取消后其他执行令牌不受影响', () => {
++  const p = svc.createProject({ name: '代理令牌', slug: 'proxy-token' });
++  const t = svc.createTask({ project: p.id, title: 'token', input: 'x' });
++  seedExecution('exe_a', t.id);
++  seedExecution('exe_b', t.id);
++
++  const a = svc.registerModelToken('exe_a', t.id);
++  const b = svc.registerModelToken('exe_b', t.id);
++  let tokens = readTokens();
++  assert.equal(tokens[a].execution_id, 'exe_a');
++  assert.equal(tokens[b].execution_id, 'exe_b');
++
++  assert.equal(svc.revokeModelTokensForExecution('exe_a'), 1);
++  tokens = readTokens();
++  assert.equal(tokens[a], undefined);
++  assert.equal(tokens[b].execution_id, 'exe_b');
++
++  svc.revokeModelToken(b);
++  assert.deepEqual(readTokens(), {});
++});
++
++function freePort() {
++  return new Promise((resolve, reject) => {
++    const s = createServer();
++    s.on('error', reject);
++    s.listen(0, '127.0.0.1', () => {
++      const port = s.address().port;
++      s.close(() => resolve(port));
++    });
++  });
++}
++
++async function startProxy(tokens) {
++  const port = await freePort();
++  const keyFile = join(tmp, 'glm.key');
++  const tokFile = join(tmp, 'model-tokens.json');
++  writeFileSync(keyFile, 'sk-test-proxy-key-not-real');
++  writeFileSync(tokFile, JSON.stringify(tokens));
++  const child = spawn(process.execPath, ['orchestrator/docker/egress-proxy.mjs'], {
++    cwd: process.cwd(),
++    env: {
++      ...process.env,
++      PROXY_PORT: String(port),
++      GLM_KEY_FILE: keyFile,
++      MODEL_TOKENS_FILE: tokFile,
++      MODEL_UPSTREAM_HOST: '127.0.0.1'
++    },
++    stdio: ['ignore', 'pipe', 'pipe']
++  });
++  let stderr = '';
++  const ready = new Promise((resolve, reject) => {
++    const timer = setTimeout(() => reject(new Error(`proxy start timeout: ${stderr}`)), 8000);
++    child.stderr.on('data', (d) => {
++      stderr += d.toString();
++      if (stderr.includes('egress proxy on')) {
++        clearTimeout(timer);
++        resolve();
++      }
++    });
++    child.on('exit', (code) => {
++      clearTimeout(timer);
++      reject(new Error(`proxy exited ${code}: ${stderr}`));
++    });
++  });
++  await ready;
++  return { port, child, stop: () => child.kill('SIGKILL') };
++}
++
++test('模型代理：无令牌/过期/已撤销 401，有效令牌才进入上游', async () => {
++  const validA = 'a'.repeat(24);
++  const validB = 'b'.repeat(24);
++  const expired = 'c'.repeat(24);
++  const proxy = await startProxy({
++    [validA]: { execution_id: 'exe_a', task_id: 'tsk_a', expires_at: future() },
++    [expired]: { execution_id: 'exe_c', task_id: 'tsk_c', expires_at: past() }
++  });
++  try {
++    const base = `http://127.0.0.1:${proxy.port}/api/anthropic`;
++    const noToken = await fetch(`${base}/v1/messages`, { signal: AbortSignal.timeout(5000) });
++    assert.equal(noToken.status, 401, '无令牌必须拒绝');
++
++    const expiredRes = await fetch(`${base}/s/${expired}/v1/messages`, { signal: AbortSignal.timeout(5000) });
++    assert.equal(expiredRes.status, 401, '过期令牌必须拒绝');
++
++    const revokedRes = await fetch(`${base}/s/${validB}/v1/messages`, { signal: AbortSignal.timeout(5000) });
++    assert.equal(revokedRes.status, 401, '未签发的令牌必须拒绝');
++
++    // 有效令牌会通过授权检查，然后因为测试上游 127.0.0.1:443 不可达而返回 502。
++    const validRes = await fetch(`${base}/s/${validA}/v1/messages`, { signal: AbortSignal.timeout(5000) });
++    assert.equal(validRes.status, 502, '有效令牌必须通过 401 检查');
++  } finally {
++    proxy.stop();
++  }
++});
+diff --git a/orchestrator/test/security.test.mjs b/orchestrator/test/security.test.mjs
+index aec8c51..fd1576b 100644
+--- a/orchestrator/test/security.test.mjs
++++ b/orchestrator/test/security.test.mjs
+@@ -8,10 +8,13 @@ import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
+ import { tmpdir } from 'node:os';
+ import { join } from 'node:path';
+ import { execFileSync } from 'node:child_process';
++import { installTestAuthKey } from './helpers/auth.mjs';
+ 
+ const tmp = mkdtempSync(join(tmpdir(), 'jarvis-sec-'));
++process.env.HOME = tmp;
+ process.env.JARVIS_HOME = tmp;
+ process.env.JARVIS_DB = join(tmp, 'state.db');
++const auth = installTestAuthKey(tmp);
+ 
+ const svc = await import('../src/service.mjs');
+ const sec = await import('../src/security.mjs');
+@@ -39,7 +42,16 @@ test('AC-01 shell 程序不能登记为校验配置', () => {
+ 
+ test('AC-01 合法校验配置可以用 argv 形式登记', () => {
+   const p = svc.createProject({ name: '合法校验', slug: 'sec-vp2' });
+-  const vp = svc.createVerifyProfile({ project: p.id, name: 'npm-test', program: 'npm', argv: ['test'] });
++  const content = {
++    kind: 'verify_profile',
++    project: p.id,
++    name: 'npm-test',
++    program: 'npm',
++    argv: ['test'],
++    cwd: null,
++    timeout_ms: 300_000
++  };
++  const vp = auth.createVerifyProfile(svc, content);
+   assert.equal(vp.program, 'npm');
+   assert.deepEqual(JSON.parse(vp.argv), ['test']);
+ });
+@@ -99,8 +111,8 @@ test('AC-03 审批后修改执行参数，原审批失效', () => {
+     executorConfig: { mode: 'acceptEdits', cwd: dir }
+   });
+ 
+-  const issued = svc.issueApproval({ task: t.id });
+-  assert.equal(issued.ok, true);
++  const issued = auth.issueApproval(svc, t.id);
++  assert.equal(issued.ok, true, issued.error);
+ 
+   const plan1 = svc.resolveExecutorPlan(svc.getTask(t.id), p);
+   assert.equal(svc.findValidApproval(t.id, plan1.resolved.digest).valid, true);
