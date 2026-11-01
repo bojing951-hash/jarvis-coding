@@ -12,7 +12,8 @@
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
+import { evaluateDockerRaceEvidence, isTrustedGoneInspect } from './b03-docker-evidence.mjs';
 
 const REAL_HOME = homedir();
 const ROOT = mkdtempSync(join(tmpdir(), 'jarvis-b02-docker-'));
@@ -187,11 +188,60 @@ const executionAfter = svc.db().prepare('SELECT * FROM executions WHERE id=?').g
 const resourceAfter = svc.db().prepare('SELECT * FROM execution_resources WHERE id=?').get(resourceRow?.id);
 const taskAfter = svc.getTask(task.id);
 const headAfter = gitHead(repo);
-let containerPs = '';
+let ps = null;
 let inspectAfter = null;
+let events = [];
+let eventsOk = false;
+let eventsError = null;
 if (containerName) {
-  try { containerPs = docker(['ps', '-a', '--filter', `name=${containerName}`, '--format', '{{.Names}} {{.Status}}']); } catch {}
-  try { inspectAfter = docker(['inspect', containerName, '--format', '{{.State.Status}}']); } catch { inspectAfter = 'gone'; }
+  const psRun = spawnSync(DOCKER, ['ps', '-a', '--filter', `name=${containerName}`, '--format', '{{.Names}} {{.Status}}'], {
+    encoding: 'utf8',
+    env: dockerEnv,
+    timeout: 10_000
+  });
+  ps = {
+    ok: psRun.status === 0,
+    status: psRun.status,
+    stdout: psRun.stdout || '',
+    stderr: psRun.stderr || '',
+    error: psRun.error?.message ?? null,
+    signal: psRun.signal ?? null
+  };
+
+  const inspectRun = spawnSync(DOCKER, ['inspect', containerName, '--format', '{{.State.Status}}'], {
+    encoding: 'utf8',
+    env: dockerEnv,
+    timeout: 5_000
+  });
+  inspectAfter = {
+    ok: inspectRun.status === 0,
+    status: inspectRun.status,
+    stdout: inspectRun.stdout || '',
+    stderr: inspectRun.stderr || '',
+    error: inspectRun.error?.message ?? null,
+    signal: inspectRun.signal ?? null,
+    abnormal: Boolean(inspectRun.error || inspectRun.signal || inspectRun.status === null)
+  };
+  inspectAfter.trustedGone = isTrustedGoneInspect(inspectAfter, containerName);
+
+  const eventsRun = spawnSync(
+    DOCKER,
+    [
+      'events',
+      '--since', String(Math.floor(startedAt / 1000) - 1),
+      '--until', String(Math.floor(Date.now() / 1000)),
+      '--filter', `container=${containerName}`,
+      '--format', '{{.Action}}'
+    ],
+    { encoding: 'utf8', env: dockerEnv, timeout: 15_000 }
+  );
+  eventsOk = eventsRun.status === 0;
+  eventsError = eventsRun.error?.message ?? (eventsRun.stderr || '').trim() ?? null;
+  const actions = (eventsRun.stdout || '')
+    .split('\n')
+    .map((x) => x.trim())
+    .filter((x) => ['create', 'start', 'die', 'destroy'].includes(x));
+  events = [...new Set(actions)];
 }
 
 const evidence = {
@@ -216,26 +266,20 @@ const evidence = {
   cancelResolvedBeforeRelease,
   taskStatus: taskAfter.status,
   resultBlocked: result?.blocked ?? null,
-  containerPs,
+  ps,
+  containerPs: ps?.stdout ?? '',
+  events,
+  eventsOk,
+  eventsError,
   gitHeadBefore: headBefore,
   gitHeadAfter: headAfter,
   image: IMAGE
 };
-console.log(JSON.stringify(evidence, null, 2));
 
-const ok =
-  !cancelResolvedBeforeRelease &&
-  cancel?.ok === true &&
-  taskAfter.status === 'cancelled' &&
-  executionAfter?.status === 'cancelled' &&
-  ['stopped', 'abandoned'].includes(resourceAfter?.state) &&
-  containerName === `jarvis-exec-${executionId}` &&
-  Boolean(containerId) &&
-  sawContainerRunning &&
-  containerPs.length === 0 &&
-  headBefore === headAfter;
+const validation = evaluateDockerRaceEvidence(evidence);
+console.log(JSON.stringify({ ...evidence, validation }, null, 2));
 
-if (!ok) {
+if (!validation.ok) {
   cleanup();
   process.exit(1);
 }

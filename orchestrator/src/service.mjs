@@ -1331,7 +1331,7 @@ export async function cancelTask(ref, deps = {}) {
       .all(exRow.id);
     const containerResults = [];
     for (const resource of resources) {
-      containerResults.push(await settleCancelResource(resource, isolation, cancelAt, deps.launchWaitMs ?? 15_000));
+      containerResults.push(await settleCancelResource(resource, isolation, cancelAt, deps.launchWaitMs ?? 15_000, deps.killOptions ?? {}));
     }
     if (!resources.length) {
       // 兼容：老执行没有资源登记
@@ -1822,7 +1822,7 @@ async function launchContainer({ executionId, taskId, kind, name, run }) {
  * 取消屏障：只有资源进入 stopped/abandoned 才视为解决。
  * starting 阶段 docker inspect 返回 gone 不能证明“尚未启动的异步启动”已消失。
  */
-async function settleCancelResource(resource, isolation, cancelAt, waitMs = 15_000) {
+async function settleCancelResource(resource, isolation, cancelAt, waitMs = 15_000, killOptions = {}) {
   const readState = () => db().prepare('SELECT state FROM execution_resources WHERE id=?').get(resource.id)?.state;
   const name = resource.name || '';
   let state = resource.state;
@@ -1874,7 +1874,7 @@ async function settleCancelResource(resource, isolation, cancelAt, waitMs = 15_0
     }
     if (state === 'unknown') return { name, state, confirmed: false, reason: 'unknown_container_state' };
 
-    lastKill = await isolation.killContainer(name);
+    lastKill = await isolation.killContainer(name, killOptions);
     if (lastKill?.reason === 'docker_daemon_unreachable') {
       markContainerUnknown(resource.id);
       return { name, state: 'unknown', confirmed: false, reason: 'docker_daemon_unreachable', ...killMeta() };

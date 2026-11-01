@@ -56,7 +56,7 @@ case "$1" in
       *)
         [ "$mode" = "inspect_timeout" ] && sleep 5
         [ "$mode" = "inspect_exited" ] && { echo "exited"; exit 0; }
-        echo "Error: No such object: x"; exit 1 ;;
+        echo "Error: No such object: $2"; exit 1 ;;
     esac ;;
   *)
     exit 0 ;;

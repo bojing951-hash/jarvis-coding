@@ -47,6 +47,8 @@ export const sh = (cmd, args, opts = {}) =>
             timedOut: false,
             abnormal: false,
             error: null,
+            stdout: stdout || '',
+            stderr: stderr || '',
             out
           });
         }
@@ -64,6 +66,8 @@ export const sh = (cmd, args, opts = {}) =>
           timedOut,
           abnormal,
           error: err.message ?? String(err),
+          stdout: stdout || '',
+          stderr: stderr || '',
           out
         });
       }
@@ -273,15 +277,30 @@ export async function daemonReachable({ timeoutMs = 8_000 } = {}) {
  *  - reason=docker_daemon_unreachable  daemon 失联，终止结果无法确认
  *  - reason=container_still_running    daemon 健康但容器仍在
  */
-export async function killContainer(name, { graceMs = 5000, killTimeoutMs = 15_000, inspectTimeoutMs = 8_000 } = {}) {
+export async function killContainer(name, { graceMs = 5000, killTimeoutMs = 15_000, inspectTimeoutMs = 8_000, pollMs = 200 } = {}) {
   if (!name) return { ok: false, confirmed: false, reason: 'no_container_name' };
 
   const inspectState = async () => {
     const r = await sh(DOCKER, ['inspect', name, '--format', '{{.State.Status}}'], { timeoutMs: inspectTimeoutMs });
-    if (r.ok) return { kind: 'state', value: r.out.trim() };
-    if (/No such object|could not be found/i.test(r.out)) return { kind: 'gone' };
-    if (/Cannot connect|daemon|connection refused/i.test(r.out)) return { kind: 'daemon' };
-    return { kind: 'error', value: r.out.slice(0, 120) };
+
+    // A. 正常完成：只有正常结束的 stdout 可作为状态。
+    if (r.ok) {
+      return { kind: 'state', value: (r.stdout || '').trim(), raw: r };
+    }
+
+    // B. 异常结束：timeout / signal / killed / spawn / maxBuffer。
+    // 无论 stdout/stderr 里出现什么文字，都不能生成可信事实。
+    if (r.abnormal || r.code === null) {
+      return { kind: 'error', abnormal: true, value: (r.error ?? r.out ?? '').slice(0, 160), raw: r };
+    }
+
+    // C. 正常非零退出：只有“正常完成 + 目标身份匹配”的明确不存在证据才是 gone。
+    const evidence = `${r.stdout || ''}\n${r.stderr || ''}`;
+    const escaped = String(name).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const goneRe = new RegExp(`(?:No such object|No such container):\\s*${escaped}(?:\\s|$|['\"\`])`, 'i');
+    if (goneRe.test(evidence)) return { kind: 'gone', raw: r };
+    if (/Cannot connect|daemon|connection refused/i.test(evidence)) return { kind: 'daemon', raw: r };
+    return { kind: 'error', abnormal: false, value: evidence.slice(0, 160), raw: r };
   };
 
   if (!(await daemonReachable())) {
@@ -305,7 +324,7 @@ export async function killContainer(name, { graceMs = 5000, killTimeoutMs = 15_0
       // 未知状态：不得判为已停止（FIX3-E）
       return { ok: false, confirmed: false, reason: 'unknown_container_state', state: st.value, escalated };
     }
-    await sleep(200);
+    await sleep(pollMs);
   }
 
   // 2) 仍未退出 → 升级 SIGKILL
@@ -320,7 +339,7 @@ export async function killContainer(name, { graceMs = 5000, killTimeoutMs = 15_0
     if (st.kind === 'state' && !['running', 'created', 'restarting', 'paused'].includes(st.value)) {
       return { ok: false, confirmed: false, reason: 'unknown_container_state', state: st.value, escalated };
     }
-    await sleep(200);
+    await sleep(pollMs);
   }
   return { ok: false, confirmed: false, reason: 'container_still_running', escalated };
 }

@@ -36,7 +36,7 @@ case "$1" in
   inspect)
     [ "$mode" = "stuck" ] && { echo "running"; exit 0; }
     [ "$mode" = "daemon_down" ] && { echo "Cannot connect to the Docker daemon"; exit 1; }
-    echo "Error: No such object: x"; exit 1 ;;
+    echo "Error: No such object: $2"; exit 1 ;;
   run)
     exit 0 ;;
   *)
