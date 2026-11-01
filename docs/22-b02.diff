@@ -1,0 +1,1207 @@
+diff --git a/docs/contracts/p0-sec-01-b02-qa-v1.0.md b/docs/contracts/p0-sec-01-b02-qa-v1.0.md
+new file mode 100644
+index 0000000..3e6422e
+--- /dev/null
++++ b/docs/contracts/p0-sec-01-b02-qa-v1.0.md
+@@ -0,0 +1,303 @@
++# B02 开发前冻结补充验收契约
++
++契约编号：JARVIS-P0-SEC-01-B02-QA-v1.0  
++状态：FROZEN｜2026-11-01，开发前  
++对应工作包：JARVIS-P0-SEC-01-FIX3-CLOSE-B02
++
++以下十项为本轮正式补充验收要求。
++
++它们不修改原有 22 AC、10 E2E、15 EV，也不替代上一轮 B01-QA-01～07。
++
++## B02-QA-01｜子进程错误语义
++
++**前置条件：** 固定旧版和 B02 新版，目标 Node.js 运行时可用。
++
++**测试动作：**
++
++使用真实 execFile() 和生产 sh() 调用路径，分别注入或触发：
++
++- 正常退出 0。
++- 正常退出非零。
++- 超时并收到 SIGTERM。
++- 外部信号终止。
++- 不存在的可执行文件。
++- 输出超出 maxBuffer。
++- 其他非空 Error 回调。
++
++**预期：**
++
++仅无错误且正常退出 0 的场景返回成功。
++
++任何 Error 不得转换成 code=0 或 ok=true。
++
++**FAIL：**
++
++任何异常执行被归类为成功。
++
++**证据：**
++
++Node 版本、原始 Error、标准化结果、退出码、signal、独立运行日志、旧版失败/新版通过对照。
++
++## B02-QA-02｜Claude、Verify、Audit 结果完整性
++
++**前置条件：** 三种容器执行入口可用。
++
++**测试动作：**
++
++分别触发 Docker CLI 超时、异常退出、启动失败；同时测试正常成功退出。
++
++**预期：**
++
++- 异常不得返回成功的执行结果。
++- Claude 不得因 CLI 超时错误进入正常成功路径。
++- Verify 异常不得被当成通过。
++- Audit 异常不得被当成成功审计。
++- 需要 Verify/Commit 的任务不得因执行超时而越过原有门禁。
++- 合法正常执行仍然成功。
++
++**FAIL：**
++
++异常执行导致 Task done、Execution ok、验证通过或未经满足条件的 Git Commit。
++
++**证据：**
++
++实际入口调用、Task/Execution 状态、验证输出、Git HEAD、异常日志。
++
++## B02-QA-03｜TERM/KILL 超时不得产生假终止证明
++
++**前置条件：** 资源处于 started、running 或 stopping。
++
++**测试动作：**
++
++控制 Docker TERM 与 KILL 返回：
++
++- 成功。
++- 非零失败。
++- 超时 err.code=null。
++- SIGTERM/SIGKILL 异常终止。
++- 未知错误。
++
++并分别组合 inspect=gone、running、exited、未知状态。
++
++**预期：**
++
++- 失败或超时的终止命令不能令 killAccepted=true。
++- 未确认状态不得产生 confirmed=true。
++- 已有独立可信物理停止证据时允许确认停止。
++- 终止命令成功但容器仍运行时不得确认停止。
++
++**FAIL：**
++
++超时的 Docker kill 被误记为成功接受，或者单独的 gone 与不可信 kill 结果导致取消被确认。
++
++**证据：**
++
++终止命令结果、状态查询结果、killAccepted、confirmed、资源状态及取消返回值。
++
++## B02-QA-04｜daemon 失联与未知 Docker 状态
++
++**前置条件：** 存在真实或受控模拟的未终止 Execution。
++
++**测试动作：**
++
++测试：
++
++- Docker info 超时。
++- Docker inspect 超时。
++- daemon 无法连接。
++- 查询结果包含不完整 stdout/stderr。
++- Docker 返回未知状态。
++- 启动流程尚未完成时 inspect 返回 gone。
++- 无资源登记的历史执行取消路径。
++
++**预期：**
++
++不能获得可信停止证据时必须 Fail Closed。
++
++Task 不得错误标记 cancelled。
++
++不得由错误的 Docker info 结果虚构 daemon 健康。
++
++**FAIL：**
++
++daemon 失联、超时或未知结果被当作已确认停止。
++
++**证据：**
++
++Docker 命令日志、Task/Execution/Resource 状态、真实或注入错误、重试行为。
++
++## B02-QA-05｜执行资源终态一致性
++
++**前置条件：** 存在启动中或已启动的 Docker 资源。
++
++**测试动作：**
++
++注入执行适配层正常返回、失败返回、超时与抛出异常；检查 launchContainer() 对资源状态的处理。
++
++必要时使用真实 Docker 验证 CLI 终止与容器状态的差异。
++
++**预期：**
++
++- 确认停止才能写入 stopped。
++- 未确认停止不得伪造资源终态。
++- 取消操作不得利用错误状态提前返回成功。
++- 状态不能被迟到回调覆盖成错误终态。
++
++**FAIL：**
++
++仅因 Docker CLI 抛错或结束，仍未确认真实容器状态就将资源标记为安全停止并据此确认取消。
++
++**证据：**
++
++资源状态转换记录、异常信息、Docker inspect/events、Task/Execution 状态。
++
++## B02-QA-06｜真实 Docker 启动/取消竞态与残留证明
++
++**前置条件：** 隔离测试 Docker 环境，使用唯一测试 Execution ID。
++
++**测试动作：**
++
++在 claimDockerInvocation() 获得许可后、真实 Docker 启动前设置确定性屏障。
++
++调用取消，释放屏障，检查真实创建、运行、终止全过程。
++
++**预期：**
++
++- 取消不得提前成功。
++- 实际发生过目标容器创建。
++- 识别的容器 ID 与数据库 Execution 对应。
++- 取消完成后目标容器真实终止。
++- 不存在迟到副作用。
++- Docker events、inspect、ps 与 SQLite 记录一致。
++- Git HEAD 不发生未经授权的变化。
++
++**FAIL：**
++
++容器名称为空、undefined、与 Execution 不对应；没有真实生命周期证据却宣告通过；或实际存在迟到容器/副作用。
++
++**证据：**
++
++真实 Docker 原始日志、容器 ID、events、inspect、ps、SQLite、Git HEAD、测试时间顺序。
++
++## B02-QA-07｜合法终止与 SIGKILL 升级
++
++**前置条件：** 真实运行中的测试容器。
++
++**测试动作：**
++
++分别执行：
++
++- 正常 SIGTERM 终止。
++- 忽略 SIGTERM 后升级 SIGKILL。
++- Docker 容器已独立确认退出。
++- Docker 已停止但 CLI 返回异常。
++- 取消重复调用。
++
++**预期：**
++
++能够确认实际停止的合法路径继续正常工作。
++
++无法确认停止的路径保持未确认。
++
++重复取消不得引入新 Execution 或错误终态。
++
++**FAIL：**
++
++修复造成正常取消全面失效，或者存在错误取消确认。
++
++**证据：**
++
++真实 TERM/KILL 结果、Docker 状态、Execution/Resource 状态、重复调用记录。
++
++## B02-QA-08｜真实合法正向执行不回归
++
++**前置条件：** 合法用户审批、真实 Docker、Claude Code、GLM 和可信验证配置。
++
++**测试动作：**
++
++在隔离测试仓库中完成：
++
++审批 → 执行 → Verify → Git Commit → Ref 验证。
++
++**预期：**
++
++- Task = done。
++- Execution = ok。
++- Verify 成功。
++- Commit 真实存在。
++- Ref 指向正确 Commit。
++- 修改文件在授权范围内。
++- 容器资源全部正常结束。
++- 凭据和令牌正常清理。
++
++**FAIL：**
++
++异常被误判为成功，或修复破坏正常合法执行。
++
++**证据：**
++
++脱敏真实执行日志、授权结果、Git 对象和 Ref、SQLite 状态、Docker 容器记录。
++
++若无法获得真实 Mac/SE/GLM 环境，标记 WAITING，不得用 Mock 替代。
++
++## B02-QA-09｜旧失败/新通过与 CI 质量
++
++**前置条件：** G0 基线及新增测试已固定。
++
++**测试动作：**
++
++1. 在 d4d8795 上复现 DEF-01。
++2. 在新固定 Commit 上使用同等条件测试。
++3. 重跑 B01-QA-01～07。
++4. 重跑原有安全测试与故障注入。
++5. 运行真实 Docker 专项测试。
++6. 在新固定 Commit 触发 GitHub CI。
++7. 运行正式契约完整性检查。
++
++**预期：**
++
++- 旧版能暴露原问题。
++- 新版通过同一失败条件。
++- 不降低测试断言。
++- 所有必需 CI 检查通过。
++- SKIP 明确列出，不能冒充 PASS。
++- 原正式契约与 G0 冻结补充契约均未修改。
++
++**FAIL：**
++
++无法复现旧缺陷、通过削弱测试制造成功、CI 未在新固定 SHA 运行、冻结契约变化或存在未解释的必需测试失败。
++
++**证据：**
++
++新旧测试日志、Commit、Diff、CI URL、测试统计、契约 SHA。
++
++## B02-QA-10｜完整 P0 验收继承与证据交付
++
++**前置条件：** B02 开发和测试完成。
++
++**测试动作：**
++
++按原冻结契约重新整理：
++
++- 22 项 AC。
++- 10 项 E2E。
++- 15 项 EV。
++
++并保留 B01-QA-01～07 与 B02-QA-01～10 的对应证据。
++
++**预期：**
++
++- 无遗漏。
++- 每项有对应测试、代码或真实证据。
++- 明确 PASS、FAIL、WAITING。
++- 明确源码、CI、Mock、真实 SQLite/Git、真实 Docker、真实 Mac 与真实 OpenClaw 的差异。
++- 无法完成的真实环境测试列出补证条件。
++- 开发方不自行宣布正式 PASS。
++
++**FAIL：**
++
++漏掉原冻结验收项目、用模拟证据替代真实 E2E、掩盖 SKIP 或在证据不足时宣布完成。
++
++**证据：**
++
++完整验收映射矩阵、运行报告、证据包清单和哈希。
+diff --git a/orchestrator/scripts/verify-b01-docker-race.mjs b/orchestrator/scripts/verify-b01-docker-race.mjs
+index 7596d2a..9d26ab0 100644
+--- a/orchestrator/scripts/verify-b01-docker-race.mjs
++++ b/orchestrator/scripts/verify-b01-docker-race.mjs
+@@ -1,32 +1,48 @@
+ #!/usr/bin/env node
+ /**
+- * B01 真实 Docker 启动/取消竞态。
++ * B02-QA-06 / A4-04：真实 Docker 启动/取消竞态与残留证明。
+  *
+- * 用一个 wrapper 在真实 `docker run` 之前建立文件屏障，确保：
+- *   启动意图/started 已登记 → docker run 尚未执行 → 取消 → 释放屏障 → 真实容器启动。
+- * 修复后取消必须等待并实际终止容器；不得在屏障释放前返回 ok=true。
++ * - 唯一隔离临时目录，不清理非本测试文件/容器/网络
++ * - Execution ID 与容器名从真实 SQLite 读取，不用 result.execution 作为唯一来源
++ * - 记录 container ID、inspect 状态序列、正确名称的 docker ps -a、Git HEAD
++ * - 屏障在 claimDockerInvocation 之后、真实 docker run 之前
+  *
+  * 需要本机 Docker + 测试镜像 jarvis-b01-exec:test（alpine + sleep 120）。
+- * 不消耗模型额度。
+  */
+-import { chmodSync, existsSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+-import { homedir } from 'node:os';
++import { chmodSync, existsSync, mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
++import { homedir, tmpdir } from 'node:os';
+ import { join } from 'node:path';
+ import { execFileSync } from 'node:child_process';
+ 
+ const REAL_HOME = homedir();
+-const HOME_DIR = '/tmp/jarvis-b01-docker/home';
++const ROOT = mkdtempSync(join(tmpdir(), 'jarvis-b02-docker-'));
++const HOME_DIR = join(ROOT, 'home');
+ const DOCKER = process.env.JARVIS_DOCKER_BIN_REAL || '/Applications/Docker.app/Contents/Resources/bin/docker';
+-const IMAGE = process.env.JARVIS_B01_IMAGE || 'jarvis-b01-exec:test';
+-const ENTERED = '/tmp/jarvis-b01-docker/run-entered';
+-const RELEASE = '/tmp/jarvis-b01-docker/run-release';
+-const WRAPPER = '/tmp/jarvis-b01-docker/docker-wrapper.sh';
++const IMAGE = process.env.JARVIS_B02_IMAGE || 'jarvis-b01-exec:test';
++const ENTERED = join(ROOT, 'run-entered');
++const RELEASE = join(ROOT, 'run-release');
++const WRAPPER = join(ROOT, 'docker-wrapper.sh');
++const LOGS = join(ROOT, 'logs');
+ 
+-rmSync('/tmp/jarvis-b01-docker', { recursive: true, force: true });
+ mkdirSync(join(HOME_DIR, '.claude'), { recursive: true });
+ mkdirSync(join(HOME_DIR, 'jarvis'), { recursive: true });
++mkdirSync(LOGS, { recursive: true });
+ writeFileSync(join(HOME_DIR, '.claude/settings.json'), JSON.stringify({ env: { ANTHROPIC_MODEL: 'test' } }));
+ 
++const dockerEnv = { ...process.env, HOME: REAL_HOME };
++if (!process.env.DOCKER_HOST && existsSync(join(REAL_HOME, '.docker/run/docker.sock'))) {
++  process.env.DOCKER_HOST = `unix://${join(REAL_HOME, '.docker/run/docker.sock')}`;
++  dockerEnv.DOCKER_HOST = process.env.DOCKER_HOST;
++}
++
++try {
++  execFileSync(DOCKER, ['image', 'inspect', IMAGE], { stdio: 'ignore', env: dockerEnv, timeout: 20_000 });
++} catch {
++  console.error(`missing test image: ${IMAGE}`);
++  console.error('build: docker build -t ' + IMAGE + ' /tmp/jarvis-b01-image');
++  process.exit(2);
++}
++
+ writeFileSync(WRAPPER, `#!/bin/sh
+ if [ "$1" = "run" ]; then
+   : > "${ENTERED}"
+@@ -41,7 +57,6 @@ exec "${DOCKER}" "$@"
+ `);
+ chmodSync(WRAPPER, 0o755);
+ 
+-process.env.DOCKER_HOST = process.env.DOCKER_HOST || `unix://${join(REAL_HOME, '.docker/run/docker.sock')}`;
+ process.env.HOME = HOME_DIR;
+ process.env.JARVIS_HOME = join(HOME_DIR, 'jarvis');
+ process.env.JARVIS_DB = join(HOME_DIR, 'jarvis', 'state.db');
+@@ -50,7 +65,6 @@ process.env.JARVIS_EXECUTOR_IMAGE = IMAGE;
+ process.env.JARVIS_EXECUTOR_NETWORK = 'jarvis-internal';
+ 
+ const svc = await import('../src/service.mjs');
+-const ex = await import('../src/executor.mjs');
+ 
+ const gitRepo = (dir) => {
+   mkdirSync(dir, { recursive: true });
+@@ -61,6 +75,8 @@ const gitRepo = (dir) => {
+   g('-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-q', '-m', 'init');
+   return g('rev-parse', 'HEAD').trim();
+ };
++const gitHead = (dir) => execFileSync('git', ['-C', dir, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
++const docker = (args) => execFileSync(DOCKER, args, { encoding: 'utf8', env: dockerEnv, stdio: ['ignore', 'pipe', 'pipe'] }).trim();
+ 
+ const waitForFile = async (path, label, failCheck = () => null) => {
+   for (let i = 0; i < 600; i++) {
+@@ -73,103 +89,153 @@ const waitForFile = async (path, label, failCheck = () => null) => {
+   throw failure || new Error(`${label} timeout`);
+ };
+ 
+-const p = svc.createProject({ name: 'B01 Docker Race', slug: `b01-docker-${Date.now().toString(36)}` });
+-const repo = join(p.dir, 'repo');
+-const head = gitRepo(repo);
++const project = svc.createProject({ name: 'B02 Docker Race', slug: `b02-docker-${Date.now().toString(36)}` });
++const repo = join(project.dir, 'repo');
++const base = gitRepo(repo);
++const headBefore = gitHead(repo);
+ const task = svc.createTask({
+-  project: p.id,
+-  title: 'B01 docker race',
++  project: project.id,
++  title: 'B02 docker race',
+   input: 'noop',
+   kind: 'executor',
+   executor: 'claude-code',
+-  executorConfig: { mode: 'plan', repo: 'repo', base_commit: head }
++  executorConfig: { mode: 'plan', repo: 'repo', base_commit: base }
+ });
+ 
++let containerName = null;
++let containerId = null;
++let executionId = null;
++let executionRow = null;
++let resourceRow = null;
++let cancel = null;
++let result = null;
++let runFailure = null;
+ let cancelResolvedBeforeRelease = false;
+ let releaseWritten = false;
+ let sawContainerRunning = false;
+-let cancel = null;
+-let result = null;
++const observedStates = [];
++const startedAt = Date.now();
++let releaseAt = null;
++
++const cleanup = () => {
++  if (!containerName) return;
++  try {
++    execFileSync(DOCKER, ['rm', '-f', containerName], { stdio: 'ignore', env: dockerEnv, timeout: 30_000 });
++  } catch {}
++};
++process.on('exit', cleanup);
++
+ try {
+-  let runFailure = null;
+   const running = svc.runTask(task.id);
+   running.catch((e) => { runFailure = e; });
+   await waitForFile(ENTERED, 'docker-run-entered', () => runFailure);
+ 
++  // 以真实 SQLite 为准：Execution ID、容器名、资源行。
++  executionRow = svc.db().prepare("SELECT * FROM executions WHERE task_id=? AND status='running' ORDER BY started_at DESC").get(task.id);
++  if (!executionRow) throw new Error('no running execution row at docker barrier');
++  executionId = executionRow.id;
++  resourceRow = svc.db().prepare("SELECT * FROM execution_resources WHERE execution_id=? AND kind='claude' ORDER BY started_at DESC").get(executionId);
++  if (!resourceRow) throw new Error(`no claude resource row for execution ${executionId}`);
++  containerName = `jarvis-exec-${executionId}`;
++  if (resourceRow.name !== containerName) {
++    throw new Error(`resource name mismatch: ${resourceRow.name} != ${containerName}`);
++  }
++
+   const cancelling = svc.cancelTask(task.id);
+   cancelling.then((r) => { cancel = r; cancelResolvedBeforeRelease = !releaseWritten; });
+-  for (let i = 0; i < 500; i++) {
++  for (let i = 0; i < 1000; i++) {
+     if (['cancel_requested', 'cancelled'].includes(svc.getTask(task.id).status)) break;
+     await new Promise((r) => setImmediate(r));
+   }
+-  assertStatus('cancel_requested or cancelled', ['cancel_requested', 'cancelled']);
+-  // 此刻真实 docker run 仍被 wrapper 挡住；取消不得已返回 ok=true。
++  if (!['cancel_requested', 'cancelled'].includes(svc.getTask(task.id).status)) {
++    throw new Error(`task not marked cancel_requested: ${svc.getTask(task.id).status}`);
++  }
++  // 真实 docker run 仍被屏障挡住：取消不得已返回成功。
+   await new Promise((r) => setImmediate(r));
+   if (cancelResolvedBeforeRelease) {
+     throw new Error('cancel reported complete before the delayed docker run was released');
+   }
+ 
+-  releaseWritten = true;
+-  const runningExec = svc.db().prepare("SELECT id FROM executions WHERE task_id=? AND status='running' ORDER BY started_at DESC").get(task.id);
+-  const containerName = runningExec ? `jarvis-exec-${runningExec.id}` : null;
+   const pollContainer = (async () => {
+-    if (!containerName) return;
+-    for (let i = 0; i < 600; i++) {
++    for (let i = 0; i < 800; i++) {
+       try {
+-        const status = execFileSync(DOCKER, ['inspect', containerName, '--format', '{{.State.Status}}'], {
+-          encoding: 'utf8',
+-          stdio: ['ignore', 'pipe', 'ignore'],
+-          env: { ...process.env, HOME: REAL_HOME, DOCKER_HOST: process.env.DOCKER_HOST }
+-        }).trim();
++        const status = docker(['inspect', containerName, '--format', '{{.State.Status}}']);
++        if (status && !observedStates.includes(status)) observedStates.push(status);
+         if (['created', 'running'].includes(status)) sawContainerRunning = true;
++        const id = docker(['inspect', containerName, '--format', '{{.Id}}']);
++        if (id) containerId = id;
+       } catch {}
+       await new Promise((r) => setTimeout(r, 10));
+     }
+   })();
++
++  releaseWritten = true;
++  releaseAt = Date.now();
+   writeFileSync(RELEASE, 'go');
+   cancel = await cancelling;
+   result = await running;
+   await pollContainer;
+ } finally {
+-  try { releaseWritten = true; writeFileSync(RELEASE, 'go'); } catch {}
++  if (!releaseWritten) {
++    releaseWritten = true;
++    releaseAt = Date.now();
++    try { writeFileSync(RELEASE, 'go'); } catch {}
++  }
+ }
+ 
+-function assertStatus(_label, allowed) {
+-  const s = svc.getTask(task.id).status;
+-  if (!allowed.includes(s)) throw new Error(`task status ${s}`);
++const executionAfter = svc.db().prepare('SELECT * FROM executions WHERE id=?').get(executionId);
++const resourceAfter = svc.db().prepare('SELECT * FROM execution_resources WHERE id=?').get(resourceRow?.id);
++const taskAfter = svc.getTask(task.id);
++const headAfter = gitHead(repo);
++let containerPs = '';
++let inspectAfter = null;
++if (containerName) {
++  try { containerPs = docker(['ps', '-a', '--filter', `name=${containerName}`, '--format', '{{.Names}} {{.Status}}']); } catch {}
++  try { inspectAfter = docker(['inspect', containerName, '--format', '{{.State.Status}}']); } catch { inspectAfter = 'gone'; }
+ }
+ 
+-const resource = svc.db().prepare('SELECT * FROM execution_resources WHERE task_id=?').get(task.id);
+-const execution = svc.db().prepare('SELECT * FROM executions WHERE task_id=? ORDER BY started_at DESC').get(task.id);
+-const ps = execFileSync(DOCKER, ['ps', '-a', '--filter', `name=jarvis-exec-${result?.execution}`, '--format', '{{.Names}} {{.Status}}'], {
+-  encoding: 'utf8',
+-  env: { ...process.env, HOME: REAL_HOME, DOCKER_HOST: process.env.DOCKER_HOST }
+-}).trim();
+-
+ const evidence = {
++  testRoot: ROOT,
++  startedAt,
++  releaseAt,
+   task: task.id,
+-  taskStatus: svc.getTask(task.id).status,
++  executionId,
++  executionIdSource: 'sqlite executions.status=running at docker barrier',
++  executionStatus: executionAfter?.status ?? null,
++  resourceId: resourceRow?.id ?? null,
++  resourceName: resourceRow?.name ?? null,
++  resourceState: resourceAfter?.state ?? null,
++  resourceStoppedAt: resourceAfter?.stopped_at ?? null,
++  containerName,
++  containerId,
++  containerNameMatchesExecution: containerName === `jarvis-exec-${executionId}`,
++  sawContainerRunning,
++  observedStates,
++  inspectAfter,
+   cancelOk: cancel?.ok ?? null,
+   cancelResolvedBeforeRelease,
+-  executionStatus: execution?.status ?? null,
+-  resourceState: resource?.state ?? null,
+-  resourceStoppedAt: resource?.stopped_at ?? null,
++  taskStatus: taskAfter.status,
+   resultBlocked: result?.blocked ?? null,
+-  resultExitCode: result?.exitCode ?? null,
+-  sawContainerRunning,
+-  containerPs: ps,
++  containerPs,
++  gitHeadBefore: headBefore,
++  gitHeadAfter: headAfter,
+   image: IMAGE
+ };
+ console.log(JSON.stringify(evidence, null, 2));
+ 
+-if (
+-  cancelResolvedBeforeRelease ||
+-  !cancel?.ok ||
+-  svc.getTask(task.id).status !== 'cancelled' ||
+-  execution?.status !== 'cancelled' ||
+-  !['stopped', 'abandoned'].includes(resource?.state) ||
+-  !sawContainerRunning ||
+-  ps.length > 0
+-) {
++const ok =
++  !cancelResolvedBeforeRelease &&
++  cancel?.ok === true &&
++  taskAfter.status === 'cancelled' &&
++  executionAfter?.status === 'cancelled' &&
++  ['stopped', 'abandoned'].includes(resourceAfter?.state) &&
++  containerName === `jarvis-exec-${executionId}` &&
++  Boolean(containerId) &&
++  sawContainerRunning &&
++  containerPs.length === 0 &&
++  headBefore === headAfter;
++
++if (!ok) {
++  cleanup();
+   process.exit(1);
+ }
+diff --git a/orchestrator/src/isolation.mjs b/orchestrator/src/isolation.mjs
+index fb58a3d..389ee9d 100644
+--- a/orchestrator/src/isolation.mjs
++++ b/orchestrator/src/isolation.mjs
+@@ -25,22 +25,60 @@ function dockerBin() {
+ }
+ const DOCKER = dockerBin();
+ 
+-const sh = (cmd, args, opts = {}) =>
++/**
++ * B02：唯一成功条件是 execFile 无错误且正常退出 0。
++ * timeout / signal / spawn error / maxBuffer 都不得映射成 code=0。
++ */
++export const sh = (cmd, args, opts = {}) =>
+   new Promise((resolve) => {
+-    execFile(cmd, args, { timeout: opts.timeoutMs ?? 20_000, maxBuffer: 8 * 1024 * 1024 }, (err, stdout, stderr) =>
+-      resolve({ code: err?.code ?? 0, out: (stdout || '') + (stderr || '') })
++    execFile(
++      cmd,
++      args,
++      { timeout: opts.timeoutMs ?? 20_000, maxBuffer: opts.maxBuffer ?? 8 * 1024 * 1024 },
++      (err, stdout, stderr) => {
++        const out = (stdout || '') + (stderr || '');
++        if (!err) {
++          return resolve({
++            ok: true,
++            code: 0,
++            errorCode: null,
++            signal: null,
++            killed: false,
++            timedOut: false,
++            abnormal: false,
++            error: null,
++            out
++          });
++        }
++        const code = typeof err.code === 'number' ? err.code : null;
++        const signal = err.signal ?? null;
++        const killed = err.killed === true;
++        const timedOut = Boolean(killed && signal);
++        const abnormal = Boolean(timedOut || signal || code === null);
++        return resolve({
++          ok: false,
++          code,
++          errorCode: err.code ?? null,
++          signal,
++          killed,
++          timedOut,
++          abnormal,
++          error: err.message ?? String(err),
++          out
++        });
++      }
+     );
+   });
+ 
+ /** 实际探测 Docker 守护进程，而不是只看命令是否存在。 */
+ export async function isolationStatus() {
+   const bin = await sh('/bin/sh', ['-c', `command -v ${DOCKER}`]).catch(() => ({ code: 1, out: '' }));
+-  if (bin.code !== 0) {
+-    return { available: false, backend: 'docker', reason: 'docker 命令不存在' };
++  if (!bin.ok || bin.code !== 0) {
++    return { available: false, backend: 'docker', reason: `docker 命令不可用: ${(bin.error ?? bin.out) || 'unknown'}` };
+   }
+   const info = await sh(DOCKER, ['info', '--format', '{{.ServerVersion}}'], { timeoutMs: 15_000 });
+-  if (info.code !== 0) {
+-    return { available: false, backend: 'docker', reason: `docker 守护进程不可用: ${info.out.slice(0, 200)}` };
++  if (!info.ok) {
++    return { available: false, backend: 'docker', reason: `docker 守护进程不可用: ${(info.error ?? info.out ?? 'unknown').slice(0, 200)}` };
+   }
+   const image = process.env.JARVIS_EXECUTOR_IMAGE || 'jarvis-executor:2.1.104';
+   if (!image) {
+@@ -52,13 +90,13 @@ export async function isolationStatus() {
+     };
+   }
+   const img = await sh(DOCKER, ['image', 'inspect', image, '--format', '{{.Id}}'], { timeoutMs: 15_000 });
+-  if (img.code !== 0) {
+-    return { available: false, backend: 'docker', serverVersion: info.out.trim(), reason: `执行镜像不可用: ${image}` };
++  if (!img.ok) {
++    return { available: false, backend: 'docker', serverVersion: info.out.trim(), reason: `执行镜像不可用: ${image} (${(img.error ?? img.out ?? 'unknown').slice(0, 160)})` };
+   }
+   const net = process.env.JARVIS_EXECUTOR_NETWORK || 'jarvis-internal';
+   const netCheck = await sh(DOCKER, ['network', 'inspect', net, '--format', '{{.Internal}}'], { timeoutMs: 10_000 });
+-  if (netCheck.code !== 0) {
+-    return { available: false, backend: 'docker', serverVersion: info.out.trim(), image: img.out.trim(), reason: `隔离网络不存在: ${net}` };
++  if (!netCheck.ok) {
++    return { available: false, backend: 'docker', serverVersion: info.out.trim(), image: img.out.trim(), reason: `隔离网络不存在: ${net} (${(netCheck.error ?? netCheck.out ?? 'unknown').slice(0, 160)})` };
+   }
+   const internal = netCheck.out.trim() === 'true';
+   // DEF-03：策略要求内部隔离网络。Internal=false 意味着存在外网路由，必须 fail closed。
+@@ -105,7 +143,7 @@ export async function isolationStatus() {
+ export async function egressProxyUrl(network = process.env.JARVIS_EXECUTOR_NETWORK || 'jarvis-internal') {
+   const name = process.env.JARVIS_PROXY_CONTAINER || 'jarvis-proxy';
+   const r = await sh(DOCKER, ['inspect', name, '--format', '{{json .NetworkSettings.Networks}}'], { timeoutMs: 10_000 });
+-  if (r.code !== 0) return null;
++  if (!r.ok) return null;
+   try {
+     const nets = JSON.parse(r.out.trim());
+     return nets?.[network]?.IPAddress ? `http://${nets[network].IPAddress}:8888` : null;
+@@ -204,8 +242,13 @@ export async function runClaudeIsolated({
+     try { parsed = JSON.parse(r.out.slice(at)); } catch { parsed = null; }
+   }
+   return {
+-    ok: r.code === 0,
++    ok: r.ok,
+     exitCode: r.code,
++    signal: r.signal,
++    killed: r.killed,
++    timedOut: r.timedOut,
++    abnormal: r.abnormal,
++    cliError: r.abnormal ? r.error : null,
+     durationMs: Date.now() - started,
+     text: parsed?.result ?? r.out.slice(-4000),
+     isolated: true,
+@@ -219,9 +262,9 @@ export async function runClaudeIsolated({
+ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+ 
+ /** 确认 Docker daemon 是否可用（与「容器不存在」区分）。 */
+-export async function daemonReachable() {
+-  const r = await sh(DOCKER, ['info', '--format', '{{.ServerVersion}}'], { timeoutMs: 8_000 });
+-  return r.code === 0;
++export async function daemonReachable({ timeoutMs = 8_000 } = {}) {
++  const r = await sh(DOCKER, ['info', '--format', '{{.ServerVersion}}'], { timeoutMs });
++  return r.ok && r.code === 0;
+ }
+ 
+ /**
+@@ -230,12 +273,12 @@ export async function daemonReachable() {
+  *  - reason=docker_daemon_unreachable  daemon 失联，终止结果无法确认
+  *  - reason=container_still_running    daemon 健康但容器仍在
+  */
+-export async function killContainer(name, { graceMs = 5000 } = {}) {
++export async function killContainer(name, { graceMs = 5000, killTimeoutMs = 15_000, inspectTimeoutMs = 8_000 } = {}) {
+   if (!name) return { ok: false, confirmed: false, reason: 'no_container_name' };
+ 
+   const inspectState = async () => {
+-    const r = await sh(DOCKER, ['inspect', name, '--format', '{{.State.Status}}'], { timeoutMs: 8_000 });
+-    if (r.code === 0) return { kind: 'state', value: r.out.trim() };
++    const r = await sh(DOCKER, ['inspect', name, '--format', '{{.State.Status}}'], { timeoutMs: inspectTimeoutMs });
++    if (r.ok) return { kind: 'state', value: r.out.trim() };
+     if (/No such object|could not be found/i.test(r.out)) return { kind: 'gone' };
+     if (/Cannot connect|daemon|connection refused/i.test(r.out)) return { kind: 'daemon' };
+     return { kind: 'error', value: r.out.slice(0, 120) };
+@@ -248,14 +291,14 @@ export async function killContainer(name, { graceMs = 5000 } = {}) {
+   const STOPPED = new Set(['exited', 'dead', 'removing']);
+ 
+   // 1) 先请求优雅终止（SIGTERM）
+-  const term = await sh(DOCKER, ['kill', '--signal', 'TERM', name], { timeoutMs: 15_000 });
+-  let killAccepted = term.code === 0;
++  const term = await sh(DOCKER, ['kill', '--signal', 'TERM', name], { timeoutMs: killTimeoutMs });
++  let killAccepted = term.ok;
+ 
+   let escalated = false;
+   const deadline = Date.now() + graceMs;
+   while (Date.now() < deadline) {
+     const st = await inspectState();
+-    if (st.kind === 'gone') return { ok: true, confirmed: true, state: 'gone', escalated, killAccepted };
++    if (st.kind === 'gone') return { ok: killAccepted, confirmed: killAccepted, state: 'gone', escalated, killAccepted, reason: killAccepted ? undefined : 'kill_unaccepted_and_container_gone' };
+     if (st.kind === 'daemon') return { ok: false, confirmed: false, reason: 'docker_daemon_unreachable' };
+     if (st.kind === 'state' && STOPPED.has(st.value)) return { ok: true, confirmed: true, state: st.value, escalated, killAccepted };
+     if (st.kind === 'state' && !['running', 'created', 'restarting', 'paused'].includes(st.value)) {
+@@ -267,11 +310,11 @@ export async function killContainer(name, { graceMs = 5000 } = {}) {
+ 
+   // 2) 仍未退出 → 升级 SIGKILL
+   escalated = true;
+-  const kill = await sh(DOCKER, ['kill', '--signal', 'KILL', name], { timeoutMs: 15_000 });
+-  if (kill.code === 0) killAccepted = true;
++  const kill = await sh(DOCKER, ['kill', '--signal', 'KILL', name], { timeoutMs: killTimeoutMs });
++  if (kill.ok) killAccepted = true;
+   for (let i = 0; i < 25; i++) {
+     const st = await inspectState();
+-    if (st.kind === 'gone') return { ok: true, confirmed: true, state: 'gone', escalated, killAccepted };
++    if (st.kind === 'gone') return { ok: killAccepted, confirmed: killAccepted, state: 'gone', escalated, killAccepted, reason: killAccepted ? undefined : 'kill_unaccepted_and_container_gone' };
+     if (st.kind === 'daemon') return { ok: false, confirmed: false, reason: 'docker_daemon_unreachable', escalated };
+     if (st.kind === 'state' && STOPPED.has(st.value)) return { ok: true, confirmed: true, state: st.value, escalated, killAccepted };
+     if (st.kind === 'state' && !['running', 'created', 'restarting', 'paused'].includes(st.value)) {
+@@ -333,7 +376,17 @@ export async function runInWorkdir({ workdir, program, args = [], image, name, r
+   }
+   const r = await runPromise;
+   try { rmSync(cidDir, { recursive: true, force: true }); } catch {}
+-  return { ok: r.code === 0, exitCode: r.code, durationMs: Date.now() - started, output: r.out.slice(-4000) };
++  return {
++    ok: r.ok,
++    exitCode: r.code,
++    signal: r.signal,
++    killed: r.killed,
++    timedOut: r.timedOut,
++    abnormal: r.abnormal,
++    cliError: r.abnormal ? r.error : null,
++    durationMs: Date.now() - started,
++    output: r.out.slice(-4000)
++  };
+ }
+ 
+ /** 隔离不可用时的统一拒绝。 */
+diff --git a/orchestrator/src/service.mjs b/orchestrator/src/service.mjs
+index a56fbe1..5ad4fe2 100644
+--- a/orchestrator/src/service.mjs
++++ b/orchestrator/src/service.mjs
+@@ -1796,11 +1796,22 @@ async function launchContainer({ executionId, taskId, kind, name, run }) {
+   try {
+     result = await run(intent.id);
+   } catch (e) {
+-    finishContainerResource(intent.id);
++    // CLI 抛错不等于真实容器已停止；保持 unknown，等待人工/取消核查。
++    markContainerUnknown(intent.id);
+     throw e;
+   }
+   if (result?.cancelled) {
+     abandonContainerResource(intent.id);
++  } else if (
++    !result ||
++    result.abnormal === true ||
++    result.timedOut === true ||
++    result.signal ||
++    result.killed === true ||
++    result.cliError
++  ) {
++    // Docker CLI 超时/信号/启动失败：无法证明容器已停止。
++    markContainerUnknown(intent.id);
+   } else {
+     finishContainerResource(intent.id);
+   }
+diff --git a/orchestrator/test/b02-timeout.test.mjs b/orchestrator/test/b02-timeout.test.mjs
+new file mode 100644
+index 0000000..f1d5d12
+--- /dev/null
++++ b/orchestrator/test/b02-timeout.test.mjs
+@@ -0,0 +1,375 @@
++/**
++ * B02-QA-01..05: 子进程错误语义、Claude/Verify/Audit 结果完整性、
++ * TERM/KILL 证明、daemon 失联、资源终态。
++ *
++ * 使用真实 production sh()/runClaudeIsolated()/runInWorkdir()/killContainer()
++ * 与真实 execFile；Docker 本身用受控 fake CLI 注入异常，不依赖模型。
++ */
++import { test } from 'node:test';
++import assert from 'node:assert/strict';
++import { mkdtempSync, mkdirSync, writeFileSync, chmodSync } from 'node:fs';
++import { tmpdir } from 'node:os';
++import { join } from 'node:path';
++import { execFileSync } from 'node:child_process';
++
++const tmp = mkdtempSync(join(tmpdir(), 'jarvis-b02-'));
++process.env.HOME = tmp;
++process.env.JARVIS_HOME = join(tmp, 'jarvis');
++process.env.JARVIS_DB = join(tmp, 'state.db');
++process.env.JARVIS_EXECUTOR_IMAGE = 'fake-image:1';
++process.env.JARVIS_EXECUTOR_NETWORK = 'fake-net';
++mkdirSync(join(tmp, '.claude'), { recursive: true });
++writeFileSync(join(tmp, '.claude/settings.json'), JSON.stringify({ env: { ANTHROPIC_MODEL: 'test' } }));
++
++const fakeDocker = join(tmp, 'docker-fake.sh');
++writeFileSync(fakeDocker, `#!/bin/sh
++mode="\${FAKE_DOCKER_MODE:-ok}"
++case "$1" in
++  info)
++    [ "$mode" = "info_signal" ] && kill -TERM $$
++    [ "$mode" = "info_timeout" ] && sleep 5
++    echo "29.9.2"; exit 0 ;;
++  image)
++    echo "sha256:fake"; exit 0 ;;
++  network)
++    echo "true"; exit 0 ;;
++  run)
++    case "$*" in
++      *--entrypoint*)
++        [ "$mode" = "verify_signal" ] && kill -TERM $$
++        [ "$mode" = "verify_timeout" ] && sleep 5
++        [ "$mode" = "verify_nonzero" ] && exit 7
++        exit 0 ;;
++      *)
++        [ "$mode" = "run_signal" ] && kill -TERM $$
++        [ "$mode" = "run_timeout" ] && sleep 5
++        [ "$mode" = "run_nonzero" ] && exit 7
++        exit 0 ;;
++    esac ;;
++  kill)
++    [ "$mode" = "kill_timeout" ] && sleep 5
++    { [ "$mode" = "kill_signal" ] || [ "$mode" = "inspect_exited" ]; } && kill -TERM $$
++    exit 0 ;;
++  inspect)
++    case "$*" in
++      *jarvis-proxy*) echo '{"fake-net":{"IPAddress":"172.18.0.99"}}'; exit 0 ;;
++      *)
++        [ "$mode" = "inspect_timeout" ] && sleep 5
++        [ "$mode" = "inspect_exited" ] && { echo "exited"; exit 0; }
++        echo "Error: No such object: x"; exit 1 ;;
++    esac ;;
++  *)
++    exit 0 ;;
++esac
++`);
++chmodSync(fakeDocker, 0o755);
++process.env.JARVIS_DOCKER_BIN = fakeDocker;
++
++const iso = await import('../src/isolation.mjs');
++const svc = await import('../src/service.mjs');
++
++const gitRepo = (dir) => {
++  mkdirSync(dir, { recursive: true });
++  const g = (...a) => execFileSync('git', ['-C', dir, ...a], { encoding: 'utf8' });
++  g('init', '-q');
++  writeFileSync(join(dir, 'a.txt'), 'x\n');
++  g('add', '-A');
++  g('-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-q', '-m', 'init');
++  return g('rev-parse', 'HEAD').trim();
++};
++
++function projectRepo(label) {
++  const p = svc.createProject({ name: label, slug: `${label}-${Date.now().toString(36)}` });
++  const repo = join(p.dir, 'repo');
++  const head = gitRepo(repo);
++  return { p, repo, head };
++}
++
++function seedProfile(project) {
++  const id = `vpr_${Date.now().toString(36)}`;
++  svc.db()
++    .prepare('INSERT INTO verify_profiles (id,project_id,name,program,argv,cwd,timeout_ms,created_by,created_at) VALUES (?,?,?,?,?,?,?,?,?)')
++    .run(id, project.id, 'ok', process.execPath, '[]', null, 300_000, 'b02', new Date().toISOString());
++  return id;
++}
++
++/* ------------------------------- QA-01 --------------------------------- */
++
++test('B02-QA-01 真实 execFile 超时不得返回成功', async () => {
++  process.env.FAKE_DOCKER_MODE = 'run_timeout';
++  const r = await iso.runClaudeIsolated({
++    workdir: tmp,
++    prompt: 'x',
++    image: 'fake-image:1',
++    name: 'b02-timeout',
++    network: 'fake-net',
++    timeoutMs: 100
++  });
++  assert.equal(r.ok, false, JSON.stringify(r));
++  assert.equal(r.exitCode, null);
++  assert.equal(r.timedOut, true);
++  assert.equal(r.killed, true);
++});
++
++test('B02-QA-01 真实 execFile 信号终止不得返回成功', async () => {
++  process.env.FAKE_DOCKER_MODE = 'run_signal';
++  const r = await iso.runClaudeIsolated({
++    workdir: tmp,
++    prompt: 'x',
++    image: 'fake-image:1',
++    name: 'b02-signal',
++    network: 'fake-net',
++    timeoutMs: 5000
++  });
++  assert.equal(r.ok, false, JSON.stringify(r));
++  assert.equal(r.exitCode, null);
++  assert.equal(r.signal, 'SIGTERM');
++});
++
++test('B02-QA-01 正常退出 0 仍是成功', async () => {
++  process.env.FAKE_DOCKER_MODE = 'ok';
++  const r = await iso.runClaudeIsolated({
++    workdir: tmp,
++    prompt: 'x',
++    image: 'fake-image:1',
++    name: 'b02-ok',
++    network: 'fake-net',
++    timeoutMs: 5000
++  });
++  assert.equal(r.ok, true, JSON.stringify(r));
++  assert.equal(r.exitCode, 0);
++});
++
++test('B02-QA-01 sh 正常非零退出保留真实退出码', async () => {
++  const r = await iso.sh('/bin/sh', ['-c', 'exit 7']);
++  assert.equal(r.ok, false);
++  assert.equal(r.code, 7);
++  assert.equal(r.abnormal, false);
++});
++
++test('B02-QA-01 sh 外部信号不得映射为成功', async () => {
++  const r = await iso.sh('/bin/sh', ['-c', 'kill -TERM $$']);
++  assert.equal(r.ok, false);
++  assert.equal(r.code, null);
++  assert.equal(r.signal, 'SIGTERM');
++  assert.equal(r.timedOut, false);
++  assert.equal(r.abnormal, true);
++});
++
++test('B02-QA-01 sh 不存在的可执行文件不得成功', async () => {
++  const r = await iso.sh('/definitely/not/a/real/binary', ['--version']);
++  assert.equal(r.ok, false);
++  assert.equal(r.code, null);
++  assert.equal(r.errorCode, 'ENOENT');
++  assert.equal(r.abnormal, true);
++});
++
++test('B02-QA-01 sh 超过 maxBuffer 不得成功', async () => {
++  const r = await iso.sh('/bin/sh', ['-c', 'yes x'], { maxBuffer: 1024, timeoutMs: 2000 });
++  assert.equal(r.ok, false);
++  assert.equal(r.code, null);
++  assert.equal(r.abnormal, true);
++  assert.match(String(r.errorCode ?? r.error), /maxBuffer|ERR_CHILD_PROCESS_STDIO_MAXBUFFER|maxBuffer/i);
++});
++
++/* ------------------------------- QA-02 --------------------------------- */
++
++test('B02-QA-02 Claude CLI 信号不得让 Task 变成 done', async () => {
++  const { p, head } = projectRepo('b02claude');
++  const t = svc.createTask({
++    project: p.id,
++    title: 'claude timeout',
++    input: 'x',
++    kind: 'executor',
++    executor: 'claude-code',
++    executorConfig: { mode: 'plan', repo: 'repo', base_commit: head }
++  });
++  process.env.FAKE_DOCKER_MODE = 'run_signal';
++  const r = await svc.runTask(t.id);
++  assert.equal(r.ok, false, JSON.stringify({ blocked: r.blocked, task: svc.getTask(t.id).status }));
++  assert.notEqual(svc.getTask(t.id).status, 'done');
++});
++
++test('B02-QA-02 Verify 容器信号不得被当成通过', async () => {
++  const { p, head } = projectRepo('b02verify');
++  const vp = seedProfile(p);
++  const t = svc.createTask({
++    project: p.id,
++    title: 'verify timeout',
++    input: 'x',
++    kind: 'executor',
++    executor: 'claude-code',
++    executorConfig: { mode: 'plan', repo: 'repo', base_commit: head, verify_profile_id: vp }
++  });
++  process.env.FAKE_DOCKER_MODE = 'verify_signal';
++  const r = await svc.runTask(t.id);
++  assert.equal(r.ok, false, JSON.stringify({ blocked: r.blocked, verify: r.verify, task: svc.getTask(t.id).status }));
++  assert.notEqual(svc.getTask(t.id).status, 'done');
++});
++
++test('B02-QA-02 Audit 容器信号不得被当成成功审计', async () => {
++  const { p, head } = projectRepo('b02audit');
++  const t = svc.createTask({
++    project: p.id,
++    title: 'audit timeout',
++    input: 'x',
++    kind: 'audit',
++    executor: 'claude-code',
++    executorConfig: { repo: 'repo', commit: head, contract: '# contract' }
++  });
++  process.env.FAKE_DOCKER_MODE = 'run_signal';
++  const r = await svc.runTask(t.id);
++  assert.equal(r.ok, false, JSON.stringify({ blocked: r.blocked, task: svc.getTask(t.id).status }));
++  assert.notEqual(svc.getTask(t.id).status, 'done');
++});
++
++/* ------------------------------- QA-03 --------------------------------- */
++
++test('B02-QA-03 信号终止的 docker kill 不得产生 killAccepted/confirmed', async () => {
++  process.env.FAKE_DOCKER_MODE = 'kill_signal';
++  const r = await iso.killContainer('b02-kill-signal');
++  assert.equal(r.killAccepted, false, JSON.stringify(r));
++  assert.equal(r.confirmed, false, '不可信的 gone 不得确认停止');
++});
++
++/* ------------------------------- QA-04 --------------------------------- */
++
++test('B02-QA-04 docker info 被信号终止时 daemon 不得被判健康', async () => {
++  process.env.FAKE_DOCKER_MODE = 'info_signal';
++  const ok = await iso.daemonReachable();
++  assert.equal(ok, false);
++});
++
++test('B02-QA-04 docker info 超时不得被判健康', async () => {
++  process.env.FAKE_DOCKER_MODE = 'info_timeout';
++  const ok = await iso.daemonReachable({ timeoutMs: 100 });
++  assert.equal(ok, false);
++});
++
++test('B02-QA-03 独立可信 exited 证据可在 kill 不可信时确认停止', async () => {
++  process.env.FAKE_DOCKER_MODE = 'inspect_exited';
++  const r = await iso.killContainer('b02-exited');
++  assert.equal(r.killAccepted, false, JSON.stringify(r));
++  assert.equal(r.confirmed, true, 'exited 是独立可信停止证据');
++  assert.equal(r.state, 'exited');
++});
++
++/* ------------------------------- QA-05 --------------------------------- */
++
++test('B02-QA-05 launchContainer 超时结果不得写 stopped', async () => {
++  const { p, head } = projectRepo('b02resource');
++  const t = svc.createTask({
++    project: p.id,
++    title: 'resource timeout',
++    input: 'x',
++    kind: 'executor',
++    executor: 'claude-code',
++    executorConfig: { mode: 'plan', repo: 'repo', base_commit: head }
++  });
++  const fakeIsolation = {
++    isolationStatus: async () => ({ available: true, backend: 'fake', image: 'fake', network: 'fake', networkInternal: true }),
++    egressProxyUrl: async () => 'http://127.0.0.1:9',
++    runClaudeIsolated: async () => ({ ok: false, exitCode: null, timedOut: true, killed: true, signal: 'SIGTERM', text: '', raw: '' }),
++    runInWorkdir: async () => ({ ok: false, exitCode: null, timedOut: true, killed: true, signal: 'SIGTERM', output: '' })
++  };
++  const r = await svc.runTask(t.id, { isolation: fakeIsolation });
++  assert.equal(r.ok, false);
++  const resource = svc.listResources(t.id)[0];
++  assert.equal(resource?.state, 'unknown', JSON.stringify(resource));
++  assert.notEqual(svc.getTask(t.id).status, 'done');
++});
++
++
++test('B02-QA-04 无 resources 的历史执行取消不得绕过终止证明', async () => {
++  const { p } = projectRepo('b02legacy');
++  const t = svc.createTask({ project: p.id, title: 'legacy cancel', input: 'x' });
++  svc.updateTask(t.id, { status: 'running' });
++  const execId = `exe_b02legacy_${Date.now().toString(36)}`;
++  svc.db()
++    .prepare('INSERT INTO executions (id,task_id,agent_id,status,model,session_key,started_at) VALUES (?,?,?,?,?,?,?)')
++    .run(execId, t.id, null, 'running', 'test', '', new Date().toISOString());
++  process.env.FAKE_DOCKER_MODE = 'kill_signal';
++  const r = await svc.cancelTask(t.id);
++  assert.equal(r.ok, false, JSON.stringify(r));
++  assert.equal(svc.getTask(t.id).status, 'cancel_requested');
++});
++
++
++test('B02-QA-05 正常非零容器退出：任务失败但资源可确认 stopped', async () => {
++  const { p, head } = projectRepo('b02nonzero');
++  const t = svc.createTask({
++    project: p.id,
++    title: 'nonzero',
++    input: 'x',
++    kind: 'executor',
++    executor: 'claude-code',
++    executorConfig: { mode: 'plan', repo: 'repo', base_commit: head }
++  });
++  const fakeIsolation = {
++    isolationStatus: async () => ({ available: true, backend: 'fake', image: 'fake', network: 'fake', networkInternal: true }),
++    egressProxyUrl: async () => 'http://127.0.0.1:9',
++    runClaudeIsolated: async () => ({ ok: false, exitCode: 1, abnormal: false, timedOut: false, signal: null, killed: false, text: 'nonzero', raw: '' }),
++    runInWorkdir: async () => ({ ok: false, exitCode: 1, abnormal: false, output: '' })
++  };
++  const r = await svc.runTask(t.id, { isolation: fakeIsolation });
++  assert.equal(r.ok, false);
++  assert.equal(svc.getTask(t.id).status, 'failed');
++  assert.equal(svc.listResources(t.id)[0]?.state, 'stopped');
++});
++
++test('B02-QA-05 执行适配层抛异常：资源必须 unknown，不得伪造 stopped', async () => {
++  const { p, head } = projectRepo('b02throw');
++  const t = svc.createTask({
++    project: p.id,
++    title: 'throw',
++    input: 'x',
++    kind: 'executor',
++    executor: 'claude-code',
++    executorConfig: { mode: 'plan', repo: 'repo', base_commit: head }
++  });
++  const fakeIsolation = {
++    isolationStatus: async () => ({ available: true, backend: 'fake', image: 'fake', network: 'fake', networkInternal: true }),
++    egressProxyUrl: async () => 'http://127.0.0.1:9',
++    runClaudeIsolated: async () => { throw new Error('simulated adapter crash'); },
++    runInWorkdir: async () => ({ ok: false, exitCode: null, abnormal: true, output: '' })
++  };
++  await assert.rejects(() => svc.runTask(t.id, { isolation: fakeIsolation }), /simulated adapter crash/);
++  assert.equal(svc.listResources(t.id)[0]?.state, 'unknown');
++});
++
++
++test('B02-QA-03 Docker kill 超时不得产生 killAccepted 或 confirmed', async () => {
++  process.env.FAKE_DOCKER_MODE = 'kill_timeout';
++  const r = await iso.killContainer('b02-kill-timeout', { graceMs: 100, killTimeoutMs: 100 });
++  assert.equal(r.killAccepted, false, JSON.stringify(r));
++  assert.equal(r.confirmed, false, '超时 kill + gone 不得确认停止');
++});
++
++
++test('B02-QA-01 Verify workdir CLI 超时不得返回成功', async () => {
++  process.env.FAKE_DOCKER_MODE = 'verify_timeout';
++  const r = await iso.runInWorkdir({
++    workdir: tmp,
++    program: 'node',
++    args: [],
++    image: 'fake-image:1',
++    name: 'b02-verify-timeout',
++    network: 'fake-net',
++    timeoutMs: 100
++  });
++  assert.equal(r.ok, false, JSON.stringify(r));
++  assert.equal(r.exitCode, null);
++  assert.equal(r.timedOut, true);
++  assert.equal(r.abnormal, true);
++});
++
++
++test('B02-QA-04 Docker inspect 超时不得产生 confirmed', async () => {
++  process.env.FAKE_DOCKER_MODE = 'inspect_timeout';
++  const r = await iso.killContainer('b02-inspect-timeout', {
++    graceMs: 100,
++    killTimeoutMs: 100,
++    inspectTimeoutMs: 50
++  });
++  assert.equal(r.confirmed, false, JSON.stringify(r));
++});
