@@ -1,0 +1,1206 @@
+diff --git a/orchestrator/scripts/verify-b01-docker-race.mjs b/orchestrator/scripts/verify-b01-docker-race.mjs
+new file mode 100644
+index 0000000..7596d2a
+--- /dev/null
++++ b/orchestrator/scripts/verify-b01-docker-race.mjs
+@@ -0,0 +1,175 @@
++#!/usr/bin/env node
++/**
++ * B01 真实 Docker 启动/取消竞态。
++ *
++ * 用一个 wrapper 在真实 `docker run` 之前建立文件屏障，确保：
++ *   启动意图/started 已登记 → docker run 尚未执行 → 取消 → 释放屏障 → 真实容器启动。
++ * 修复后取消必须等待并实际终止容器；不得在屏障释放前返回 ok=true。
++ *
++ * 需要本机 Docker + 测试镜像 jarvis-b01-exec:test（alpine + sleep 120）。
++ * 不消耗模型额度。
++ */
++import { chmodSync, existsSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
++import { homedir } from 'node:os';
++import { join } from 'node:path';
++import { execFileSync } from 'node:child_process';
++
++const REAL_HOME = homedir();
++const HOME_DIR = '/tmp/jarvis-b01-docker/home';
++const DOCKER = process.env.JARVIS_DOCKER_BIN_REAL || '/Applications/Docker.app/Contents/Resources/bin/docker';
++const IMAGE = process.env.JARVIS_B01_IMAGE || 'jarvis-b01-exec:test';
++const ENTERED = '/tmp/jarvis-b01-docker/run-entered';
++const RELEASE = '/tmp/jarvis-b01-docker/run-release';
++const WRAPPER = '/tmp/jarvis-b01-docker/docker-wrapper.sh';
++
++rmSync('/tmp/jarvis-b01-docker', { recursive: true, force: true });
++mkdirSync(join(HOME_DIR, '.claude'), { recursive: true });
++mkdirSync(join(HOME_DIR, 'jarvis'), { recursive: true });
++writeFileSync(join(HOME_DIR, '.claude/settings.json'), JSON.stringify({ env: { ANTHROPIC_MODEL: 'test' } }));
++
++writeFileSync(WRAPPER, `#!/bin/sh
++if [ "$1" = "run" ]; then
++  : > "${ENTERED}"
++  i=0
++  while [ ! -f "${RELEASE}" ]; do
++    i=$((i+1))
++    [ "$i" -gt 1200 ] && exit 124
++    sleep 0.05
++  done
++fi
++exec "${DOCKER}" "$@"
++`);
++chmodSync(WRAPPER, 0o755);
++
++process.env.DOCKER_HOST = process.env.DOCKER_HOST || `unix://${join(REAL_HOME, '.docker/run/docker.sock')}`;
++process.env.HOME = HOME_DIR;
++process.env.JARVIS_HOME = join(HOME_DIR, 'jarvis');
++process.env.JARVIS_DB = join(HOME_DIR, 'jarvis', 'state.db');
++process.env.JARVIS_DOCKER_BIN = WRAPPER;
++process.env.JARVIS_EXECUTOR_IMAGE = IMAGE;
++process.env.JARVIS_EXECUTOR_NETWORK = 'jarvis-internal';
++
++const svc = await import('../src/service.mjs');
++const ex = await import('../src/executor.mjs');
++
++const gitRepo = (dir) => {
++  mkdirSync(dir, { recursive: true });
++  const g = (...a) => execFileSync('git', ['-C', dir, ...a], { encoding: 'utf8' });
++  g('init', '-q');
++  writeFileSync(join(dir, 'a.txt'), 'x\n');
++  g('add', '-A');
++  g('-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-q', '-m', 'init');
++  return g('rev-parse', 'HEAD').trim();
++};
++
++const waitForFile = async (path, label, failCheck = () => null) => {
++  for (let i = 0; i < 600; i++) {
++    const failure = failCheck();
++    if (failure) throw failure;
++    if (existsSync(path)) return;
++    await new Promise((r) => setTimeout(r, 50));
++  }
++  const failure = failCheck();
++  throw failure || new Error(`${label} timeout`);
++};
++
++const p = svc.createProject({ name: 'B01 Docker Race', slug: `b01-docker-${Date.now().toString(36)}` });
++const repo = join(p.dir, 'repo');
++const head = gitRepo(repo);
++const task = svc.createTask({
++  project: p.id,
++  title: 'B01 docker race',
++  input: 'noop',
++  kind: 'executor',
++  executor: 'claude-code',
++  executorConfig: { mode: 'plan', repo: 'repo', base_commit: head }
++});
++
++let cancelResolvedBeforeRelease = false;
++let releaseWritten = false;
++let sawContainerRunning = false;
++let cancel = null;
++let result = null;
++try {
++  let runFailure = null;
++  const running = svc.runTask(task.id);
++  running.catch((e) => { runFailure = e; });
++  await waitForFile(ENTERED, 'docker-run-entered', () => runFailure);
++
++  const cancelling = svc.cancelTask(task.id);
++  cancelling.then((r) => { cancel = r; cancelResolvedBeforeRelease = !releaseWritten; });
++  for (let i = 0; i < 500; i++) {
++    if (['cancel_requested', 'cancelled'].includes(svc.getTask(task.id).status)) break;
++    await new Promise((r) => setImmediate(r));
++  }
++  assertStatus('cancel_requested or cancelled', ['cancel_requested', 'cancelled']);
++  // 此刻真实 docker run 仍被 wrapper 挡住；取消不得已返回 ok=true。
++  await new Promise((r) => setImmediate(r));
++  if (cancelResolvedBeforeRelease) {
++    throw new Error('cancel reported complete before the delayed docker run was released');
++  }
++
++  releaseWritten = true;
++  const runningExec = svc.db().prepare("SELECT id FROM executions WHERE task_id=? AND status='running' ORDER BY started_at DESC").get(task.id);
++  const containerName = runningExec ? `jarvis-exec-${runningExec.id}` : null;
++  const pollContainer = (async () => {
++    if (!containerName) return;
++    for (let i = 0; i < 600; i++) {
++      try {
++        const status = execFileSync(DOCKER, ['inspect', containerName, '--format', '{{.State.Status}}'], {
++          encoding: 'utf8',
++          stdio: ['ignore', 'pipe', 'ignore'],
++          env: { ...process.env, HOME: REAL_HOME, DOCKER_HOST: process.env.DOCKER_HOST }
++        }).trim();
++        if (['created', 'running'].includes(status)) sawContainerRunning = true;
++      } catch {}
++      await new Promise((r) => setTimeout(r, 10));
++    }
++  })();
++  writeFileSync(RELEASE, 'go');
++  cancel = await cancelling;
++  result = await running;
++  await pollContainer;
++} finally {
++  try { releaseWritten = true; writeFileSync(RELEASE, 'go'); } catch {}
++}
++
++function assertStatus(_label, allowed) {
++  const s = svc.getTask(task.id).status;
++  if (!allowed.includes(s)) throw new Error(`task status ${s}`);
++}
++
++const resource = svc.db().prepare('SELECT * FROM execution_resources WHERE task_id=?').get(task.id);
++const execution = svc.db().prepare('SELECT * FROM executions WHERE task_id=? ORDER BY started_at DESC').get(task.id);
++const ps = execFileSync(DOCKER, ['ps', '-a', '--filter', `name=jarvis-exec-${result?.execution}`, '--format', '{{.Names}} {{.Status}}'], {
++  encoding: 'utf8',
++  env: { ...process.env, HOME: REAL_HOME, DOCKER_HOST: process.env.DOCKER_HOST }
++}).trim();
++
++const evidence = {
++  task: task.id,
++  taskStatus: svc.getTask(task.id).status,
++  cancelOk: cancel?.ok ?? null,
++  cancelResolvedBeforeRelease,
++  executionStatus: execution?.status ?? null,
++  resourceState: resource?.state ?? null,
++  resourceStoppedAt: resource?.stopped_at ?? null,
++  resultBlocked: result?.blocked ?? null,
++  resultExitCode: result?.exitCode ?? null,
++  sawContainerRunning,
++  containerPs: ps,
++  image: IMAGE
++};
++console.log(JSON.stringify(evidence, null, 2));
++
++if (
++  cancelResolvedBeforeRelease ||
++  !cancel?.ok ||
++  svc.getTask(task.id).status !== 'cancelled' ||
++  execution?.status !== 'cancelled' ||
++  !['stopped', 'abandoned'].includes(resource?.state) ||
++  !sawContainerRunning ||
++  ps.length > 0
++) {
++  process.exit(1);
++}
+diff --git a/orchestrator/src/isolation.mjs b/orchestrator/src/isolation.mjs
+index c070805..fb58a3d 100644
+--- a/orchestrator/src/isolation.mjs
++++ b/orchestrator/src/isolation.mjs
+@@ -8,7 +8,9 @@
+  */
+ import { execFile } from 'node:child_process';
+ 
+-import { existsSync } from 'node:fs';
++import { existsSync, mkdtempSync, rmSync } from 'node:fs';
++import { join } from 'node:path';
++import { tmpdir } from 'node:os';
+ 
+ const DOCKER_CANDIDATES = [
+   process.env.JARVIS_DOCKER_BIN,
+@@ -124,7 +126,9 @@ export async function runClaudeIsolated({
+   readOnly = false,
+   tmpDir,
+   network = process.env.JARVIS_EXECUTOR_NETWORK || 'jarvis-internal',
+-  timeoutMs = 900_000
++  timeoutMs = 900_000,
++  guard = null,
++  onStarted = null
+ }) {
+   const st = await isolationStatus();
+   if (!st.available) return { ok: false, blocked: 'isolation_unavailable', error: st.reason };
+@@ -146,10 +150,54 @@ export async function runClaudeIsolated({
+   // 不再注入 HTTP(S)_PROXY：模型流量通过 ANTHROPIC_BASE_URL 指向代理，
+   // 直接走内网 IP；其余出网在 --internal 网络里本就没有路由。
+   if (modelToken) args.push('-e', `JARVIS_MODEL_TOKEN=${modelToken}`);
++  const cidDir = mkdtempSync(join(tmpdir(), 'jarvis-cid-'));
++  const cidFile = join(cidDir, 'container.cid');
++  args.push('--cidfile', cidFile);
+   args.push(image, '-p', prompt, '--output-format', 'json', '--permission-mode', mode);
+ 
++  // B01：真正调用 docker run 之前的最后一道启动许可检查。
++  if (guard) {
++    let allowed = false;
++    try { allowed = Boolean(await guard()); } catch { allowed = false; }
++    if (!allowed) {
++      try { rmSync(cidDir, { recursive: true, force: true }); } catch {}
++      return {
++        ok: false,
++        cancelled: true,
++        blocked: 'cancelled',
++        exitCode: null,
++        text: '',
++        isolated: true,
++        network,
++        image,
++        raw: 'launch_cancelled_before_docker_run'
++      };
++    }
++  }
++
+   const started = Date.now();
+-  const r = await sh(DOCKER, args, { timeoutMs });
++  const runPromise = sh(DOCKER, args, { timeoutMs });
++  let notified = false;
++  if (onStarted) {
++    const waitStart = Date.now();
++    while (Date.now() - waitStart < 5_000) {
++      if (existsSync(cidFile)) {
++        notified = true;
++        try { onStarted(); } catch {}
++        break;
++      }
++      const done = await Promise.race([
++        runPromise.then((value) => ({ done: true, value })),
++        new Promise((resolve) => setTimeout(() => resolve({ done: false }), 50))
++      ]);
++      if (done.done) break;
++    }
++    if (!notified && existsSync(cidFile)) {
++      try { onStarted(); } catch {}
++    }
++  }
++  const r = await runPromise;
++  try { rmSync(cidDir, { recursive: true, force: true }); } catch {}
+   let parsed = null;
+   const at = r.out.indexOf('{');
+   if (at >= 0) {
+@@ -200,15 +248,16 @@ export async function killContainer(name, { graceMs = 5000 } = {}) {
+   const STOPPED = new Set(['exited', 'dead', 'removing']);
+ 
+   // 1) 先请求优雅终止（SIGTERM）
+-  await sh(DOCKER, ['kill', '--signal', 'TERM', name], { timeoutMs: 15_000 });
++  const term = await sh(DOCKER, ['kill', '--signal', 'TERM', name], { timeoutMs: 15_000 });
++  let killAccepted = term.code === 0;
+ 
+   let escalated = false;
+   const deadline = Date.now() + graceMs;
+   while (Date.now() < deadline) {
+     const st = await inspectState();
+-    if (st.kind === 'gone') return { ok: true, confirmed: true, state: 'gone', escalated };
++    if (st.kind === 'gone') return { ok: true, confirmed: true, state: 'gone', escalated, killAccepted };
+     if (st.kind === 'daemon') return { ok: false, confirmed: false, reason: 'docker_daemon_unreachable' };
+-    if (st.kind === 'state' && STOPPED.has(st.value)) return { ok: true, confirmed: true, state: st.value, escalated };
++    if (st.kind === 'state' && STOPPED.has(st.value)) return { ok: true, confirmed: true, state: st.value, escalated, killAccepted };
+     if (st.kind === 'state' && !['running', 'created', 'restarting', 'paused'].includes(st.value)) {
+       // 未知状态：不得判为已停止（FIX3-E）
+       return { ok: false, confirmed: false, reason: 'unknown_container_state', state: st.value, escalated };
+@@ -218,12 +267,13 @@ export async function killContainer(name, { graceMs = 5000 } = {}) {
+ 
+   // 2) 仍未退出 → 升级 SIGKILL
+   escalated = true;
+-  await sh(DOCKER, ['kill', '--signal', 'KILL', name], { timeoutMs: 15_000 });
++  const kill = await sh(DOCKER, ['kill', '--signal', 'KILL', name], { timeoutMs: 15_000 });
++  if (kill.code === 0) killAccepted = true;
+   for (let i = 0; i < 25; i++) {
+     const st = await inspectState();
+-    if (st.kind === 'gone') return { ok: true, confirmed: true, state: 'gone', escalated };
++    if (st.kind === 'gone') return { ok: true, confirmed: true, state: 'gone', escalated, killAccepted };
+     if (st.kind === 'daemon') return { ok: false, confirmed: false, reason: 'docker_daemon_unreachable', escalated };
+-    if (st.kind === 'state' && STOPPED.has(st.value)) return { ok: true, confirmed: true, state: st.value, escalated };
++    if (st.kind === 'state' && STOPPED.has(st.value)) return { ok: true, confirmed: true, state: st.value, escalated, killAccepted };
+     if (st.kind === 'state' && !['running', 'created', 'restarting', 'paused'].includes(st.value)) {
+       return { ok: false, confirmed: false, reason: 'unknown_container_state', state: st.value, escalated };
+     }
+@@ -233,7 +283,7 @@ export async function killContainer(name, { graceMs = 5000 } = {}) {
+ }
+ 
+ /** 在同一隔离网络/挂载里运行任意受控程序（校验用）。 */
+-export async function runInWorkdir({ workdir, program, args = [], image, name, readOnly = false, network = process.env.JARVIS_EXECUTOR_NETWORK || 'jarvis-internal', timeoutMs = 300_000 }) {
++export async function runInWorkdir({ workdir, program, args = [], image, name, readOnly = false, network = process.env.JARVIS_EXECUTOR_NETWORK || 'jarvis-internal', timeoutMs = 300_000, guard = null, onStarted = null }) {
+   const st = await isolationStatus();
+   if (!st.available) return { ok: false, blocked: 'isolation_unavailable', error: st.reason };
+   const dockerArgs = [
+@@ -251,8 +301,38 @@ export async function runInWorkdir({ workdir, program, args = [], image, name, r
+     image,
+     ...args
+   ];
++  const cidDir = mkdtempSync(join(tmpdir(), 'jarvis-cid-'));
++  const cidFile = join(cidDir, 'container.cid');
++  dockerArgs.splice(dockerArgs.length - args.length - 1, 0, '--cidfile', cidFile);
++  if (guard) {
++    let allowed = false;
++    try { allowed = Boolean(await guard()); } catch { allowed = false; }
++    if (!allowed) {
++      try { rmSync(cidDir, { recursive: true, force: true }); } catch {}
++      return { ok: false, cancelled: true, blocked: 'cancelled', exitCode: null, output: 'launch_cancelled_before_docker_run' };
++    }
++  }
+   const started = Date.now();
+-  const r = await sh(DOCKER, dockerArgs, { timeoutMs });
++  const runPromise = sh(DOCKER, dockerArgs, { timeoutMs });
++  if (onStarted) {
++    const waitStart = Date.now();
++    while (Date.now() - waitStart < 5_000) {
++      if (existsSync(cidFile)) {
++        try { onStarted(); } catch {}
++        break;
++      }
++      const done = await Promise.race([
++        runPromise.then((value) => ({ done: true, value })),
++        new Promise((resolve) => setTimeout(() => resolve({ done: false }), 50))
++      ]);
++      if (done.done) break;
++    }
++    if (existsSync(cidFile)) {
++      try { onStarted(); } catch {}
++    }
++  }
++  const r = await runPromise;
++  try { rmSync(cidDir, { recursive: true, force: true }); } catch {}
+   return { ok: r.code === 0, exitCode: r.code, durationMs: Date.now() - started, output: r.out.slice(-4000) };
+ }
+ 
+diff --git a/orchestrator/src/service.mjs b/orchestrator/src/service.mjs
+index dd26b35..a56fbe1 100644
+--- a/orchestrator/src/service.mjs
++++ b/orchestrator/src/service.mjs
+@@ -352,7 +352,7 @@ export async function runTask(ref, deps = {}) {
+     return runExecutorTask(task, project, deps);
+   }
+   if (task.kind === 'audit') {
+-    return runAuditTask(task, project);
++    return runAuditTask(task, project, deps);
+   }
+   if (!task.assignee_agent_id) {
+     return { ok: false, blocked: 'no_assignee', error: '任务未指派 Agent' };
+@@ -882,17 +882,28 @@ async function runExecutorTask(task, project, deps = {}) {
+     }
+     credFile = cred.file;
+     const containerName = `jarvis-exec-${execId}`;
+-    const execResId = registerResource({ executionId: execId, taskId: task.id, kind: 'claude', name: containerName });
+-    const res = await isolation.runClaudeIsolated({
+-      modelToken,
++    const res = await launchContainer({
++      executionId: execId,
++      taskId: task.id,
++      kind: 'claude',
+       name: containerName,
+-      workdir: dest,
+-      prompt: task.input,
+-      mode: resolved.mode,
+-      image: st.image,
+-      credentialsFile: credFile,
+-      proxyUrl
++      run: (resourceId) => isolation.runClaudeIsolated({
++        modelToken,
++        name: containerName,
++        workdir: dest,
++        prompt: task.input,
++        mode: resolved.mode,
++        image: st.image,
++        credentialsFile: credFile,
++        proxyUrl,
++        guard: () => claimDockerInvocation(resourceId, task.id),
++        onStarted: () => markContainerRunning(resourceId)
++      })
+     });
++    if (res.cancelled) {
++      finalizeAttempt(task, execId, { status: 'cancelled', reason: '取消于执行启动前' });
++      return { ok: false, blocked: 'cancelled', error: '任务已取消，执行容器未启动' };
++    }
+ 
+     const cancelledNow = () => ['cancelled', 'cancel_requested'].includes(db().prepare('SELECT status FROM tasks WHERE id=?').get(task.id)?.status);
+     if (cancelledNow()) {
+@@ -905,16 +916,24 @@ async function runExecutorTask(task, project, deps = {}) {
+     if (res.ok && resolved.profile) {
+       db().prepare("UPDATE tasks SET status='verifying', updated_at=? WHERE id=? AND status='running'").run(now(), task.id);
+       const verifyName = `jarvis-verify-${execId}`;
+-      const verifyResId = registerResource({ executionId: execId, taskId: task.id, kind: 'verify', name: verifyName });
+-      const vr = await isolation.runInWorkdir({
++      const vr = await launchContainer({
++        executionId: execId,
++        taskId: task.id,
++        kind: 'verify',
+         name: verifyName,
+-        workdir: dest,
+-        program: resolved.profile.program,
+-        args: JSON.parse(resolved.profile.argv || '[]'),
+-        image: st.image
++        run: (resourceId) => isolation.runInWorkdir({
++          name: verifyName,
++          workdir: dest,
++          program: resolved.profile.program,
++          args: JSON.parse(resolved.profile.argv || '[]'),
++          image: st.image,
++          guard: () => claimDockerInvocation(resourceId, task.id),
++        onStarted: () => markContainerRunning(resourceId)
++        })
+       });
+-      verify = { exitCode: vr.exitCode, ok: vr.ok, output: vr.output, program: resolved.profile.program, argv: JSON.parse(resolved.profile.argv || '[]') };
+-      finishResource(verifyResId, 'stopped');
++      if (!vr.cancelled) {
++        verify = { exitCode: vr.exitCode, ok: vr.ok, output: vr.output, program: resolved.profile.program, argv: JSON.parse(resolved.profile.argv || '[]') };
++      }
+     }
+ 
+     // 修改范围检查
+@@ -1228,9 +1247,13 @@ export async function cancelTask(ref, deps = {}) {
+     .prepare("SELECT * FROM executions WHERE task_id = ? AND status = 'running' ORDER BY started_at DESC")
+     .all(task.id);
+   if (!running.length) {
++    if (task.status === 'cancelled') {
++      return { ok: true, already_cancelled: true, task: getTask(task.id) };
++    }
+     return { ok: false, error: '该任务没有正在运行的执行', task: getTask(task.id) };
+   }
+ 
++  const cancelAt = now();
+   // 提交与取消的互斥：committing 由 runTask 用原子状态迁移抢占。
+   // 提交中不杀进程、不写 cancel_requested，避免 git commit 已发生却虚报 cancelled。
+   let current = getTask(task.id);
+@@ -1300,28 +1323,30 @@ export async function cancelTask(ref, deps = {}) {
+       }
+     }
+ 
+-    // FIX3-C：以执行资源登记为准，不依赖硬编码名称
++    // B01：以 execution_resources 的真实生命周期为准。
++    // intent 直接 abandon；starting 必须等启动方落 stopped/abandoned，
++    // 或实际 kill 到 exited；inspect 的 gone 不能证明异步启动已消失。
+     const resources = db()
+-      .prepare("SELECT * FROM execution_resources WHERE execution_id=? AND state IN ('started','running','stopping')")
++      .prepare("SELECT * FROM execution_resources WHERE execution_id=? AND state IN ('intent','starting','started','running','stopping','unknown') ORDER BY started_at")
+       .all(exRow.id);
+-    const targets = resources.filter((r) => ['claude', 'verify', 'audit'].includes(r.kind)).map((r) => r.name);
+-    if (!targets.length) {
+-      // 兼容：老执行没有资源登记
+-      targets.push(`jarvis-exec-${exRow.id}`, `jarvis-verify-${exRow.id}`);
+-    }
+     const containerResults = [];
+-    for (const tname of targets) {
+-      const r = await isolation.killContainer(tname);
+-      containerResults.push({ name: tname, ...r });
+-      db().prepare("UPDATE execution_resources SET state=?, stopped_at=? WHERE execution_id=? AND name=? AND state IN ('started','running','stopping')")
+-        .run(r.confirmed ? 'stopped' : 'unknown', now(), exRow.id, tname);
++    for (const resource of resources) {
++      containerResults.push(await settleCancelResource(resource, isolation, cancelAt, deps.launchWaitMs ?? 15_000));
++    }
++    if (!resources.length) {
++      // 兼容：老执行没有资源登记
++      for (const tname of [`jarvis-exec-${exRow.id}`, `jarvis-verify-${exRow.id}`]) {
++        const r = await isolation.killContainer(tname);
++        containerResults.push({ name: tname, ...r });
++      }
+     }
+     containerKilled = { results: containerResults };
+ 
+     const daemonLost = containerResults.some((r) => r.reason === 'docker_daemon_unreachable');
+     const allConfirmed = containerResults.every((r) => r.confirmed === true);
+-    // daemon 失联优先报告「无法确认」，绝不当作已停止
+-    const fullyStopped = daemonLost ? false : allConfirmed;
++    const pidStopped = !(Number.isFinite(pid) && pid > 0) || confirmed;
++    // daemon 失联/进程未确认/启动意图未解决，都不得当作已停止
++    const fullyStopped = daemonLost ? false : (pidStopped && allConfirmed);
+ 
+     if (fullyStopped) {
+       db().prepare("UPDATE executions SET status='cancelled', finished_at=? WHERE id=? AND status='running'").run(now(), exRow.id);
+@@ -1331,6 +1356,7 @@ export async function cancelTask(ref, deps = {}) {
+       execution: exRow.id,
+       pid,
+       confirmedExit: fullyStopped,
++      pidStopped,
+       escalatedToSigkill: escalated,
+       containers: containerKilled.results
+     });
+@@ -1364,7 +1390,9 @@ export async function cancelTask(ref, deps = {}) {
+  * 固定 commit → 一次性工作树 → 容器内只读执行（plan）→ 校验未被修改。
+  * 注意：审计任务执行成功 ≠ 独立审计结论 PASS。
+  */
+-async function runAuditTask(task, project) {
++async function runAuditTask(task, project, deps = {}) {
++  const executor = deps.executor ?? ex;
++  const isolation = deps.isolation ?? iso;
+   const cfg = JSON.parse(task.executor_config || '{}');
+   const { repo, commit, contract } = cfg;
+   if (!repo || !commit) {
+@@ -1380,7 +1408,7 @@ async function runAuditTask(task, project) {
+     return { ok: false, blocked: 'repo_outside_project', error: rc.error };
+   }
+ 
+-  const st = await iso.isolationStatus();
++  const st = await isolation.isolationStatus();
+   if (!st.available) {
+     recordAttempt({ task, project, phase: 'isolation', status: 'rejected', blocked: 'isolation_unavailable', reason: st.reason });
+     return { ok: false, blocked: 'isolation_unavailable', error: st.reason };
+@@ -1406,18 +1434,18 @@ async function runAuditTask(task, project) {
+     rmSync(dest, { recursive: true, force: true });
+     mkdirSync(join(JARVIS_HOME, 'audit'), { recursive: true });
+ 
+-    const wt = await ex.createWorktree({ repo: rc.cwd, commit, dest });
++    const wt = await executor.createWorktree({ repo: rc.cwd, commit, dest });
+     if (!wt.ok) {
+       finalizeAttempt(task, execId, { status: 'failed', reason: `审计工作树创建失败: ${wt.error}` });
+       return { ok: false, blocked: 'worktree_failed', error: wt.error };
+     }
+-    const init = await ex.worktreeStatus(dest);
++    const init = await executor.worktreeStatus(dest);
+     if (!init.clean) {
+       finalizeAttempt(task, execId, { status: 'failed', reason: '审计工作树初始不干净' });
+       return { ok: false, blocked: 'dirty_worktree', error: '审计工作树初始不干净' };
+     }
+ 
+-    const proxyUrl = await iso.egressProxyUrl();
++    const proxyUrl = await isolation.egressProxyUrl();
+     const cred = writeCredentialFile(execId, proxyUrl, modelToken);
+     if (!cred.ok) {
+       finalizeAttempt(task, execId, { status: 'failed', reason: cred.error });
+@@ -1441,22 +1469,32 @@ async function runAuditTask(task, project) {
+ 
+     const auditTmp = join(JARVIS_HOME, 'audit-tmp', execId);
+     mkdirSync(auditTmp, { recursive: true });
+-    const auditResId = registerResource({ executionId: execId, taskId: task.id, kind: 'audit', name: `jarvis-audit-${execId}` });
+-    const res = await iso.runClaudeIsolated({
++    const res = await launchContainer({
++      executionId: execId,
++      taskId: task.id,
++      kind: 'audit',
+       name: `jarvis-audit-${execId}`,
+-      workdir: dest,
+-      prompt,
+-      mode: 'plan',
+-      image: st.image,
+-      credentialsFile: credFile,
+-      modelToken,
+-      readOnly: true,
+-      tmpDir: auditTmp,
+-      proxyUrl
++      run: (resourceId) => isolation.runClaudeIsolated({
++        name: `jarvis-audit-${execId}`,
++        workdir: dest,
++        prompt,
++        mode: 'plan',
++        image: st.image,
++        credentialsFile: credFile,
++        modelToken,
++        readOnly: true,
++        tmpDir: auditTmp,
++        proxyUrl,
++        guard: () => claimDockerInvocation(resourceId, task.id),
++        onStarted: () => markContainerRunning(resourceId)
++      })
+     });
+-    finishResource(auditResId, 'stopped');
++    if (res.cancelled) {
++      finalizeAttempt(task, execId, { status: 'cancelled', reason: '取消于 Audit 启动前' });
++      return { ok: false, blocked: 'cancelled', error: '任务已取消，Audit 容器未启动' };
++    }
+ 
+-    const after = await ex.worktreeStatus(dest);
++    const after = await executor.worktreeStatus(dest);
+     const evidence = {
+       isolated: true,
+       network: st.network,
+@@ -1479,7 +1517,7 @@ async function runAuditTask(task, project) {
+     revokeModelToken(modelToken);
+     try { if (credFile) rmSync(credFile, { force: true }); } catch {}
+     if (!preserved) {
+-      try { await ex.removeWorktree({ repo: rc.cwd, dest }); } catch {}
++      try { await executor.removeWorktree({ repo: rc.cwd, dest }); } catch {}
+     }
+   }
+ }
+@@ -1678,16 +1716,192 @@ export function revokeModelTokensForExecution(execId) {
+ 
+ /* ------------------------------ 执行资源登记 -------------------------------- */
+ 
+-function registerResource({ executionId, taskId, kind, name }) {
++/**
++ * B01：容器资源生命周期。
++ * intent -> starting -> stopped / abandoned；取消时 intent 直接 abandon，
++ * starting 由取消屏障等待并终止，绝不把“inspect 暂时不存在”当作已停止。
++ */
++function registerContainerIntent({ executionId, taskId, kind, name }) {
+   const id = newId('res');
++  const r = db()
++    .prepare(`INSERT INTO execution_resources (id,execution_id,task_id,kind,name,state,started_at)
++              SELECT ?,?,?,?,?,'intent',?
++              WHERE EXISTS (SELECT 1 FROM tasks WHERE id=? AND status IN ('running','verifying'))`)
++    .run(id, executionId, taskId, kind, name ?? '', now(), taskId);
++  if (r.changes !== 1) return { ok: false, id: null, reason: '任务已取消，拒绝登记新的启动意图' };
++  return { ok: true, id };
++}
++
++function claimContainerStart(id, taskId) {
++  const r = db()
++    .prepare(`UPDATE execution_resources SET state='starting'
++              WHERE id=? AND state='intent'
++                AND EXISTS (SELECT 1 FROM tasks WHERE id=? AND status IN ('running','verifying'))`)
++    .run(id, taskId);
++  return r.changes === 1;
++}
++
++/**
++ * 在真正调用 docker run 之前的最后一道原子检查：
++ * starting -> started 与任务未取消必须同时成立。一旦进入 started，
++ * 取消方必须认为 docker 调用可能已经发生，不能仅凭 inspect=gone 宣告完成。
++ */
++function claimDockerInvocation(id, taskId) {
++  const r = db()
++    .prepare(`UPDATE execution_resources SET state='started'
++              WHERE id=? AND state='starting'
++                AND EXISTS (SELECT 1 FROM tasks WHERE id=? AND status IN ('running','verifying'))`)
++    .run(id, taskId);
++  return r.changes === 1;
++}
++
++function abandonContainerResource(id) {
++  const r = db()
++    .prepare("UPDATE execution_resources SET state='abandoned', stopped_at=? WHERE id=? AND state IN ('intent','starting','stopping')")
++    .run(now(), id);
++  return r.changes === 1;
++}
++
++function finishContainerResource(id) {
+   db()
+-    .prepare('INSERT INTO execution_resources (id,execution_id,task_id,kind,name,state,started_at) VALUES (?,?,?,?,?,?,?)')
+-    .run(id, executionId, taskId, kind, name ?? '', 'started', now());
+-  return id;
++    .prepare("UPDATE execution_resources SET state='stopped', stopped_at=? WHERE id=? AND state IN ('starting','running','started','stopping')")
++    .run(now(), id);
++}
++
++function markContainerRunning(id) {
++  db().prepare("UPDATE execution_resources SET state='running' WHERE id=? AND state IN ('starting','started')").run(id);
++}
++
++function markContainerStopping(id) {
++  db().prepare("UPDATE execution_resources SET state='stopping' WHERE id=? AND state IN ('starting','running','started')").run(id);
+ }
+ 
+-function finishResource(id, state) {
+-  db().prepare('UPDATE execution_resources SET state=?, stopped_at=? WHERE id=?').run(state, now(), id);
++function markContainerUnknown(id) {
++  db()
++    .prepare("UPDATE execution_resources SET state='unknown', stopped_at=? WHERE id=? AND state IN ('intent','starting','running','started','stopping')")
++    .run(now(), id);
++}
++
++/** 统一容器启动：登记 intent → 原子 claim → 最后一道 guard → 执行 → 落 stopped/abandoned。 */
++async function launchContainer({ executionId, taskId, kind, name, run }) {
++  const intent = registerContainerIntent({ executionId, taskId, kind, name });
++  if (!intent.ok) {
++    return { ok: false, blocked: 'cancelled', cancelled: true, error: intent.reason };
++  }
++  if (!claimContainerStart(intent.id, taskId)) {
++    abandonContainerResource(intent.id);
++    return { ok: false, blocked: 'cancelled', cancelled: true, error: '任务已取消，拒绝启动容器' };
++  }
++  let result;
++  try {
++    result = await run(intent.id);
++  } catch (e) {
++    finishContainerResource(intent.id);
++    throw e;
++  }
++  if (result?.cancelled) {
++    abandonContainerResource(intent.id);
++  } else {
++    finishContainerResource(intent.id);
++  }
++  return result;
++}
++
++/**
++ * 取消屏障：只有资源进入 stopped/abandoned 才视为解决。
++ * starting 阶段 docker inspect 返回 gone 不能证明“尚未启动的异步启动”已消失。
++ */
++async function settleCancelResource(resource, isolation, cancelAt, waitMs = 15_000) {
++  const readState = () => db().prepare('SELECT state FROM execution_resources WHERE id=?').get(resource.id)?.state;
++  const name = resource.name || '';
++  let state = resource.state;
++
++  if (state === 'intent') {
++    abandonContainerResource(resource.id);
++    state = readState();
++    return { name, state, confirmed: state === 'abandoned' || state === 'stopped', reason: state === 'abandoned' ? 'launch_abandoned' : undefined };
++  }
++  if (state === 'abandoned') return { name, state, confirmed: true };
++  if (state === 'stopped') {
++    // 取消前已完成：已无新副作用。取消开始后才 stopped：没有终止证据，fail closed。
++    const finished = Date.parse(resource.stopped_at || '');
++    const cancelledAt = Date.parse(cancelAt || '');
++    const beforeCancel = Number.isFinite(finished) && Number.isFinite(cancelledAt) && finished <= cancelledAt;
++    return {
++      name,
++      state,
++      confirmed: beforeCancel,
++      reason: beforeCancel ? 'already_stopped' : 'container_stopped_after_cancel_without_stop_evidence',
++      escalated: false,
++      killAccepted: false,
++      containerState: null
++    };
++  }
++  if (state === 'unknown') return { name, state, confirmed: false, reason: 'unknown_container_state' };
++
++  // starting / started / running / stopping
++  markContainerStopping(resource.id);
++  const deadline = Date.now() + waitMs;
++  let lastKill = null;
++  let killConfirmed = false;
++  const killMeta = () => ({
++    escalated: lastKill?.escalated === true,
++    killAccepted: lastKill?.killAccepted === true,
++    containerState: lastKill?.state ?? null
++  });
++  while (Date.now() < deadline) {
++    state = readState();
++    if (state === 'abandoned') return { name, state, confirmed: true, ...killMeta() };
++    if (state === 'stopped') {
++      return {
++        name,
++        state,
++        confirmed: killConfirmed,
++        reason: killConfirmed ? 'stopped_by_cancel' : 'container_stopped_after_cancel_without_stop_evidence',
++        ...killMeta()
++      };
++    }
++    if (state === 'unknown') return { name, state, confirmed: false, reason: 'unknown_container_state' };
++
++    lastKill = await isolation.killContainer(name);
++    if (lastKill?.reason === 'docker_daemon_unreachable') {
++      markContainerUnknown(resource.id);
++      return { name, state: 'unknown', confirmed: false, reason: 'docker_daemon_unreachable', ...killMeta() };
++    }
++    if (
++      lastKill?.confirmed &&
++      (['exited', 'dead', 'removing'].includes(lastKill.state) ||
++        (lastKill.state === 'gone' && lastKill.killAccepted === true))
++    ) {
++      killConfirmed = true;
++    }
++    state = readState();
++    if (state === 'abandoned') return { name, state, confirmed: true, ...killMeta() };
++    if (state === 'stopped') {
++      return {
++        name,
++        state,
++        confirmed: killConfirmed,
++        reason: killConfirmed ? 'stopped_by_cancel' : 'container_stopped_after_cancel_without_stop_evidence',
++        ...killMeta()
++      };
++    }
++    if (state === 'unknown') return { name, state, confirmed: false, reason: 'unknown_container_state' };
++
++    // 只有“确实见过容器且已 exited/dead/removing”才可直接确认；
++    // state=gone 在 started 阶段仍可能是尚未创建的竞态，必须继续等启动方。
++    if (lastKill?.confirmed && ['exited', 'dead', 'removing'].includes(lastKill.state)) {
++      killConfirmed = true;
++      db()
++        .prepare("UPDATE execution_resources SET state='stopped', stopped_at=? WHERE id=? AND state IN ('starting','running','started','stopping')")
++        .run(now(), resource.id);
++      return { name, state: 'stopped', confirmed: true, ...killMeta() };
++    }
++    await new Promise((r) => setTimeout(r, 50));
++  }
++
++  markContainerUnknown(resource.id);
++  return { name, state: 'unknown', confirmed: false, reason: 'launch_cancel_timeout', ...killMeta() };
+ }
+ 
+ export function listResources(taskId) {
+diff --git a/orchestrator/test/b01.test.mjs b/orchestrator/test/b01.test.mjs
+new file mode 100644
+index 0000000..ca36c2b
+--- /dev/null
++++ b/orchestrator/test/b01.test.mjs
+@@ -0,0 +1,367 @@
++/**
++ * B01 复现：取消已确认后仍可能启动执行/验证容器。
++ *
++ * 使用确定性启动屏障（不是 sleep）：容器启动协程在真正“启动”前挂起，
++ * 取消先完成，再释放启动协程，观察迟到的启动。
++ */
++import { test } from 'node:test';
++import assert from 'node:assert/strict';
++import { mkdtempSync, mkdirSync, writeFileSync } from 'node:fs';
++import { tmpdir } from 'node:os';
++import { join } from 'node:path';
++import { execFileSync } from 'node:child_process';
++import { installTestAuthKey } from './helpers/auth.mjs';
++
++const tmp = mkdtempSync(join(tmpdir(), 'jarvis-b01-'));
++process.env.HOME = tmp;
++process.env.JARVIS_HOME = join(tmp, 'jarvis');
++process.env.JARVIS_DB = join(tmp, 'state.db');
++mkdirSync(join(tmp, '.claude'), { recursive: true });
++writeFileSync(join(tmp, '.claude/settings.json'), JSON.stringify({ env: { ANTHROPIC_MODEL: 'test' } }));
++const auth = installTestAuthKey(tmp);
++
++const svc = await import('../src/service.mjs');
++
++const gitRepo = (dir) => {
++  mkdirSync(dir, { recursive: true });
++  const g = (...a) => execFileSync('git', ['-C', dir, ...a], { encoding: 'utf8' });
++  g('init', '-q');
++  writeFileSync(join(dir, 'a.txt'), 'x\n');
++  g('add', '-A');
++  g('-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-q', '-m', 'init');
++  return g('rev-parse', 'HEAD').trim();
++};
++
++function makeTask(label) {
++  const p = svc.createProject({ name: label, slug: `${label}-${Date.now().toString(36)}` });
++  const repo = join(p.dir, 'repo');
++  const head = gitRepo(repo);
++  const vp = `vpr_${label}_${Date.now().toString(36)}`;
++  svc.db()
++    .prepare('INSERT INTO verify_profiles (id,project_id,name,program,argv,cwd,timeout_ms,created_by,created_at) VALUES (?,?,?,?,?,?,?,?,?)')
++    .run(vp, p.id, 'ok', process.execPath, '[]', null, 300_000, 'b01', new Date().toISOString());
++  const t = svc.createTask({
++    project: p.id,
++    title: label,
++    input: 'write feature.txt',
++    kind: 'executor',
++    executor: 'claude-code',
++    executorConfig: {
++      mode: 'acceptEdits',
++      repo: 'repo',
++      base_commit: head,
++      commit: true,
++      commit_paths: ['feature.txt'],
++      verify_profile_id: vp
++    }
++  });
++  const challenge = svc.createAuthChallenge(t.id);
++  const issued = svc.issueApproval({ task: t.id, proof: auth.proofFor(challenge) });
++  assert.equal(issued.ok, true, issued.error);
++  return { t, repo };
++}
++
++async function waitForTaskStatus(taskId, allowed, label) {
++  for (let i = 0; i < 300; i++) {
++    const status = svc.getTask(taskId).status;
++    if (allowed.includes(status)) return status;
++    await new Promise((r) => setImmediate(r));
++  }
++  throw new Error(`${label}: task status timeout, last=${svc.getTask(taskId).status}`);
++}
++
++function claudeBarrier() {
++  let markStarted;
++  let release;
++  const started = new Promise((r) => { markStarted = r; });
++  const hold = new Promise((r) => { release = r; });
++  let launched = false;
++  let stopped = false;
++  const iso = {
++    isolationStatus: async () => ({ available: true, backend: 'fake', image: 'fake', network: 'fake', networkInternal: true }),
++    egressProxyUrl: async () => 'http://127.0.0.1:9',
++    runClaudeIsolated: async ({ workdir, guard }) => {
++      markStarted();
++      await hold;
++      if (guard && !(await guard())) {
++        return { ok: false, cancelled: true, blocked: 'cancelled', exitCode: null, text: '', raw: 'guard_cancelled' };
++      }
++      launched = true;
++      writeFileSync(join(workdir, 'feature.txt'), 'late claude start\n');
++      return { ok: true, exitCode: 0, text: 'late', isolated: true, network: 'fake', image: 'fake', raw: '' };
++    },
++    runInWorkdir: async () => ({ ok: true, exitCode: 0, output: 'verify ok' }),
++    killContainer: async () => {
++      if (!launched) return { ok: true, confirmed: true, state: 'gone' };
++      stopped = true;
++      return { ok: true, confirmed: true, state: 'exited' };
++    }
++  };
++  return {
++    iso,
++    started,
++    release: () => release(),
++    alive: () => launched && !stopped
++  };
++}
++
++function verifyBarrier() {
++  let markStarted;
++  let release;
++  const started = new Promise((r) => { markStarted = r; });
++  const hold = new Promise((r) => { release = r; });
++  let launched = false;
++  let stopped = false;
++  const iso = {
++    isolationStatus: async () => ({ available: true, backend: 'fake', image: 'fake', network: 'fake', networkInternal: true }),
++    egressProxyUrl: async () => 'http://127.0.0.1:9',
++    runClaudeIsolated: async ({ workdir }) => {
++      writeFileSync(join(workdir, 'feature.txt'), 'claude done\n');
++      return { ok: true, exitCode: 0, text: 'done', isolated: true, network: 'fake', image: 'fake', raw: '' };
++    },
++    runInWorkdir: async ({ guard }) => {
++      markStarted();
++      await hold;
++      if (guard && !(await guard())) {
++        return { ok: false, cancelled: true, blocked: 'cancelled', exitCode: null, output: 'guard_cancelled' };
++      }
++      launched = true;
++      return { ok: true, exitCode: 0, output: 'late verify start' };
++    },
++    killContainer: async () => {
++      if (!launched) return { ok: true, confirmed: true, state: 'gone' };
++      stopped = true;
++      return { ok: true, confirmed: true, state: 'exited' };
++    }
++  };
++  return {
++    iso,
++    started,
++    release: () => release(),
++    alive: () => launched && !stopped
++  };
++}
++
++test('B01-A 执行容器：取消已报告成功后不得迟到启动', async () => {
++  const { t } = makeTask('b01a');
++  const barrier = claudeBarrier();
++  const running = svc.runTask(t.id, { isolation: barrier.iso });
++  await barrier.started;
++
++  const cancelling = svc.cancelTask(t.id, { isolation: barrier.iso });
++  await waitForTaskStatus(t.id, ['cancel_requested', 'cancelled'], 'B01-A');
++  barrier.release();
++  const cancel = await cancelling;
++  const result = await running;
++
++  assert.equal(
++    Boolean(cancel.ok) && barrier.alive(),
++    false,
++    `取消返回 ok=${cancel.ok} 后仍观察到迟到启动 (task=${svc.getTask(t.id).status}, result=${result.blocked})`
++  );
++  const resources = svc.listResources(t.id);
++  assert.ok(resources.length > 0);
++  assert.ok(resources.every((r) => ['abandoned', 'stopped'].includes(r.state)), JSON.stringify(resources));
++  assert.equal(svc.getTask(t.id).status, 'cancelled');
++  const execution = svc.db().prepare('SELECT * FROM executions WHERE task_id=?').get(t.id);
++  assert.equal(execution.status, 'cancelled');
++  const repeat = await svc.cancelTask(t.id, { isolation: barrier.iso });
++  assert.equal(repeat.ok, true);
++  assert.equal(repeat.already_cancelled, true);
++});
++
++test('B01-B 验证容器：取消已报告成功后不得迟到启动', async () => {
++  const { t } = makeTask('b01b');
++  const barrier = verifyBarrier();
++  const running = svc.runTask(t.id, { isolation: barrier.iso });
++  await barrier.started;
++
++  const cancelling = svc.cancelTask(t.id, { isolation: barrier.iso });
++  await waitForTaskStatus(t.id, ['cancel_requested', 'cancelled'], 'B01-B');
++  barrier.release();
++  const cancel = await cancelling;
++  const result = await running;
++
++  assert.equal(
++    Boolean(cancel.ok) && barrier.alive(),
++    false,
++    `取消返回 ok=${cancel.ok} 后仍观察到验证容器迟到启动 (task=${svc.getTask(t.id).status}, result=${result.blocked})`
++  );
++  const resources = svc.listResources(t.id);
++  assert.ok(resources.some((r) => r.kind === 'claude' && ['stopped', 'abandoned'].includes(r.state)), JSON.stringify(resources));
++  assert.ok(resources.some((r) => r.kind === 'verify' && r.state === 'abandoned'), JSON.stringify(resources));
++  assert.equal(svc.getTask(t.id).status, 'cancelled');
++});
++
++
++function auditBarrier() {
++  let markStarted;
++  let release;
++  const started = new Promise((r) => { markStarted = r; });
++  const hold = new Promise((r) => { release = r; });
++  let launched = false;
++  let stopped = false;
++  const iso = {
++    isolationStatus: async () => ({ available: true, backend: 'fake', image: 'fake', network: 'fake', networkInternal: true }),
++    egressProxyUrl: async () => 'http://127.0.0.1:9',
++    runClaudeIsolated: async ({ guard }) => {
++      markStarted();
++      await hold;
++      if (guard && !(await guard())) {
++        return { ok: false, cancelled: true, blocked: 'cancelled', exitCode: null, text: '', raw: 'guard_cancelled' };
++      }
++      launched = true;
++      return { ok: true, exitCode: 0, text: 'late audit start', isolated: true, network: 'fake', image: 'fake', raw: '' };
++    },
++    killContainer: async () => {
++      if (!launched) return { ok: true, confirmed: true, state: 'gone' };
++      stopped = true;
++      return { ok: true, confirmed: true, state: 'exited' };
++    }
++  };
++  return { iso, started, release: () => release(), alive: () => launched && !stopped };
++}
++
++test('B01-C Audit 容器：取消已报告成功后不得迟到启动', async () => {
++  const p = svc.createProject({ name: 'b01c', slug: `b01c-${Date.now().toString(36)}` });
++  const repo = join(p.dir, 'repo');
++  const head = gitRepo(repo);
++  const t = svc.createTask({
++    project: p.id,
++    title: 'B01 audit',
++    input: 'audit',
++    kind: 'audit',
++    executor: 'claude-code',
++    executorConfig: { repo: 'repo', commit: head, contract: '# frozen contract' }
++  });
++  const barrier = auditBarrier();
++  const running = svc.runTask(t.id, { isolation: barrier.iso });
++  await barrier.started;
++
++  const cancelling = svc.cancelTask(t.id, { isolation: barrier.iso });
++  await waitForTaskStatus(t.id, ['cancel_requested', 'cancelled'], 'B01-C');
++  barrier.release();
++  const cancel = await cancelling;
++  await running.catch(() => {});
++
++  assert.equal(
++    Boolean(cancel.ok) && barrier.alive(),
++    false,
++    `取消返回 ok=${cancel.ok} 后仍观察到 Audit 容器迟到启动 (task=${svc.getTask(t.id).status})`
++  );
++  const resources = svc.listResources(t.id);
++  assert.ok(resources.some((r) => r.kind === 'audit' && r.state === 'abandoned'), JSON.stringify(resources));
++  assert.equal(svc.getTask(t.id).status, 'cancelled');
++});
++
++
++function claudeInFlightBarrier() {
++  let markStarted;
++  let release;
++  const started = new Promise((r) => { markStarted = r; });
++  const hold = new Promise((r) => { release = r; });
++  let launched = false;
++  let stopped = false;
++  const iso = {
++    isolationStatus: async () => ({ available: true, backend: 'fake', image: 'fake', network: 'fake', networkInternal: true }),
++    egressProxyUrl: async () => 'http://127.0.0.1:9',
++    runClaudeIsolated: async ({ workdir, guard }) => {
++      // 先取得 docker 启动许可（资源进入 started），再挂起，模拟启动进行中。
++      const allowed = guard ? await guard() : true;
++      if (!allowed) return { ok: false, cancelled: true, blocked: 'cancelled', exitCode: null, text: '', raw: 'guard_cancelled' };
++      markStarted();
++      await hold;
++      launched = true;
++      writeFileSync(join(workdir, 'feature.txt'), 'in-flight claude start\n');
++      return { ok: true, exitCode: 0, text: 'in-flight', isolated: true, network: 'fake', image: 'fake', raw: '' };
++    },
++    runInWorkdir: async () => ({ ok: true, exitCode: 0, output: 'ok' }),
++    killContainer: async () => {
++      if (!launched) return { ok: true, confirmed: true, state: 'gone' };
++      stopped = true;
++      return { ok: true, confirmed: true, state: 'exited' };
++    }
++  };
++  return { iso, started, release: () => release(), alive: () => launched && !stopped };
++}
++
++test('B01-QA-02 启动进行中取消：不得提前成功，必须等到可验证停止', async () => {
++  const { t } = makeTask('b01inflight');
++  const barrier = claudeInFlightBarrier();
++  const running = svc.runTask(t.id, { isolation: barrier.iso });
++  await barrier.started;
++
++  const cancelling = svc.cancelTask(t.id, { isolation: barrier.iso });
++  await waitForTaskStatus(t.id, ['cancel_requested', 'cancelled'], 'B01-QA-02');
++  // 启动已进入 started 阶段；取消不能在没有 kill 证据时提前结束。
++  barrier.release();
++  const cancel = await cancelling;
++  const result = await running;
++  assert.equal(
++    Boolean(cancel.ok) && barrier.alive(),
++    false,
++    `取消返回 ok=${cancel.ok} 后仍观察到进行中的执行容器存活 (task=${svc.getTask(t.id).status}, result=${result.blocked})`
++  );
++});
++
++
++test('B01-QA-05a Docker 失联：不得把启动意图当作安全停止', async () => {
++  const { t } = makeTask('b01daemon');
++  const barrier = claudeBarrier();
++  const iso = {
++    ...barrier.iso,
++    killContainer: async () => ({ ok: false, confirmed: false, reason: 'docker_daemon_unreachable' })
++  };
++  const running = svc.runTask(t.id, { isolation: iso });
++  await barrier.started;
++  const cancel = await svc.cancelTask(t.id, { isolation: iso, launchWaitMs: 500 });
++  assert.equal(cancel.ok, false);
++  assert.equal(svc.getTask(t.id).status, 'cancel_requested');
++  const resources = svc.listResources(t.id);
++  assert.ok(resources.every((r) => r.state === 'unknown'), JSON.stringify(resources));
++  barrier.release();
++  await running.catch(() => {});
++  assert.equal(barrier.alive(), false);
++});
++
++test('B01-QA-05b 重启遗留 starting 意图：超时后必须 unknown 且取消未确认', async () => {
++  const p = svc.createProject({ name: 'b01restart', slug: `b01restart-${Date.now().toString(36)}` });
++  const t = svc.createTask({ project: p.id, title: 'restart', input: 'x' });
++  svc.updateTask(t.id, { status: 'running' });
++  const execId = `exe_b01restart_${Date.now().toString(36)}`;
++  svc.db()
++    .prepare('INSERT INTO executions (id,task_id,agent_id,status,model,session_key,started_at) VALUES (?,?,?,?,?,?,?)')
++    .run(execId, t.id, null, 'running', 'test', '', new Date().toISOString());
++  svc.db()
++    .prepare("INSERT INTO execution_resources (id,execution_id,task_id,kind,name,state,started_at) VALUES (?,?,?,?,?,?,?)")
++    .run(`res_${execId}`, execId, t.id, 'claude', `jarvis-exec-${execId}`, 'starting', new Date().toISOString());
++
++  const fakeIso = { killContainer: async () => ({ ok: true, confirmed: true, state: 'gone' }) };
++  const cancel = await svc.cancelTask(t.id, { isolation: fakeIso, launchWaitMs: 120 });
++  assert.equal(cancel.ok, false, '未解决的启动意图不得报告取消成功');
++  assert.equal(svc.getTask(t.id).status, 'cancel_requested');
++  const resource = svc.listResources(t.id)[0];
++  assert.equal(resource.state, 'unknown');
++  const execution = svc.db().prepare('SELECT * FROM executions WHERE id=?').get(execId);
++  assert.equal(execution.status, 'running', '执行状态不得被伪造成 cancelled');
++});
++
++test('B01-QA-06 并发取消：不得产生新执行或错误终态', async () => {
++  const { t } = makeTask('b01concurrent');
++  const barrier = claudeBarrier();
++  const running = svc.runTask(t.id, { isolation: barrier.iso });
++  await barrier.started;
++  const execBefore = svc.db().prepare('SELECT COUNT(*) AS n FROM executions WHERE task_id=?').get(t.id).n;
++  const c1 = svc.cancelTask(t.id, { isolation: barrier.iso });
++  const c2 = svc.cancelTask(t.id, { isolation: barrier.iso });
++  await waitForTaskStatus(t.id, ['cancel_requested', 'cancelled'], 'B01-QA-06');
++  barrier.release();
++  const [r1, r2] = await Promise.all([c1, c2]);
++  await running.catch(() => {});
++  assert.ok(r1.ok || r1.already_cancelled, JSON.stringify(r1));
++  assert.ok(r2.ok || r2.already_cancelled, JSON.stringify(r2));
++  assert.equal(svc.getTask(t.id).status, 'cancelled');
++  assert.equal(barrier.alive(), false);
++  const execAfter = svc.db().prepare('SELECT COUNT(*) AS n FROM executions WHERE task_id=?').get(t.id).n;
++  assert.equal(execAfter, execBefore, '并发取消不得创建新执行');
++});
+diff --git a/orchestrator/test/fix3-close.test.mjs b/orchestrator/test/fix3-close.test.mjs
+index 03f8803..846d82a 100644
+--- a/orchestrator/test/fix3-close.test.mjs
++++ b/orchestrator/test/fix3-close.test.mjs
+@@ -277,10 +277,13 @@ test('取消在提交前成立：不得开始 Git Commit', async () => {
+   const hold = new Promise((r) => { releaseRun = r; });
+   const gatedIso = {
+     ...fakeIsolation,
+-    runClaudeIsolated: async ({ workdir }) => {
+-      writeFileSync(join(workdir, 'feature.txt'), 'x\n');
++    runClaudeIsolated: async ({ workdir, guard }) => {
+       markStarted();
+       await hold;
++      if (guard && !(await guard())) {
++        return { ok: false, cancelled: true, blocked: 'cancelled', exitCode: null, text: '', raw: 'guard_cancelled' };
++      }
++      writeFileSync(join(workdir, 'feature.txt'), 'x\n');
+       return { ok: true, exitCode: 0, text: 'done', isolated: true, network: 'fake-net', image: 'fake-image', raw: '' };
+     }
+   };
+@@ -291,9 +294,14 @@ test('取消在提交前成立：不得开始 Git Commit', async () => {
+   };
+   const running = svc.runTask(t.id, { isolation: gatedIso, executor: spyExecutor });
+   await started;
+-  const cancelled = await svc.cancelTask(t.id, { isolation: gatedIso });
+-  assert.equal(cancelled.ok, true, JSON.stringify(cancelled));
++  const cancelling = svc.cancelTask(t.id, { isolation: gatedIso });
++  for (let i = 0; i < 200; i++) {
++    if (['cancel_requested', 'cancelled'].includes(svc.getTask(t.id).status)) break;
++    await new Promise((r) => setImmediate(r));
++  }
+   releaseRun();
++  const cancelled = await cancelling;
++  assert.equal(cancelled.ok, true, JSON.stringify(cancelled));
+   const r = await running;
+   assert.equal(r.ok, false);
+   assert.equal(r.blocked, 'cancelled');
