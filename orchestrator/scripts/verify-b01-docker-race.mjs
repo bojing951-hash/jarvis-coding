@@ -1,31 +1,47 @@
 #!/usr/bin/env node
 /**
- * B01 真实 Docker 启动/取消竞态。
+ * B02-QA-06 / A4-04：真实 Docker 启动/取消竞态与残留证明。
  *
- * 用一个 wrapper 在真实 `docker run` 之前建立文件屏障，确保：
- *   启动意图/started 已登记 → docker run 尚未执行 → 取消 → 释放屏障 → 真实容器启动。
- * 修复后取消必须等待并实际终止容器；不得在屏障释放前返回 ok=true。
+ * - 唯一隔离临时目录，不清理非本测试文件/容器/网络
+ * - Execution ID 与容器名从真实 SQLite 读取，不用 result.execution 作为唯一来源
+ * - 记录 container ID、inspect 状态序列、正确名称的 docker ps -a、Git HEAD
+ * - 屏障在 claimDockerInvocation 之后、真实 docker run 之前
  *
  * 需要本机 Docker + 测试镜像 jarvis-b01-exec:test（alpine + sleep 120）。
- * 不消耗模型额度。
  */
-import { chmodSync, existsSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
-import { homedir } from 'node:os';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
+import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
 
 const REAL_HOME = homedir();
-const HOME_DIR = '/tmp/jarvis-b01-docker/home';
+const ROOT = mkdtempSync(join(tmpdir(), 'jarvis-b02-docker-'));
+const HOME_DIR = join(ROOT, 'home');
 const DOCKER = process.env.JARVIS_DOCKER_BIN_REAL || '/Applications/Docker.app/Contents/Resources/bin/docker';
-const IMAGE = process.env.JARVIS_B01_IMAGE || 'jarvis-b01-exec:test';
-const ENTERED = '/tmp/jarvis-b01-docker/run-entered';
-const RELEASE = '/tmp/jarvis-b01-docker/run-release';
-const WRAPPER = '/tmp/jarvis-b01-docker/docker-wrapper.sh';
+const IMAGE = process.env.JARVIS_B02_IMAGE || 'jarvis-b01-exec:test';
+const ENTERED = join(ROOT, 'run-entered');
+const RELEASE = join(ROOT, 'run-release');
+const WRAPPER = join(ROOT, 'docker-wrapper.sh');
+const LOGS = join(ROOT, 'logs');
 
-rmSync('/tmp/jarvis-b01-docker', { recursive: true, force: true });
 mkdirSync(join(HOME_DIR, '.claude'), { recursive: true });
 mkdirSync(join(HOME_DIR, 'jarvis'), { recursive: true });
+mkdirSync(LOGS, { recursive: true });
 writeFileSync(join(HOME_DIR, '.claude/settings.json'), JSON.stringify({ env: { ANTHROPIC_MODEL: 'test' } }));
+
+const dockerEnv = { ...process.env, HOME: REAL_HOME };
+if (!process.env.DOCKER_HOST && existsSync(join(REAL_HOME, '.docker/run/docker.sock'))) {
+  process.env.DOCKER_HOST = `unix://${join(REAL_HOME, '.docker/run/docker.sock')}`;
+  dockerEnv.DOCKER_HOST = process.env.DOCKER_HOST;
+}
+
+try {
+  execFileSync(DOCKER, ['image', 'inspect', IMAGE], { stdio: 'ignore', env: dockerEnv, timeout: 20_000 });
+} catch {
+  console.error(`missing test image: ${IMAGE}`);
+  console.error('build: docker build -t ' + IMAGE + ' /tmp/jarvis-b01-image');
+  process.exit(2);
+}
 
 writeFileSync(WRAPPER, `#!/bin/sh
 if [ "$1" = "run" ]; then
@@ -41,7 +57,6 @@ exec "${DOCKER}" "$@"
 `);
 chmodSync(WRAPPER, 0o755);
 
-process.env.DOCKER_HOST = process.env.DOCKER_HOST || `unix://${join(REAL_HOME, '.docker/run/docker.sock')}`;
 process.env.HOME = HOME_DIR;
 process.env.JARVIS_HOME = join(HOME_DIR, 'jarvis');
 process.env.JARVIS_DB = join(HOME_DIR, 'jarvis', 'state.db');
@@ -50,7 +65,6 @@ process.env.JARVIS_EXECUTOR_IMAGE = IMAGE;
 process.env.JARVIS_EXECUTOR_NETWORK = 'jarvis-internal';
 
 const svc = await import('../src/service.mjs');
-const ex = await import('../src/executor.mjs');
 
 const gitRepo = (dir) => {
   mkdirSync(dir, { recursive: true });
@@ -61,6 +75,8 @@ const gitRepo = (dir) => {
   g('-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-q', '-m', 'init');
   return g('rev-parse', 'HEAD').trim();
 };
+const gitHead = (dir) => execFileSync('git', ['-C', dir, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
+const docker = (args) => execFileSync(DOCKER, args, { encoding: 'utf8', env: dockerEnv, stdio: ['ignore', 'pipe', 'pipe'] }).trim();
 
 const waitForFile = async (path, label, failCheck = () => null) => {
   for (let i = 0; i < 600; i++) {
@@ -73,103 +89,153 @@ const waitForFile = async (path, label, failCheck = () => null) => {
   throw failure || new Error(`${label} timeout`);
 };
 
-const p = svc.createProject({ name: 'B01 Docker Race', slug: `b01-docker-${Date.now().toString(36)}` });
-const repo = join(p.dir, 'repo');
-const head = gitRepo(repo);
+const project = svc.createProject({ name: 'B02 Docker Race', slug: `b02-docker-${Date.now().toString(36)}` });
+const repo = join(project.dir, 'repo');
+const base = gitRepo(repo);
+const headBefore = gitHead(repo);
 const task = svc.createTask({
-  project: p.id,
-  title: 'B01 docker race',
+  project: project.id,
+  title: 'B02 docker race',
   input: 'noop',
   kind: 'executor',
   executor: 'claude-code',
-  executorConfig: { mode: 'plan', repo: 'repo', base_commit: head }
+  executorConfig: { mode: 'plan', repo: 'repo', base_commit: base }
 });
 
+let containerName = null;
+let containerId = null;
+let executionId = null;
+let executionRow = null;
+let resourceRow = null;
+let cancel = null;
+let result = null;
+let runFailure = null;
 let cancelResolvedBeforeRelease = false;
 let releaseWritten = false;
 let sawContainerRunning = false;
-let cancel = null;
-let result = null;
+const observedStates = [];
+const startedAt = Date.now();
+let releaseAt = null;
+
+const cleanup = () => {
+  if (!containerName) return;
+  try {
+    execFileSync(DOCKER, ['rm', '-f', containerName], { stdio: 'ignore', env: dockerEnv, timeout: 30_000 });
+  } catch {}
+};
+process.on('exit', cleanup);
+
 try {
-  let runFailure = null;
   const running = svc.runTask(task.id);
   running.catch((e) => { runFailure = e; });
   await waitForFile(ENTERED, 'docker-run-entered', () => runFailure);
 
+  // 以真实 SQLite 为准：Execution ID、容器名、资源行。
+  executionRow = svc.db().prepare("SELECT * FROM executions WHERE task_id=? AND status='running' ORDER BY started_at DESC").get(task.id);
+  if (!executionRow) throw new Error('no running execution row at docker barrier');
+  executionId = executionRow.id;
+  resourceRow = svc.db().prepare("SELECT * FROM execution_resources WHERE execution_id=? AND kind='claude' ORDER BY started_at DESC").get(executionId);
+  if (!resourceRow) throw new Error(`no claude resource row for execution ${executionId}`);
+  containerName = `jarvis-exec-${executionId}`;
+  if (resourceRow.name !== containerName) {
+    throw new Error(`resource name mismatch: ${resourceRow.name} != ${containerName}`);
+  }
+
   const cancelling = svc.cancelTask(task.id);
   cancelling.then((r) => { cancel = r; cancelResolvedBeforeRelease = !releaseWritten; });
-  for (let i = 0; i < 500; i++) {
+  for (let i = 0; i < 1000; i++) {
     if (['cancel_requested', 'cancelled'].includes(svc.getTask(task.id).status)) break;
     await new Promise((r) => setImmediate(r));
   }
-  assertStatus('cancel_requested or cancelled', ['cancel_requested', 'cancelled']);
-  // 此刻真实 docker run 仍被 wrapper 挡住；取消不得已返回 ok=true。
+  if (!['cancel_requested', 'cancelled'].includes(svc.getTask(task.id).status)) {
+    throw new Error(`task not marked cancel_requested: ${svc.getTask(task.id).status}`);
+  }
+  // 真实 docker run 仍被屏障挡住：取消不得已返回成功。
   await new Promise((r) => setImmediate(r));
   if (cancelResolvedBeforeRelease) {
     throw new Error('cancel reported complete before the delayed docker run was released');
   }
 
-  releaseWritten = true;
-  const runningExec = svc.db().prepare("SELECT id FROM executions WHERE task_id=? AND status='running' ORDER BY started_at DESC").get(task.id);
-  const containerName = runningExec ? `jarvis-exec-${runningExec.id}` : null;
   const pollContainer = (async () => {
-    if (!containerName) return;
-    for (let i = 0; i < 600; i++) {
+    for (let i = 0; i < 800; i++) {
       try {
-        const status = execFileSync(DOCKER, ['inspect', containerName, '--format', '{{.State.Status}}'], {
-          encoding: 'utf8',
-          stdio: ['ignore', 'pipe', 'ignore'],
-          env: { ...process.env, HOME: REAL_HOME, DOCKER_HOST: process.env.DOCKER_HOST }
-        }).trim();
+        const status = docker(['inspect', containerName, '--format', '{{.State.Status}}']);
+        if (status && !observedStates.includes(status)) observedStates.push(status);
         if (['created', 'running'].includes(status)) sawContainerRunning = true;
+        const id = docker(['inspect', containerName, '--format', '{{.Id}}']);
+        if (id) containerId = id;
       } catch {}
       await new Promise((r) => setTimeout(r, 10));
     }
   })();
+
+  releaseWritten = true;
+  releaseAt = Date.now();
   writeFileSync(RELEASE, 'go');
   cancel = await cancelling;
   result = await running;
   await pollContainer;
 } finally {
-  try { releaseWritten = true; writeFileSync(RELEASE, 'go'); } catch {}
+  if (!releaseWritten) {
+    releaseWritten = true;
+    releaseAt = Date.now();
+    try { writeFileSync(RELEASE, 'go'); } catch {}
+  }
 }
 
-function assertStatus(_label, allowed) {
-  const s = svc.getTask(task.id).status;
-  if (!allowed.includes(s)) throw new Error(`task status ${s}`);
+const executionAfter = svc.db().prepare('SELECT * FROM executions WHERE id=?').get(executionId);
+const resourceAfter = svc.db().prepare('SELECT * FROM execution_resources WHERE id=?').get(resourceRow?.id);
+const taskAfter = svc.getTask(task.id);
+const headAfter = gitHead(repo);
+let containerPs = '';
+let inspectAfter = null;
+if (containerName) {
+  try { containerPs = docker(['ps', '-a', '--filter', `name=${containerName}`, '--format', '{{.Names}} {{.Status}}']); } catch {}
+  try { inspectAfter = docker(['inspect', containerName, '--format', '{{.State.Status}}']); } catch { inspectAfter = 'gone'; }
 }
-
-const resource = svc.db().prepare('SELECT * FROM execution_resources WHERE task_id=?').get(task.id);
-const execution = svc.db().prepare('SELECT * FROM executions WHERE task_id=? ORDER BY started_at DESC').get(task.id);
-const ps = execFileSync(DOCKER, ['ps', '-a', '--filter', `name=jarvis-exec-${result?.execution}`, '--format', '{{.Names}} {{.Status}}'], {
-  encoding: 'utf8',
-  env: { ...process.env, HOME: REAL_HOME, DOCKER_HOST: process.env.DOCKER_HOST }
-}).trim();
 
 const evidence = {
+  testRoot: ROOT,
+  startedAt,
+  releaseAt,
   task: task.id,
-  taskStatus: svc.getTask(task.id).status,
+  executionId,
+  executionIdSource: 'sqlite executions.status=running at docker barrier',
+  executionStatus: executionAfter?.status ?? null,
+  resourceId: resourceRow?.id ?? null,
+  resourceName: resourceRow?.name ?? null,
+  resourceState: resourceAfter?.state ?? null,
+  resourceStoppedAt: resourceAfter?.stopped_at ?? null,
+  containerName,
+  containerId,
+  containerNameMatchesExecution: containerName === `jarvis-exec-${executionId}`,
+  sawContainerRunning,
+  observedStates,
+  inspectAfter,
   cancelOk: cancel?.ok ?? null,
   cancelResolvedBeforeRelease,
-  executionStatus: execution?.status ?? null,
-  resourceState: resource?.state ?? null,
-  resourceStoppedAt: resource?.stopped_at ?? null,
+  taskStatus: taskAfter.status,
   resultBlocked: result?.blocked ?? null,
-  resultExitCode: result?.exitCode ?? null,
-  sawContainerRunning,
-  containerPs: ps,
+  containerPs,
+  gitHeadBefore: headBefore,
+  gitHeadAfter: headAfter,
   image: IMAGE
 };
 console.log(JSON.stringify(evidence, null, 2));
 
-if (
-  cancelResolvedBeforeRelease ||
-  !cancel?.ok ||
-  svc.getTask(task.id).status !== 'cancelled' ||
-  execution?.status !== 'cancelled' ||
-  !['stopped', 'abandoned'].includes(resource?.state) ||
-  !sawContainerRunning ||
-  ps.length > 0
-) {
+const ok =
+  !cancelResolvedBeforeRelease &&
+  cancel?.ok === true &&
+  taskAfter.status === 'cancelled' &&
+  executionAfter?.status === 'cancelled' &&
+  ['stopped', 'abandoned'].includes(resourceAfter?.state) &&
+  containerName === `jarvis-exec-${executionId}` &&
+  Boolean(containerId) &&
+  sawContainerRunning &&
+  containerPs.length === 0 &&
+  headBefore === headAfter;
+
+if (!ok) {
+  cleanup();
   process.exit(1);
 }

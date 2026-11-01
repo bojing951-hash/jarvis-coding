@@ -1796,11 +1796,22 @@ async function launchContainer({ executionId, taskId, kind, name, run }) {
   try {
     result = await run(intent.id);
   } catch (e) {
-    finishContainerResource(intent.id);
+    // CLI 抛错不等于真实容器已停止；保持 unknown，等待人工/取消核查。
+    markContainerUnknown(intent.id);
     throw e;
   }
   if (result?.cancelled) {
     abandonContainerResource(intent.id);
+  } else if (
+    !result ||
+    result.abnormal === true ||
+    result.timedOut === true ||
+    result.signal ||
+    result.killed === true ||
+    result.cliError
+  ) {
+    // Docker CLI 超时/信号/启动失败：无法证明容器已停止。
+    markContainerUnknown(intent.id);
   } else {
     finishContainerResource(intent.id);
   }

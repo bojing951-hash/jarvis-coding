@@ -25,22 +25,60 @@ function dockerBin() {
 }
 const DOCKER = dockerBin();
 
-const sh = (cmd, args, opts = {}) =>
+/**
+ * B02：唯一成功条件是 execFile 无错误且正常退出 0。
+ * timeout / signal / spawn error / maxBuffer 都不得映射成 code=0。
+ */
+export const sh = (cmd, args, opts = {}) =>
   new Promise((resolve) => {
-    execFile(cmd, args, { timeout: opts.timeoutMs ?? 20_000, maxBuffer: 8 * 1024 * 1024 }, (err, stdout, stderr) =>
-      resolve({ code: err?.code ?? 0, out: (stdout || '') + (stderr || '') })
+    execFile(
+      cmd,
+      args,
+      { timeout: opts.timeoutMs ?? 20_000, maxBuffer: opts.maxBuffer ?? 8 * 1024 * 1024 },
+      (err, stdout, stderr) => {
+        const out = (stdout || '') + (stderr || '');
+        if (!err) {
+          return resolve({
+            ok: true,
+            code: 0,
+            errorCode: null,
+            signal: null,
+            killed: false,
+            timedOut: false,
+            abnormal: false,
+            error: null,
+            out
+          });
+        }
+        const code = typeof err.code === 'number' ? err.code : null;
+        const signal = err.signal ?? null;
+        const killed = err.killed === true;
+        const timedOut = Boolean(killed && signal);
+        const abnormal = Boolean(timedOut || signal || code === null);
+        return resolve({
+          ok: false,
+          code,
+          errorCode: err.code ?? null,
+          signal,
+          killed,
+          timedOut,
+          abnormal,
+          error: err.message ?? String(err),
+          out
+        });
+      }
     );
   });
 
 /** 实际探测 Docker 守护进程，而不是只看命令是否存在。 */
 export async function isolationStatus() {
   const bin = await sh('/bin/sh', ['-c', `command -v ${DOCKER}`]).catch(() => ({ code: 1, out: '' }));
-  if (bin.code !== 0) {
-    return { available: false, backend: 'docker', reason: 'docker 命令不存在' };
+  if (!bin.ok || bin.code !== 0) {
+    return { available: false, backend: 'docker', reason: `docker 命令不可用: ${(bin.error ?? bin.out) || 'unknown'}` };
   }
   const info = await sh(DOCKER, ['info', '--format', '{{.ServerVersion}}'], { timeoutMs: 15_000 });
-  if (info.code !== 0) {
-    return { available: false, backend: 'docker', reason: `docker 守护进程不可用: ${info.out.slice(0, 200)}` };
+  if (!info.ok) {
+    return { available: false, backend: 'docker', reason: `docker 守护进程不可用: ${(info.error ?? info.out ?? 'unknown').slice(0, 200)}` };
   }
   const image = process.env.JARVIS_EXECUTOR_IMAGE || 'jarvis-executor:2.1.104';
   if (!image) {
@@ -52,13 +90,13 @@ export async function isolationStatus() {
     };
   }
   const img = await sh(DOCKER, ['image', 'inspect', image, '--format', '{{.Id}}'], { timeoutMs: 15_000 });
-  if (img.code !== 0) {
-    return { available: false, backend: 'docker', serverVersion: info.out.trim(), reason: `执行镜像不可用: ${image}` };
+  if (!img.ok) {
+    return { available: false, backend: 'docker', serverVersion: info.out.trim(), reason: `执行镜像不可用: ${image} (${(img.error ?? img.out ?? 'unknown').slice(0, 160)})` };
   }
   const net = process.env.JARVIS_EXECUTOR_NETWORK || 'jarvis-internal';
   const netCheck = await sh(DOCKER, ['network', 'inspect', net, '--format', '{{.Internal}}'], { timeoutMs: 10_000 });
-  if (netCheck.code !== 0) {
-    return { available: false, backend: 'docker', serverVersion: info.out.trim(), image: img.out.trim(), reason: `隔离网络不存在: ${net}` };
+  if (!netCheck.ok) {
+    return { available: false, backend: 'docker', serverVersion: info.out.trim(), image: img.out.trim(), reason: `隔离网络不存在: ${net} (${(netCheck.error ?? netCheck.out ?? 'unknown').slice(0, 160)})` };
   }
   const internal = netCheck.out.trim() === 'true';
   // DEF-03：策略要求内部隔离网络。Internal=false 意味着存在外网路由，必须 fail closed。
@@ -105,7 +143,7 @@ export async function isolationStatus() {
 export async function egressProxyUrl(network = process.env.JARVIS_EXECUTOR_NETWORK || 'jarvis-internal') {
   const name = process.env.JARVIS_PROXY_CONTAINER || 'jarvis-proxy';
   const r = await sh(DOCKER, ['inspect', name, '--format', '{{json .NetworkSettings.Networks}}'], { timeoutMs: 10_000 });
-  if (r.code !== 0) return null;
+  if (!r.ok) return null;
   try {
     const nets = JSON.parse(r.out.trim());
     return nets?.[network]?.IPAddress ? `http://${nets[network].IPAddress}:8888` : null;
@@ -204,8 +242,13 @@ export async function runClaudeIsolated({
     try { parsed = JSON.parse(r.out.slice(at)); } catch { parsed = null; }
   }
   return {
-    ok: r.code === 0,
+    ok: r.ok,
     exitCode: r.code,
+    signal: r.signal,
+    killed: r.killed,
+    timedOut: r.timedOut,
+    abnormal: r.abnormal,
+    cliError: r.abnormal ? r.error : null,
     durationMs: Date.now() - started,
     text: parsed?.result ?? r.out.slice(-4000),
     isolated: true,
@@ -219,9 +262,9 @@ export async function runClaudeIsolated({
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 /** 确认 Docker daemon 是否可用（与「容器不存在」区分）。 */
-export async function daemonReachable() {
-  const r = await sh(DOCKER, ['info', '--format', '{{.ServerVersion}}'], { timeoutMs: 8_000 });
-  return r.code === 0;
+export async function daemonReachable({ timeoutMs = 8_000 } = {}) {
+  const r = await sh(DOCKER, ['info', '--format', '{{.ServerVersion}}'], { timeoutMs });
+  return r.ok && r.code === 0;
 }
 
 /**
@@ -230,12 +273,12 @@ export async function daemonReachable() {
  *  - reason=docker_daemon_unreachable  daemon 失联，终止结果无法确认
  *  - reason=container_still_running    daemon 健康但容器仍在
  */
-export async function killContainer(name, { graceMs = 5000 } = {}) {
+export async function killContainer(name, { graceMs = 5000, killTimeoutMs = 15_000 } = {}) {
   if (!name) return { ok: false, confirmed: false, reason: 'no_container_name' };
 
   const inspectState = async () => {
     const r = await sh(DOCKER, ['inspect', name, '--format', '{{.State.Status}}'], { timeoutMs: 8_000 });
-    if (r.code === 0) return { kind: 'state', value: r.out.trim() };
+    if (r.ok) return { kind: 'state', value: r.out.trim() };
     if (/No such object|could not be found/i.test(r.out)) return { kind: 'gone' };
     if (/Cannot connect|daemon|connection refused/i.test(r.out)) return { kind: 'daemon' };
     return { kind: 'error', value: r.out.slice(0, 120) };
@@ -248,14 +291,14 @@ export async function killContainer(name, { graceMs = 5000 } = {}) {
   const STOPPED = new Set(['exited', 'dead', 'removing']);
 
   // 1) 先请求优雅终止（SIGTERM）
-  const term = await sh(DOCKER, ['kill', '--signal', 'TERM', name], { timeoutMs: 15_000 });
-  let killAccepted = term.code === 0;
+  const term = await sh(DOCKER, ['kill', '--signal', 'TERM', name], { timeoutMs: killTimeoutMs });
+  let killAccepted = term.ok;
 
   let escalated = false;
   const deadline = Date.now() + graceMs;
   while (Date.now() < deadline) {
     const st = await inspectState();
-    if (st.kind === 'gone') return { ok: true, confirmed: true, state: 'gone', escalated, killAccepted };
+    if (st.kind === 'gone') return { ok: killAccepted, confirmed: killAccepted, state: 'gone', escalated, killAccepted, reason: killAccepted ? undefined : 'kill_unaccepted_and_container_gone' };
     if (st.kind === 'daemon') return { ok: false, confirmed: false, reason: 'docker_daemon_unreachable' };
     if (st.kind === 'state' && STOPPED.has(st.value)) return { ok: true, confirmed: true, state: st.value, escalated, killAccepted };
     if (st.kind === 'state' && !['running', 'created', 'restarting', 'paused'].includes(st.value)) {
@@ -267,11 +310,11 @@ export async function killContainer(name, { graceMs = 5000 } = {}) {
 
   // 2) 仍未退出 → 升级 SIGKILL
   escalated = true;
-  const kill = await sh(DOCKER, ['kill', '--signal', 'KILL', name], { timeoutMs: 15_000 });
-  if (kill.code === 0) killAccepted = true;
+  const kill = await sh(DOCKER, ['kill', '--signal', 'KILL', name], { timeoutMs: killTimeoutMs });
+  if (kill.ok) killAccepted = true;
   for (let i = 0; i < 25; i++) {
     const st = await inspectState();
-    if (st.kind === 'gone') return { ok: true, confirmed: true, state: 'gone', escalated, killAccepted };
+    if (st.kind === 'gone') return { ok: killAccepted, confirmed: killAccepted, state: 'gone', escalated, killAccepted, reason: killAccepted ? undefined : 'kill_unaccepted_and_container_gone' };
     if (st.kind === 'daemon') return { ok: false, confirmed: false, reason: 'docker_daemon_unreachable', escalated };
     if (st.kind === 'state' && STOPPED.has(st.value)) return { ok: true, confirmed: true, state: st.value, escalated, killAccepted };
     if (st.kind === 'state' && !['running', 'created', 'restarting', 'paused'].includes(st.value)) {
@@ -333,7 +376,17 @@ export async function runInWorkdir({ workdir, program, args = [], image, name, r
   }
   const r = await runPromise;
   try { rmSync(cidDir, { recursive: true, force: true }); } catch {}
-  return { ok: r.code === 0, exitCode: r.code, durationMs: Date.now() - started, output: r.out.slice(-4000) };
+  return {
+    ok: r.ok,
+    exitCode: r.code,
+    signal: r.signal,
+    killed: r.killed,
+    timedOut: r.timedOut,
+    abnormal: r.abnormal,
+    cliError: r.abnormal ? r.error : null,
+    durationMs: Date.now() - started,
+    output: r.out.slice(-4000)
+  };
 }
 
 /** 隔离不可用时的统一拒绝。 */
