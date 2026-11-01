@@ -381,3 +381,38 @@ test('执行容器凭据文件不包含原始 GLM Key', async () => {
   assert.match(captured.body, /proxy-managed-placeholder/);
   assert.match(captured.body, /\/api\/anthropic\/s\//);
 });
+
+
+/* -------------------- AC-13 / AC-14：Commit 门禁 ---------------------- */
+
+test('AC-13 校验失败不得产生 Commit', async () => {
+  const { t, repo } = approvedTask('ac13');
+  const before = headOf(repo);
+  const failVerifyIso = {
+    ...fakeIsolation,
+    runInWorkdir: async () => ({ ok: false, exitCode: 1, output: 'TEST_FAILED' })
+  };
+  const r = await svc.runTask(t.id, { isolation: failVerifyIso });
+  assert.equal(r.ok, false);
+  assert.equal(r.commit?.skipped, true);
+  assert.match(r.commit?.reason ?? '', /校验失败/);
+  assert.equal(r.verify?.exitCode, 1);
+  assert.equal(headOf(repo), before, '校验失败不得产生新 commit');
+  assert.equal(svc.getTask(t.id).status, 'failed');
+});
+
+test('AC-14 缺少可信校验不得产生 Commit', async () => {
+  const { p, head } = projectWithRepo('ac14');
+  const t = seedTask({ project: p, head, verifyProfileId: null });
+  const challenge = svc.createAuthChallenge(t.id);
+  const issued = svc.issueApproval({ task: t.id, proof: signChallenge(challenge) });
+  assert.equal(issued.ok, true, issued.error);
+  const repo = join(p.dir, 'repo');
+  const before = headOf(repo);
+  const r = await svc.runTask(t.id, { isolation: fakeIsolation });
+  assert.equal(r.ok, false);
+  assert.equal(r.commit?.skipped, true);
+  assert.match(r.commit?.reason ?? '', /缺少必需校验/);
+  assert.equal(headOf(repo), before, '缺少校验不得产生新 commit');
+  assert.equal(svc.getTask(t.id).status, 'failed');
+});
