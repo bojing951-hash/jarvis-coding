@@ -87,6 +87,7 @@ const task = svc.createTask({
 
 let cancelResolvedBeforeRelease = false;
 let releaseWritten = false;
+let sawContainerRunning = false;
 let cancel = null;
 let result = null;
 try {
@@ -109,9 +110,26 @@ try {
   }
 
   releaseWritten = true;
+  const runningExec = svc.db().prepare("SELECT id FROM executions WHERE task_id=? AND status='running' ORDER BY started_at DESC").get(task.id);
+  const containerName = runningExec ? `jarvis-exec-${runningExec.id}` : null;
+  const pollContainer = (async () => {
+    if (!containerName) return;
+    for (let i = 0; i < 600; i++) {
+      try {
+        const status = execFileSync(DOCKER, ['inspect', containerName, '--format', '{{.State.Status}}'], {
+          encoding: 'utf8',
+          stdio: ['ignore', 'pipe', 'ignore'],
+          env: { ...process.env, HOME: REAL_HOME, DOCKER_HOST: process.env.DOCKER_HOST }
+        }).trim();
+        if (['created', 'running'].includes(status)) sawContainerRunning = true;
+      } catch {}
+      await new Promise((r) => setTimeout(r, 10));
+    }
+  })();
   writeFileSync(RELEASE, 'go');
   cancel = await cancelling;
   result = await running;
+  await pollContainer;
 } finally {
   try { releaseWritten = true; writeFileSync(RELEASE, 'go'); } catch {}
 }
@@ -137,6 +155,8 @@ const evidence = {
   resourceState: resource?.state ?? null,
   resourceStoppedAt: resource?.stopped_at ?? null,
   resultBlocked: result?.blocked ?? null,
+  resultExitCode: result?.exitCode ?? null,
+  sawContainerRunning,
   containerPs: ps,
   image: IMAGE
 };
@@ -148,6 +168,7 @@ if (
   svc.getTask(task.id).status !== 'cancelled' ||
   execution?.status !== 'cancelled' ||
   !['stopped', 'abandoned'].includes(resource?.state) ||
+  !sawContainerRunning ||
   ps.length > 0
 ) {
   process.exit(1);
