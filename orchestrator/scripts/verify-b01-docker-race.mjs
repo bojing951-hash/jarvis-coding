@@ -12,8 +12,9 @@
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { execFileSync, spawnSync } from 'node:child_process';
-import { evaluateDockerRaceEvidence, isTrustedGoneInspect } from './b03-docker-evidence.mjs';
+import { execFileSync, spawn, spawnSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
+import { evaluateDockerRaceEvidence, isTrustedGoneInspect, parseDockerEventLine } from './b03-docker-evidence.mjs';
 
 const REAL_HOME = homedir();
 const ROOT = mkdtempSync(join(tmpdir(), 'jarvis-b02-docker-'));
@@ -116,7 +117,81 @@ let releaseWritten = false;
 let sawContainerRunning = false;
 const observedStates = [];
 const startedAt = Date.now();
+let barrierAt = null;
+let cancelRequestedAt = null;
 let releaseAt = null;
+let cancelResolvedAt = null;
+let finalStateAt = null;
+
+const eventsRawLines = [];
+const events = [];
+const eventsParseErrors = [];
+let eventsProcess = null;
+let eventsStarted = false;
+let eventsStopping = false;
+let eventsSpawnError = null;
+let eventsStreamError = null;
+
+const recordEventLine = (line) => {
+  const raw = String(line ?? '').trim();
+  if (!raw) return;
+  eventsRawLines.push(raw);
+  try {
+    events.push(parseDockerEventLine(raw));
+  } catch (e) {
+    eventsParseErrors.push(e.message);
+  }
+};
+
+const startEventCollector = async () => {
+  eventsProcess = spawn(DOCKER, ['events', '--filter', 'type=container', '--format', '{{json .}}'], {
+    env: dockerEnv,
+    stdio: ['ignore', 'pipe', 'pipe']
+  });
+  eventsStarted = true;
+  eventsProcess.stdout.setEncoding('utf8');
+  eventsProcess.stderr.setEncoding('utf8');
+  let buffer = '';
+  eventsProcess.stdout.on('data', (chunk) => {
+    buffer += chunk;
+    let idx;
+    while ((idx = buffer.indexOf('\n')) >= 0) {
+      recordEventLine(buffer.slice(0, idx));
+      buffer = buffer.slice(idx + 1);
+    }
+  });
+  eventsProcess.stderr.on('data', (chunk) => {
+    if (!eventsStopping) eventsStreamError = String(chunk).slice(0, 400);
+  });
+  eventsProcess.on('error', (e) => { eventsSpawnError = e.message; });
+  eventsProcess.on('exit', (code, signal) => {
+    if (!eventsStopping && (code !== 0 || signal)) {
+      eventsStreamError = `docker events exited code=${code} signal=${signal}`;
+    }
+  });
+  // 给事件监听器一个启动机会，再释放 docker run 屏障。
+  await new Promise((r) => setTimeout(r, 200));
+};
+
+const stopEventCollector = async () => {
+  if (!eventsProcess) return;
+  eventsStopping = true;
+  try { eventsProcess.kill('SIGTERM'); } catch {}
+  await new Promise((resolve) => {
+    let done = false;
+    const finish = () => { if (!done) { done = true; resolve(); } };
+    eventsProcess.once('exit', finish);
+    setTimeout(finish, 2000);
+  });
+};
+
+const waitForTargetDestroy = async (timeoutMs = 4000) => {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (containerId && events.some((e) => e.action === 'destroy' && e.actorId === containerId)) return;
+    await new Promise((r) => setTimeout(r, 20));
+  }
+};
 
 const cleanup = () => {
   if (!containerName) return;
@@ -124,12 +199,14 @@ const cleanup = () => {
     execFileSync(DOCKER, ['rm', '-f', containerName], { stdio: 'ignore', env: dockerEnv, timeout: 30_000 });
   } catch {}
 };
-process.on('exit', cleanup);
+process.on('exit', () => { cleanup(); try { eventsProcess?.kill('SIGKILL'); } catch {} });
 
 try {
+  await startEventCollector();
   const running = svc.runTask(task.id);
   running.catch((e) => { runFailure = e; });
   await waitForFile(ENTERED, 'docker-run-entered', () => runFailure);
+  barrierAt = Date.now();
 
   // 以真实 SQLite 为准：Execution ID、容器名、资源行。
   executionRow = svc.db().prepare("SELECT * FROM executions WHERE task_id=? AND status='running' ORDER BY started_at DESC").get(task.id);
@@ -142,6 +219,7 @@ try {
     throw new Error(`resource name mismatch: ${resourceRow.name} != ${containerName}`);
   }
 
+  cancelRequestedAt = Date.now();
   const cancelling = svc.cancelTask(task.id);
   cancelling.then((r) => { cancel = r; cancelResolvedBeforeRelease = !releaseWritten; });
   for (let i = 0; i < 1000; i++) {
@@ -174,8 +252,10 @@ try {
   releaseAt = Date.now();
   writeFileSync(RELEASE, 'go');
   cancel = await cancelling;
+  cancelResolvedAt = Date.now();
   result = await running;
   await pollContainer;
+  await waitForTargetDestroy();
 } finally {
   if (!releaseWritten) {
     releaseWritten = true;
@@ -190,9 +270,6 @@ const taskAfter = svc.getTask(task.id);
 const headAfter = gitHead(repo);
 let ps = null;
 let inspectAfter = null;
-let events = [];
-let eventsOk = false;
-let eventsError = null;
 if (containerName) {
   const psRun = spawnSync(DOCKER, ['ps', '-a', '--filter', `name=${containerName}`, '--format', '{{.Names}} {{.Status}}'], {
     encoding: 'utf8',
@@ -223,31 +300,32 @@ if (containerName) {
     abnormal: Boolean(inspectRun.error || inspectRun.signal || inspectRun.status === null)
   };
   inspectAfter.trustedGone = isTrustedGoneInspect(inspectAfter, containerName);
-
-  const eventsRun = spawnSync(
-    DOCKER,
-    [
-      'events',
-      '--since', String(Math.floor(startedAt / 1000) - 1),
-      '--until', String(Math.floor(Date.now() / 1000)),
-      '--filter', `container=${containerName}`,
-      '--format', '{{.Action}}'
-    ],
-    { encoding: 'utf8', env: dockerEnv, timeout: 15_000 }
-  );
-  eventsOk = eventsRun.status === 0;
-  eventsError = eventsRun.error?.message ?? (eventsRun.stderr || '').trim() ?? null;
-  const actions = (eventsRun.stdout || '')
-    .split('\n')
-    .map((x) => x.trim())
-    .filter((x) => ['create', 'start', 'die', 'destroy'].includes(x));
-  events = [...new Set(actions)];
 }
+
+await stopEventCollector();
+finalStateAt = Date.now();
+
+const eventsRaw = eventsRawLines.join('\n');
+const eventsRawFile = eventsRaw + (eventsRaw ? '\n' : '');
+const eventsRawPath = join(ROOT, 'docker-events.jsonl');
+writeFileSync(eventsRawPath, eventsRawFile);
+const eventsRawSha256 = createHash('sha256').update(eventsRawFile).digest('hex');
+const eventsError = eventsSpawnError || eventsStreamError || (eventsParseErrors.length ? eventsParseErrors.join('; ') : null);
+const eventsOk =
+  eventsStarted &&
+  !eventsSpawnError &&
+  !eventsStreamError &&
+  eventsParseErrors.length === 0 &&
+  eventsRawLines.length > 0;
 
 const evidence = {
   testRoot: ROOT,
   startedAt,
+  barrierAt,
+  cancelRequestedAt,
   releaseAt,
+  cancelResolvedAt,
+  finalStateAt,
   task: task.id,
   executionId,
   executionIdSource: 'sqlite executions.status=running at docker barrier',
@@ -269,6 +347,10 @@ const evidence = {
   ps,
   containerPs: ps?.stdout ?? '',
   events,
+  eventsRaw,
+  eventsRawPath,
+  eventsRawSha256,
+  eventsParseErrors,
   eventsOk,
   eventsError,
   gitHeadBefore: headBefore,
