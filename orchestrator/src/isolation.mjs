@@ -8,7 +8,9 @@
  */
 import { execFile } from 'node:child_process';
 
-import { existsSync } from 'node:fs';
+import { existsSync, mkdtempSync, rmSync } from 'node:fs';
+import { join } from 'node:path';
+import { tmpdir } from 'node:os';
 
 const DOCKER_CANDIDATES = [
   process.env.JARVIS_DOCKER_BIN,
@@ -124,7 +126,9 @@ export async function runClaudeIsolated({
   readOnly = false,
   tmpDir,
   network = process.env.JARVIS_EXECUTOR_NETWORK || 'jarvis-internal',
-  timeoutMs = 900_000
+  timeoutMs = 900_000,
+  guard = null,
+  onStarted = null
 }) {
   const st = await isolationStatus();
   if (!st.available) return { ok: false, blocked: 'isolation_unavailable', error: st.reason };
@@ -146,10 +150,54 @@ export async function runClaudeIsolated({
   // 不再注入 HTTP(S)_PROXY：模型流量通过 ANTHROPIC_BASE_URL 指向代理，
   // 直接走内网 IP；其余出网在 --internal 网络里本就没有路由。
   if (modelToken) args.push('-e', `JARVIS_MODEL_TOKEN=${modelToken}`);
+  const cidDir = mkdtempSync(join(tmpdir(), 'jarvis-cid-'));
+  const cidFile = join(cidDir, 'container.cid');
+  args.push('--cidfile', cidFile);
   args.push(image, '-p', prompt, '--output-format', 'json', '--permission-mode', mode);
 
+  // B01：真正调用 docker run 之前的最后一道启动许可检查。
+  if (guard) {
+    let allowed = false;
+    try { allowed = Boolean(await guard()); } catch { allowed = false; }
+    if (!allowed) {
+      try { rmSync(cidDir, { recursive: true, force: true }); } catch {}
+      return {
+        ok: false,
+        cancelled: true,
+        blocked: 'cancelled',
+        exitCode: null,
+        text: '',
+        isolated: true,
+        network,
+        image,
+        raw: 'launch_cancelled_before_docker_run'
+      };
+    }
+  }
+
   const started = Date.now();
-  const r = await sh(DOCKER, args, { timeoutMs });
+  const runPromise = sh(DOCKER, args, { timeoutMs });
+  let notified = false;
+  if (onStarted) {
+    const waitStart = Date.now();
+    while (Date.now() - waitStart < 5_000) {
+      if (existsSync(cidFile)) {
+        notified = true;
+        try { onStarted(); } catch {}
+        break;
+      }
+      const done = await Promise.race([
+        runPromise.then((value) => ({ done: true, value })),
+        new Promise((resolve) => setTimeout(() => resolve({ done: false }), 50))
+      ]);
+      if (done.done) break;
+    }
+    if (!notified && existsSync(cidFile)) {
+      try { onStarted(); } catch {}
+    }
+  }
+  const r = await runPromise;
+  try { rmSync(cidDir, { recursive: true, force: true }); } catch {}
   let parsed = null;
   const at = r.out.indexOf('{');
   if (at >= 0) {
@@ -200,15 +248,16 @@ export async function killContainer(name, { graceMs = 5000 } = {}) {
   const STOPPED = new Set(['exited', 'dead', 'removing']);
 
   // 1) 先请求优雅终止（SIGTERM）
-  await sh(DOCKER, ['kill', '--signal', 'TERM', name], { timeoutMs: 15_000 });
+  const term = await sh(DOCKER, ['kill', '--signal', 'TERM', name], { timeoutMs: 15_000 });
+  let killAccepted = term.code === 0;
 
   let escalated = false;
   const deadline = Date.now() + graceMs;
   while (Date.now() < deadline) {
     const st = await inspectState();
-    if (st.kind === 'gone') return { ok: true, confirmed: true, state: 'gone', escalated };
+    if (st.kind === 'gone') return { ok: true, confirmed: true, state: 'gone', escalated, killAccepted };
     if (st.kind === 'daemon') return { ok: false, confirmed: false, reason: 'docker_daemon_unreachable' };
-    if (st.kind === 'state' && STOPPED.has(st.value)) return { ok: true, confirmed: true, state: st.value, escalated };
+    if (st.kind === 'state' && STOPPED.has(st.value)) return { ok: true, confirmed: true, state: st.value, escalated, killAccepted };
     if (st.kind === 'state' && !['running', 'created', 'restarting', 'paused'].includes(st.value)) {
       // 未知状态：不得判为已停止（FIX3-E）
       return { ok: false, confirmed: false, reason: 'unknown_container_state', state: st.value, escalated };
@@ -218,12 +267,13 @@ export async function killContainer(name, { graceMs = 5000 } = {}) {
 
   // 2) 仍未退出 → 升级 SIGKILL
   escalated = true;
-  await sh(DOCKER, ['kill', '--signal', 'KILL', name], { timeoutMs: 15_000 });
+  const kill = await sh(DOCKER, ['kill', '--signal', 'KILL', name], { timeoutMs: 15_000 });
+  if (kill.code === 0) killAccepted = true;
   for (let i = 0; i < 25; i++) {
     const st = await inspectState();
-    if (st.kind === 'gone') return { ok: true, confirmed: true, state: 'gone', escalated };
+    if (st.kind === 'gone') return { ok: true, confirmed: true, state: 'gone', escalated, killAccepted };
     if (st.kind === 'daemon') return { ok: false, confirmed: false, reason: 'docker_daemon_unreachable', escalated };
-    if (st.kind === 'state' && STOPPED.has(st.value)) return { ok: true, confirmed: true, state: st.value, escalated };
+    if (st.kind === 'state' && STOPPED.has(st.value)) return { ok: true, confirmed: true, state: st.value, escalated, killAccepted };
     if (st.kind === 'state' && !['running', 'created', 'restarting', 'paused'].includes(st.value)) {
       return { ok: false, confirmed: false, reason: 'unknown_container_state', state: st.value, escalated };
     }
@@ -233,7 +283,7 @@ export async function killContainer(name, { graceMs = 5000 } = {}) {
 }
 
 /** 在同一隔离网络/挂载里运行任意受控程序（校验用）。 */
-export async function runInWorkdir({ workdir, program, args = [], image, name, readOnly = false, network = process.env.JARVIS_EXECUTOR_NETWORK || 'jarvis-internal', timeoutMs = 300_000 }) {
+export async function runInWorkdir({ workdir, program, args = [], image, name, readOnly = false, network = process.env.JARVIS_EXECUTOR_NETWORK || 'jarvis-internal', timeoutMs = 300_000, guard = null, onStarted = null }) {
   const st = await isolationStatus();
   if (!st.available) return { ok: false, blocked: 'isolation_unavailable', error: st.reason };
   const dockerArgs = [
@@ -251,8 +301,38 @@ export async function runInWorkdir({ workdir, program, args = [], image, name, r
     image,
     ...args
   ];
+  const cidDir = mkdtempSync(join(tmpdir(), 'jarvis-cid-'));
+  const cidFile = join(cidDir, 'container.cid');
+  dockerArgs.splice(dockerArgs.length - args.length - 1, 0, '--cidfile', cidFile);
+  if (guard) {
+    let allowed = false;
+    try { allowed = Boolean(await guard()); } catch { allowed = false; }
+    if (!allowed) {
+      try { rmSync(cidDir, { recursive: true, force: true }); } catch {}
+      return { ok: false, cancelled: true, blocked: 'cancelled', exitCode: null, output: 'launch_cancelled_before_docker_run' };
+    }
+  }
   const started = Date.now();
-  const r = await sh(DOCKER, dockerArgs, { timeoutMs });
+  const runPromise = sh(DOCKER, dockerArgs, { timeoutMs });
+  if (onStarted) {
+    const waitStart = Date.now();
+    while (Date.now() - waitStart < 5_000) {
+      if (existsSync(cidFile)) {
+        try { onStarted(); } catch {}
+        break;
+      }
+      const done = await Promise.race([
+        runPromise.then((value) => ({ done: true, value })),
+        new Promise((resolve) => setTimeout(() => resolve({ done: false }), 50))
+      ]);
+      if (done.done) break;
+    }
+    if (existsSync(cidFile)) {
+      try { onStarted(); } catch {}
+    }
+  }
+  const r = await runPromise;
+  try { rmSync(cidDir, { recursive: true, force: true }); } catch {}
   return { ok: r.code === 0, exitCode: r.code, durationMs: Date.now() - started, output: r.out.slice(-4000) };
 }
 

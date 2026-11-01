@@ -277,10 +277,13 @@ test('取消在提交前成立：不得开始 Git Commit', async () => {
   const hold = new Promise((r) => { releaseRun = r; });
   const gatedIso = {
     ...fakeIsolation,
-    runClaudeIsolated: async ({ workdir }) => {
-      writeFileSync(join(workdir, 'feature.txt'), 'x\n');
+    runClaudeIsolated: async ({ workdir, guard }) => {
       markStarted();
       await hold;
+      if (guard && !(await guard())) {
+        return { ok: false, cancelled: true, blocked: 'cancelled', exitCode: null, text: '', raw: 'guard_cancelled' };
+      }
+      writeFileSync(join(workdir, 'feature.txt'), 'x\n');
       return { ok: true, exitCode: 0, text: 'done', isolated: true, network: 'fake-net', image: 'fake-image', raw: '' };
     }
   };
@@ -291,9 +294,14 @@ test('取消在提交前成立：不得开始 Git Commit', async () => {
   };
   const running = svc.runTask(t.id, { isolation: gatedIso, executor: spyExecutor });
   await started;
-  const cancelled = await svc.cancelTask(t.id, { isolation: gatedIso });
-  assert.equal(cancelled.ok, true, JSON.stringify(cancelled));
+  const cancelling = svc.cancelTask(t.id, { isolation: gatedIso });
+  for (let i = 0; i < 200; i++) {
+    if (['cancel_requested', 'cancelled'].includes(svc.getTask(t.id).status)) break;
+    await new Promise((r) => setImmediate(r));
+  }
   releaseRun();
+  const cancelled = await cancelling;
+  assert.equal(cancelled.ok, true, JSON.stringify(cancelled));
   const r = await running;
   assert.equal(r.ok, false);
   assert.equal(r.blocked, 'cancelled');

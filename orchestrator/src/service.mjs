@@ -352,7 +352,7 @@ export async function runTask(ref, deps = {}) {
     return runExecutorTask(task, project, deps);
   }
   if (task.kind === 'audit') {
-    return runAuditTask(task, project);
+    return runAuditTask(task, project, deps);
   }
   if (!task.assignee_agent_id) {
     return { ok: false, blocked: 'no_assignee', error: '任务未指派 Agent' };
@@ -882,17 +882,28 @@ async function runExecutorTask(task, project, deps = {}) {
     }
     credFile = cred.file;
     const containerName = `jarvis-exec-${execId}`;
-    const execResId = registerResource({ executionId: execId, taskId: task.id, kind: 'claude', name: containerName });
-    const res = await isolation.runClaudeIsolated({
-      modelToken,
+    const res = await launchContainer({
+      executionId: execId,
+      taskId: task.id,
+      kind: 'claude',
       name: containerName,
-      workdir: dest,
-      prompt: task.input,
-      mode: resolved.mode,
-      image: st.image,
-      credentialsFile: credFile,
-      proxyUrl
+      run: (resourceId) => isolation.runClaudeIsolated({
+        modelToken,
+        name: containerName,
+        workdir: dest,
+        prompt: task.input,
+        mode: resolved.mode,
+        image: st.image,
+        credentialsFile: credFile,
+        proxyUrl,
+        guard: () => claimDockerInvocation(resourceId, task.id),
+        onStarted: () => markContainerRunning(resourceId)
+      })
     });
+    if (res.cancelled) {
+      finalizeAttempt(task, execId, { status: 'cancelled', reason: '取消于执行启动前' });
+      return { ok: false, blocked: 'cancelled', error: '任务已取消，执行容器未启动' };
+    }
 
     const cancelledNow = () => ['cancelled', 'cancel_requested'].includes(db().prepare('SELECT status FROM tasks WHERE id=?').get(task.id)?.status);
     if (cancelledNow()) {
@@ -905,16 +916,24 @@ async function runExecutorTask(task, project, deps = {}) {
     if (res.ok && resolved.profile) {
       db().prepare("UPDATE tasks SET status='verifying', updated_at=? WHERE id=? AND status='running'").run(now(), task.id);
       const verifyName = `jarvis-verify-${execId}`;
-      const verifyResId = registerResource({ executionId: execId, taskId: task.id, kind: 'verify', name: verifyName });
-      const vr = await isolation.runInWorkdir({
+      const vr = await launchContainer({
+        executionId: execId,
+        taskId: task.id,
+        kind: 'verify',
         name: verifyName,
-        workdir: dest,
-        program: resolved.profile.program,
-        args: JSON.parse(resolved.profile.argv || '[]'),
-        image: st.image
+        run: (resourceId) => isolation.runInWorkdir({
+          name: verifyName,
+          workdir: dest,
+          program: resolved.profile.program,
+          args: JSON.parse(resolved.profile.argv || '[]'),
+          image: st.image,
+          guard: () => claimDockerInvocation(resourceId, task.id),
+        onStarted: () => markContainerRunning(resourceId)
+        })
       });
-      verify = { exitCode: vr.exitCode, ok: vr.ok, output: vr.output, program: resolved.profile.program, argv: JSON.parse(resolved.profile.argv || '[]') };
-      finishResource(verifyResId, 'stopped');
+      if (!vr.cancelled) {
+        verify = { exitCode: vr.exitCode, ok: vr.ok, output: vr.output, program: resolved.profile.program, argv: JSON.parse(resolved.profile.argv || '[]') };
+      }
     }
 
     // 修改范围检查
@@ -1228,9 +1247,13 @@ export async function cancelTask(ref, deps = {}) {
     .prepare("SELECT * FROM executions WHERE task_id = ? AND status = 'running' ORDER BY started_at DESC")
     .all(task.id);
   if (!running.length) {
+    if (task.status === 'cancelled') {
+      return { ok: true, already_cancelled: true, task: getTask(task.id) };
+    }
     return { ok: false, error: '该任务没有正在运行的执行', task: getTask(task.id) };
   }
 
+  const cancelAt = now();
   // 提交与取消的互斥：committing 由 runTask 用原子状态迁移抢占。
   // 提交中不杀进程、不写 cancel_requested，避免 git commit 已发生却虚报 cancelled。
   let current = getTask(task.id);
@@ -1300,28 +1323,30 @@ export async function cancelTask(ref, deps = {}) {
       }
     }
 
-    // FIX3-C：以执行资源登记为准，不依赖硬编码名称
+    // B01：以 execution_resources 的真实生命周期为准。
+    // intent 直接 abandon；starting 必须等启动方落 stopped/abandoned，
+    // 或实际 kill 到 exited；inspect 的 gone 不能证明异步启动已消失。
     const resources = db()
-      .prepare("SELECT * FROM execution_resources WHERE execution_id=? AND state IN ('started','running','stopping')")
+      .prepare("SELECT * FROM execution_resources WHERE execution_id=? AND state IN ('intent','starting','started','running','stopping','unknown') ORDER BY started_at")
       .all(exRow.id);
-    const targets = resources.filter((r) => ['claude', 'verify', 'audit'].includes(r.kind)).map((r) => r.name);
-    if (!targets.length) {
-      // 兼容：老执行没有资源登记
-      targets.push(`jarvis-exec-${exRow.id}`, `jarvis-verify-${exRow.id}`);
-    }
     const containerResults = [];
-    for (const tname of targets) {
-      const r = await isolation.killContainer(tname);
-      containerResults.push({ name: tname, ...r });
-      db().prepare("UPDATE execution_resources SET state=?, stopped_at=? WHERE execution_id=? AND name=? AND state IN ('started','running','stopping')")
-        .run(r.confirmed ? 'stopped' : 'unknown', now(), exRow.id, tname);
+    for (const resource of resources) {
+      containerResults.push(await settleCancelResource(resource, isolation, cancelAt, deps.launchWaitMs ?? 15_000));
+    }
+    if (!resources.length) {
+      // 兼容：老执行没有资源登记
+      for (const tname of [`jarvis-exec-${exRow.id}`, `jarvis-verify-${exRow.id}`]) {
+        const r = await isolation.killContainer(tname);
+        containerResults.push({ name: tname, ...r });
+      }
     }
     containerKilled = { results: containerResults };
 
     const daemonLost = containerResults.some((r) => r.reason === 'docker_daemon_unreachable');
     const allConfirmed = containerResults.every((r) => r.confirmed === true);
-    // daemon 失联优先报告「无法确认」，绝不当作已停止
-    const fullyStopped = daemonLost ? false : allConfirmed;
+    const pidStopped = !(Number.isFinite(pid) && pid > 0) || confirmed;
+    // daemon 失联/进程未确认/启动意图未解决，都不得当作已停止
+    const fullyStopped = daemonLost ? false : (pidStopped && allConfirmed);
 
     if (fullyStopped) {
       db().prepare("UPDATE executions SET status='cancelled', finished_at=? WHERE id=? AND status='running'").run(now(), exRow.id);
@@ -1331,6 +1356,7 @@ export async function cancelTask(ref, deps = {}) {
       execution: exRow.id,
       pid,
       confirmedExit: fullyStopped,
+      pidStopped,
       escalatedToSigkill: escalated,
       containers: containerKilled.results
     });
@@ -1364,7 +1390,9 @@ export async function cancelTask(ref, deps = {}) {
  * 固定 commit → 一次性工作树 → 容器内只读执行（plan）→ 校验未被修改。
  * 注意：审计任务执行成功 ≠ 独立审计结论 PASS。
  */
-async function runAuditTask(task, project) {
+async function runAuditTask(task, project, deps = {}) {
+  const executor = deps.executor ?? ex;
+  const isolation = deps.isolation ?? iso;
   const cfg = JSON.parse(task.executor_config || '{}');
   const { repo, commit, contract } = cfg;
   if (!repo || !commit) {
@@ -1380,7 +1408,7 @@ async function runAuditTask(task, project) {
     return { ok: false, blocked: 'repo_outside_project', error: rc.error };
   }
 
-  const st = await iso.isolationStatus();
+  const st = await isolation.isolationStatus();
   if (!st.available) {
     recordAttempt({ task, project, phase: 'isolation', status: 'rejected', blocked: 'isolation_unavailable', reason: st.reason });
     return { ok: false, blocked: 'isolation_unavailable', error: st.reason };
@@ -1406,18 +1434,18 @@ async function runAuditTask(task, project) {
     rmSync(dest, { recursive: true, force: true });
     mkdirSync(join(JARVIS_HOME, 'audit'), { recursive: true });
 
-    const wt = await ex.createWorktree({ repo: rc.cwd, commit, dest });
+    const wt = await executor.createWorktree({ repo: rc.cwd, commit, dest });
     if (!wt.ok) {
       finalizeAttempt(task, execId, { status: 'failed', reason: `审计工作树创建失败: ${wt.error}` });
       return { ok: false, blocked: 'worktree_failed', error: wt.error };
     }
-    const init = await ex.worktreeStatus(dest);
+    const init = await executor.worktreeStatus(dest);
     if (!init.clean) {
       finalizeAttempt(task, execId, { status: 'failed', reason: '审计工作树初始不干净' });
       return { ok: false, blocked: 'dirty_worktree', error: '审计工作树初始不干净' };
     }
 
-    const proxyUrl = await iso.egressProxyUrl();
+    const proxyUrl = await isolation.egressProxyUrl();
     const cred = writeCredentialFile(execId, proxyUrl, modelToken);
     if (!cred.ok) {
       finalizeAttempt(task, execId, { status: 'failed', reason: cred.error });
@@ -1441,22 +1469,32 @@ async function runAuditTask(task, project) {
 
     const auditTmp = join(JARVIS_HOME, 'audit-tmp', execId);
     mkdirSync(auditTmp, { recursive: true });
-    const auditResId = registerResource({ executionId: execId, taskId: task.id, kind: 'audit', name: `jarvis-audit-${execId}` });
-    const res = await iso.runClaudeIsolated({
+    const res = await launchContainer({
+      executionId: execId,
+      taskId: task.id,
+      kind: 'audit',
       name: `jarvis-audit-${execId}`,
-      workdir: dest,
-      prompt,
-      mode: 'plan',
-      image: st.image,
-      credentialsFile: credFile,
-      modelToken,
-      readOnly: true,
-      tmpDir: auditTmp,
-      proxyUrl
+      run: (resourceId) => isolation.runClaudeIsolated({
+        name: `jarvis-audit-${execId}`,
+        workdir: dest,
+        prompt,
+        mode: 'plan',
+        image: st.image,
+        credentialsFile: credFile,
+        modelToken,
+        readOnly: true,
+        tmpDir: auditTmp,
+        proxyUrl,
+        guard: () => claimDockerInvocation(resourceId, task.id),
+        onStarted: () => markContainerRunning(resourceId)
+      })
     });
-    finishResource(auditResId, 'stopped');
+    if (res.cancelled) {
+      finalizeAttempt(task, execId, { status: 'cancelled', reason: '取消于 Audit 启动前' });
+      return { ok: false, blocked: 'cancelled', error: '任务已取消，Audit 容器未启动' };
+    }
 
-    const after = await ex.worktreeStatus(dest);
+    const after = await executor.worktreeStatus(dest);
     const evidence = {
       isolated: true,
       network: st.network,
@@ -1479,7 +1517,7 @@ async function runAuditTask(task, project) {
     revokeModelToken(modelToken);
     try { if (credFile) rmSync(credFile, { force: true }); } catch {}
     if (!preserved) {
-      try { await ex.removeWorktree({ repo: rc.cwd, dest }); } catch {}
+      try { await executor.removeWorktree({ repo: rc.cwd, dest }); } catch {}
     }
   }
 }
@@ -1678,16 +1716,192 @@ export function revokeModelTokensForExecution(execId) {
 
 /* ------------------------------ 执行资源登记 -------------------------------- */
 
-function registerResource({ executionId, taskId, kind, name }) {
+/**
+ * B01：容器资源生命周期。
+ * intent -> starting -> stopped / abandoned；取消时 intent 直接 abandon，
+ * starting 由取消屏障等待并终止，绝不把“inspect 暂时不存在”当作已停止。
+ */
+function registerContainerIntent({ executionId, taskId, kind, name }) {
   const id = newId('res');
-  db()
-    .prepare('INSERT INTO execution_resources (id,execution_id,task_id,kind,name,state,started_at) VALUES (?,?,?,?,?,?,?)')
-    .run(id, executionId, taskId, kind, name ?? '', 'started', now());
-  return id;
+  const r = db()
+    .prepare(`INSERT INTO execution_resources (id,execution_id,task_id,kind,name,state,started_at)
+              SELECT ?,?,?,?,?,'intent',?
+              WHERE EXISTS (SELECT 1 FROM tasks WHERE id=? AND status IN ('running','verifying'))`)
+    .run(id, executionId, taskId, kind, name ?? '', now(), taskId);
+  if (r.changes !== 1) return { ok: false, id: null, reason: '任务已取消，拒绝登记新的启动意图' };
+  return { ok: true, id };
 }
 
-function finishResource(id, state) {
-  db().prepare('UPDATE execution_resources SET state=?, stopped_at=? WHERE id=?').run(state, now(), id);
+function claimContainerStart(id, taskId) {
+  const r = db()
+    .prepare(`UPDATE execution_resources SET state='starting'
+              WHERE id=? AND state='intent'
+                AND EXISTS (SELECT 1 FROM tasks WHERE id=? AND status IN ('running','verifying'))`)
+    .run(id, taskId);
+  return r.changes === 1;
+}
+
+/**
+ * 在真正调用 docker run 之前的最后一道原子检查：
+ * starting -> started 与任务未取消必须同时成立。一旦进入 started，
+ * 取消方必须认为 docker 调用可能已经发生，不能仅凭 inspect=gone 宣告完成。
+ */
+function claimDockerInvocation(id, taskId) {
+  const r = db()
+    .prepare(`UPDATE execution_resources SET state='started'
+              WHERE id=? AND state='starting'
+                AND EXISTS (SELECT 1 FROM tasks WHERE id=? AND status IN ('running','verifying'))`)
+    .run(id, taskId);
+  return r.changes === 1;
+}
+
+function abandonContainerResource(id) {
+  const r = db()
+    .prepare("UPDATE execution_resources SET state='abandoned', stopped_at=? WHERE id=? AND state IN ('intent','starting','stopping')")
+    .run(now(), id);
+  return r.changes === 1;
+}
+
+function finishContainerResource(id) {
+  db()
+    .prepare("UPDATE execution_resources SET state='stopped', stopped_at=? WHERE id=? AND state IN ('starting','running','started','stopping')")
+    .run(now(), id);
+}
+
+function markContainerRunning(id) {
+  db().prepare("UPDATE execution_resources SET state='running' WHERE id=? AND state IN ('starting','started')").run(id);
+}
+
+function markContainerStopping(id) {
+  db().prepare("UPDATE execution_resources SET state='stopping' WHERE id=? AND state IN ('starting','running','started')").run(id);
+}
+
+function markContainerUnknown(id) {
+  db()
+    .prepare("UPDATE execution_resources SET state='unknown', stopped_at=? WHERE id=? AND state IN ('intent','starting','running','started','stopping')")
+    .run(now(), id);
+}
+
+/** 统一容器启动：登记 intent → 原子 claim → 最后一道 guard → 执行 → 落 stopped/abandoned。 */
+async function launchContainer({ executionId, taskId, kind, name, run }) {
+  const intent = registerContainerIntent({ executionId, taskId, kind, name });
+  if (!intent.ok) {
+    return { ok: false, blocked: 'cancelled', cancelled: true, error: intent.reason };
+  }
+  if (!claimContainerStart(intent.id, taskId)) {
+    abandonContainerResource(intent.id);
+    return { ok: false, blocked: 'cancelled', cancelled: true, error: '任务已取消，拒绝启动容器' };
+  }
+  let result;
+  try {
+    result = await run(intent.id);
+  } catch (e) {
+    finishContainerResource(intent.id);
+    throw e;
+  }
+  if (result?.cancelled) {
+    abandonContainerResource(intent.id);
+  } else {
+    finishContainerResource(intent.id);
+  }
+  return result;
+}
+
+/**
+ * 取消屏障：只有资源进入 stopped/abandoned 才视为解决。
+ * starting 阶段 docker inspect 返回 gone 不能证明“尚未启动的异步启动”已消失。
+ */
+async function settleCancelResource(resource, isolation, cancelAt, waitMs = 15_000) {
+  const readState = () => db().prepare('SELECT state FROM execution_resources WHERE id=?').get(resource.id)?.state;
+  const name = resource.name || '';
+  let state = resource.state;
+
+  if (state === 'intent') {
+    abandonContainerResource(resource.id);
+    state = readState();
+    return { name, state, confirmed: state === 'abandoned' || state === 'stopped', reason: state === 'abandoned' ? 'launch_abandoned' : undefined };
+  }
+  if (state === 'abandoned') return { name, state, confirmed: true };
+  if (state === 'stopped') {
+    // 取消前已完成：已无新副作用。取消开始后才 stopped：没有终止证据，fail closed。
+    const finished = Date.parse(resource.stopped_at || '');
+    const cancelledAt = Date.parse(cancelAt || '');
+    const beforeCancel = Number.isFinite(finished) && Number.isFinite(cancelledAt) && finished <= cancelledAt;
+    return {
+      name,
+      state,
+      confirmed: beforeCancel,
+      reason: beforeCancel ? 'already_stopped' : 'container_stopped_after_cancel_without_stop_evidence',
+      escalated: false,
+      killAccepted: false,
+      containerState: null
+    };
+  }
+  if (state === 'unknown') return { name, state, confirmed: false, reason: 'unknown_container_state' };
+
+  // starting / started / running / stopping
+  markContainerStopping(resource.id);
+  const deadline = Date.now() + waitMs;
+  let lastKill = null;
+  let killConfirmed = false;
+  const killMeta = () => ({
+    escalated: lastKill?.escalated === true,
+    killAccepted: lastKill?.killAccepted === true,
+    containerState: lastKill?.state ?? null
+  });
+  while (Date.now() < deadline) {
+    state = readState();
+    if (state === 'abandoned') return { name, state, confirmed: true, ...killMeta() };
+    if (state === 'stopped') {
+      return {
+        name,
+        state,
+        confirmed: killConfirmed,
+        reason: killConfirmed ? 'stopped_by_cancel' : 'container_stopped_after_cancel_without_stop_evidence',
+        ...killMeta()
+      };
+    }
+    if (state === 'unknown') return { name, state, confirmed: false, reason: 'unknown_container_state' };
+
+    lastKill = await isolation.killContainer(name);
+    if (lastKill?.reason === 'docker_daemon_unreachable') {
+      markContainerUnknown(resource.id);
+      return { name, state: 'unknown', confirmed: false, reason: 'docker_daemon_unreachable', ...killMeta() };
+    }
+    if (
+      lastKill?.confirmed &&
+      (['exited', 'dead', 'removing'].includes(lastKill.state) ||
+        (lastKill.state === 'gone' && lastKill.killAccepted === true))
+    ) {
+      killConfirmed = true;
+    }
+    state = readState();
+    if (state === 'abandoned') return { name, state, confirmed: true, ...killMeta() };
+    if (state === 'stopped') {
+      return {
+        name,
+        state,
+        confirmed: killConfirmed,
+        reason: killConfirmed ? 'stopped_by_cancel' : 'container_stopped_after_cancel_without_stop_evidence',
+        ...killMeta()
+      };
+    }
+    if (state === 'unknown') return { name, state, confirmed: false, reason: 'unknown_container_state' };
+
+    // 只有“确实见过容器且已 exited/dead/removing”才可直接确认；
+    // state=gone 在 started 阶段仍可能是尚未创建的竞态，必须继续等启动方。
+    if (lastKill?.confirmed && ['exited', 'dead', 'removing'].includes(lastKill.state)) {
+      killConfirmed = true;
+      db()
+        .prepare("UPDATE execution_resources SET state='stopped', stopped_at=? WHERE id=? AND state IN ('starting','running','started','stopping')")
+        .run(now(), resource.id);
+      return { name, state: 'stopped', confirmed: true, ...killMeta() };
+    }
+    await new Promise((r) => setTimeout(r, 50));
+  }
+
+  markContainerUnknown(resource.id);
+  return { name, state: 'unknown', confirmed: false, reason: 'launch_cancel_timeout', ...killMeta() };
 }
 
 export function listResources(taskId) {
