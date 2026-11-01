@@ -186,7 +186,9 @@ productionSignatureValid: true
 tamperedValid: false
 ```
 
-### 6.3 真实审批 E2E（服务层）
+### 6.3 真实审批 E2E（服务层，独立临时 SE key）
+
+本节使用 `/tmp/jarvis-auth-e2e` 下独立生成的临时 SE key，不触碰生产 key；生产 key 的真实签名见 6.2，生产 key 参与的真实 Claude E2E 见 6.4。
 
 ```json
 {
