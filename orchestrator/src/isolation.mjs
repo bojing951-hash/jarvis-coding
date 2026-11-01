@@ -273,11 +273,11 @@ export async function daemonReachable({ timeoutMs = 8_000 } = {}) {
  *  - reason=docker_daemon_unreachable  daemon 失联，终止结果无法确认
  *  - reason=container_still_running    daemon 健康但容器仍在
  */
-export async function killContainer(name, { graceMs = 5000, killTimeoutMs = 15_000 } = {}) {
+export async function killContainer(name, { graceMs = 5000, killTimeoutMs = 15_000, inspectTimeoutMs = 8_000 } = {}) {
   if (!name) return { ok: false, confirmed: false, reason: 'no_container_name' };
 
   const inspectState = async () => {
-    const r = await sh(DOCKER, ['inspect', name, '--format', '{{.State.Status}}'], { timeoutMs: 8_000 });
+    const r = await sh(DOCKER, ['inspect', name, '--format', '{{.State.Status}}'], { timeoutMs: inspectTimeoutMs });
     if (r.ok) return { kind: 'state', value: r.out.trim() };
     if (/No such object|could not be found/i.test(r.out)) return { kind: 'gone' };
     if (/Cannot connect|daemon|connection refused/i.test(r.out)) return { kind: 'daemon' };

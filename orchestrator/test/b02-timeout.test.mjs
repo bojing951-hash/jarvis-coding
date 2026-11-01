@@ -54,6 +54,7 @@ case "$1" in
     case "$*" in
       *jarvis-proxy*) echo '{"fake-net":{"IPAddress":"172.18.0.99"}}'; exit 0 ;;
       *)
+        [ "$mode" = "inspect_timeout" ] && sleep 5
         [ "$mode" = "inspect_exited" ] && { echo "exited"; exit 0; }
         echo "Error: No such object: x"; exit 1 ;;
     esac ;;
@@ -360,4 +361,15 @@ test('B02-QA-01 Verify workdir CLI 超时不得返回成功', async () => {
   assert.equal(r.exitCode, null);
   assert.equal(r.timedOut, true);
   assert.equal(r.abnormal, true);
+});
+
+
+test('B02-QA-04 Docker inspect 超时不得产生 confirmed', async () => {
+  process.env.FAKE_DOCKER_MODE = 'inspect_timeout';
+  const r = await iso.killContainer('b02-inspect-timeout', {
+    graceMs: 100,
+    killTimeoutMs: 100,
+    inspectTimeoutMs: 50
+  });
+  assert.equal(r.confirmed, false, JSON.stringify(r));
 });
